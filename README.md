@@ -166,7 +166,47 @@ Two things refuse to sit neatly on one side — which is exactly the tell that t
 
 The takeaway that frames the whole doc: **the frontend is your existing skill set** (Ethernet, IP, BGP, load-balancing — back in §6); **the backend is the genuinely new thing** — the GPU datapath, in two fabrics (§3 scale-up, §4 scale-out). Everything hard lives on the path that skips the CPU.
 
-### 1.5 The one-slide summary
+### 1.5 The two workloads: training vs inference
+
+Everything so far — sharded tensors, GPUs collaborating mid-computation — has quietly assumed *one* kind of work. But a GPU data center runs **two very different jobs**, and they stress the network in opposite ways. You already have the perfect pair of analogies for them: **training is a batch / bulk-sync job; inference is a latency-sensitive request-response service.** Which one you're wiring for changes what the network has to be good at.
+
+```
+   TRAINING  — backend only, all GPUs in lockstep
+      G === G === G === G
+      ||  gradient all-reduce  ||      east-west, synchronized every
+      G === G === G === G              step  ->  tail-latency bound
+
+   INFERENCE — users in front, lighter backend behind
+      users  ->  [ model endpoints ]   north-south, load-balanced (frontend)
+                       |
+      G === G === G === G              east-west but lighter: the model is
+      (lighter collectives)            still sharded across GPUs (backend)
+```
+
+**Training — build the model.** This is the heavy one. Thousands of GPUs run in **lockstep**, grinding through the dataset for days or weeks, and after every step they reconcile what they learned — the **gradient all-reduce** from §3.7: *every parameter, summed across every replica.* Its traffic signature:
+- **East-west and internal** — GPU↔GPU collectives dominate; almost nothing leaves for a user. Pure **backend** (§1.4).
+- **Synchronized and bursty** — everyone hits the network at the same instant, then waits for the slowest before the next step (§4.1). **Tail latency sets the pace of the whole job.**
+- **Throughput-bound** — you care about sustained bandwidth, not single-request microseconds.
+- Networker's analogy: a giant **MPI/HPC batch job**, or a fabric-wide **bulk sync** where every node must reach the barrier before anyone moves on.
+
+**Inference — use the model to serve users.** The model is trained; now you run it forward to answer requests. This *is* the **inference / serving** network already sitting at the top of the §1.4 diagram — **north-south, user-facing, load-balanced**, the Ethernet/IP/TCP traffic you've run your whole career. But there's a backend twist: a frontier model is still too big for one GPU, so even *serving* it is spread across GPUs — so inference *also* produces east-west collective traffic, just **lighter and less tightly synchronized** than training.
+
+Inference also splits into **two phases** with different appetites — worth knowing because they're increasingly run on *different* GPUs:
+- **Prefill** — read the whole prompt and build its context in one parallel pass. **Compute-heavy, bursty** (like ingesting a full request payload at once).
+- **Decode** — emit the answer one token at a time, each token depending on the last. **Latency-bound, many tiny steps, memory-bandwidth-hungry** (like a long-lived chatty session dribbling out its reply).
+
+| Property      | Training              | Inference                       |
+|---------------|-----------------------|---------------------------------|
+| Goal          | build the model       | serve the model                 |
+| Direction     | east-west (GPU↔GPU)   | north-south + lighter east-west |
+| Network plane | backend               | frontend + backend              |
+| Pattern       | synchronized, bursty  | streaming, request-driven       |
+| Bound by      | throughput            | latency (especially decode)     |
+| Looks like…   | HPC batch / bulk sync | a web request-response tier     |
+
+The takeaway for the rest of the doc: **§3 and §4 are mostly the *training* story** — the synchronized backend collectives that push the fabric hardest. Inference adds the familiar **frontend** dimension (→ §6) plus a lighter backend. But "lighter" is changing fast: modern serving is starting to **disaggregate** — running prefill and decode on separate GPU pools and shipping the intermediate state (the KV cache) between them over the backend fabric — which turns inference into its own demanding network problem. We flag it here and come back to it later; for now, just hold the split: **training stresses the backend; inference spans both planes.**
+
+### 1.6 The one-slide summary
 
 > A node = 1 CPU host + several GPU devices (`cuda:0…`). Each GPU is thousands of throughput cores (SMs / tensor cores) fronted by a small pool of very fast memory (HBM). Models are too big for one GPU's HBM, so they're split across GPUs — which forces those GPUs to exchange data fast. **That "exchange data fast" requirement is the entire reason GPU networking exists** — and it splits into two problems, which is exactly where §2 begins.
 
@@ -632,4 +672,11 @@ That's an **~18× drop** at the island edge (and it grows with each NVLink gener
 
 # TODO list tracking
 
-- storage with backend/frontend
+
+- different types of GPU with different capabilities ? they may not all have nvlink for example ? connectX vs BF ? 
+- structure in 4. is not consistent with 3 (section names )
+- we should talk about  the split inference (P/D A/F), KV cache -> dynamo 
+- how much non nvidia the doc should be ???
+- UAlink ?
+- ESUN ?
+
