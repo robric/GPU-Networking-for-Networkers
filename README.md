@@ -490,9 +490,95 @@ We've met the technology (§3.2) and the systems (§3.4). What's left is the par
 
 With the names decoded, a sentence like *"the Kyber-based Rubin Ultra NVL576 MGX rack"* stops being noise and parses cleanly: **Rubin Ultra GPUs**, in the **Kyber** rack design, wired into a **576-GPU NVLink domain**, to the **MGX** modular spec.
 
-*Coming next:*
+### 3.7 Where scale-up ends and scale-out must begin
 
-- 3.7 Where scale-up ends and scale-out must begin.
+Everything in §3 has been **one bounded thing**: a single NVLink memory domain — 8 GPUs, 72, eventually a few thousand — where any GPU can `load`/`store` any other's HBM as if it were local. Beautiful, fast, and *finite.* This last section is about the wall it hits, and what you do when you reach it.
+
+**Why scale-up can't just keep growing.** Every rung up the ladder (§3.4) gets more expensive on several axes at once:
+
+- **Power & cooling.** One NVL72 rack is ~**120 kW**, liquid-cooled. You cannot put a 100,000-GPU NVLink domain in a building — the power density alone is impossible.
+- **Distance & media.** Copper dies at a meter or two; past that it's optics, then co-packaged optics — each step costlier and more power-hungry, just to hold "remote HBM ≈ local HBM."
+- **Switch radix & latency.** Every extra NVLink tier (§3.4.2) adds hops and latency, and NVSwitch radix is finite. The shared-memory illusion weakens the bigger you stretch it.
+- **Cost.** NVLink switching + optics is *premium* interconnect. Making all 100k GPUs in a cluster members of one memory fabric would be financially absurd.
+
+So there's a hard ceiling — today, hundreds to a few thousand GPUs per NVLink domain. A frontier training job needs **tens of thousands**. The gap is bridged by *not* extending the memory fabric, but switching to a different one.
+
+**The real architecture: scale-up islands, stitched by a scale-out fabric.**
+
+```
+   The real cluster = scale-up ISLANDS stitched by a scale-out FABRIC
+
+   +-----------------+   +-----------------+        +-----------------+
+   |  NVL72 island   |   |  NVL72 island   |        |  NVL72 island   |
+   | 72 GPUs,        |   | 72 GPUs,        |  ...   | 72 GPUs,        |
+   | NVLink memory   |   | NVLink memory   |        | NVLink memory   |
+   | fabric (ld/st)  |   | fabric (ld/st)  |        | fabric (ld/st)  |
+   +--------+--------+   +--------+--------+        +--------+--------+
+            | NICs                | NICs                     | NICs
+            +---------------------+------------ ... ---------+
+                                  |
+                  scale-out fabric: IB / RoCE, packet-switched
+                  RDMA over a leaf-spine Clos   ->   all of §4
+```
+
+Inside each island, GPUs share memory over NVLink (§3.1–3.6). Between islands, they fall back to **message passing over the NIC** — RDMA packets across an InfiniBand or RoCE Clos (§4). Two fabrics, layered: a fast *memory* fabric inside the island, a routed *packet* fabric between islands.
+
+**The punchline — the boundary is also where you cut the workload.** This isn't just physics; it dictates *how a model is partitioned.* You match each kind of parallel traffic to the fabric that suits it:
+
+- **Tensor parallelism / MoE all-to-all** — chatty, fine-grained, latency-critical (an exchange *every layer*). This **must** live **inside** the scale-up island, on NVLink.
+- **Data & pipeline parallelism** — coarser and less frequent (gradients once per step, activations once per stage). These ride **across** the scale-out fabric, where higher latency is tolerable.
+
+And *that* is the real reason NVIDIA keeps pushing the NVLink domain bigger (8 → 72 → 576): **a larger scale-up island lets more of the chatty, hard traffic stay on the fast memory fabric**, leaving the scale-out network to carry only the coarse stuff. Grow the island, relax the network.
+
+So scale-up ends not at a number, but at a **role boundary**: it handles the tight, memory-speed collaboration; everything beyond that is handed to the packet network. That network — RDMA, RoCE vs InfiniBand, rails, congestion control, the parts that look most like the networking you already do — is **§4**, the other half of this document.
+
+---
+
+## 4. Scale-out: the GPU cluster network
+
+> Goal: by the end you should see the scale-out fabric for what it is — **a data-center network you already know how to reason about** (Clos, packets, ECMP, congestion control) — but pushed to extremes that break the usual assumptions, and speaking **RDMA** instead of TCP.
+
+This half is home turf. Where scale-up (§3) was an alien *memory* fabric, scale-out is a **packet-switched network**: NICs, leaf and spine switches, links, routing, congestion control. You have built these. The twist is *what* runs on it and *how hard* it gets pushed:
+
+- the endpoints are **GPUs, not servers**, and they talk **RDMA**, not sockets;
+- the traffic is a handful of **enormous, synchronized flows**, not millions of small independent ones;
+- the fabric is often required to be **lossless**, which is *not* how you built your last data center;
+- and a few giant flows wreck plain **ECMP**, so the fabric needs help — either a **rail-optimized** topology or a flatter Clos with **adaptive load balancing** (adaptive routing / packet spraying).
+
+Same golden rule as §3: map each piece to networking you already know, then flag exactly where GPU clusters diverge — because the places they diverge are where all the pain (and all the interesting engineering) lives.
+
+*Section outline:*
+
+- 4.1 The job: connect the islands — scale, and what actually crosses the boundary.
+- 4.2 RDMA on the wire: one-sided, kernel-bypass, and GPUDirect.
+- 4.3 InfiniBand vs RoCE: two ways to carry RDMA at scale.
+- 4.4 Why AI traffic breaks ordinary networks: elephant flows, incast, synchronized bursts.
+- 4.5 Keeping it lossless: PFC, ECN / DCQCN, and where it's heading.
+- 4.6 Topology & load balancing: why ECMP isn't enough, then the two answers — rail-optimized fabrics vs flat Clos with adaptive LB (adaptive routing / packet spraying).
+- 4.7 Collectives on the wire: what NCCL actually sends (and in-network reduction).
+
+### 4.1 The job: connect the islands
+
+§3.7 left us with the picture: **scale-up islands** — each an NVLink memory domain of 8–72 GPUs — that now have to be wired into a **cluster**. That's the whole job of scale-out. The numbers are what make it hard.
+
+**The scale.** A frontier training run wants **tens of thousands** of GPUs; the biggest clusters are now **100,000+**. At 72 GPUs per NVL72 island, 100k GPUs is roughly **1,400 islands** to interconnect. And each GPU brings its **own NIC** — well-provisioned AI clusters run about **one NIC per GPU** (the NIC edge from §1.2) — so the fabric is terminating on the order of **100,000 high-speed ports**, all for a *single job*. That's a bigger network than most enterprises run in total.
+
+**The bandwidth cliff (why the boundary exists at all).** Per GPU, the two fabrics aren't remotely close:
+
+| Fabric                          | Per-GPU bandwidth            |
+|---------------------------------|------------------------------|
+| Scale-up (NVLink 5, Blackwell)  | ~1,800 GB/s (≈ 14,400 Gb/s)  |
+| Scale-out (one 800G NIC)        | ~800 Gb/s                    |
+
+That's an **~18× drop** at the island edge (and it grows with each NVLink generation — Rubin's 3,600 GB/s makes it ~36×). Cross the boundary and your bandwidth falls by more than an order of magnitude. *This* is the quantitative reason for §3.7's workload-cut rule: keep the chatty traffic **inside** the island; push across the NIC only what you must.
+
+**What actually crosses.** Mostly the coarse, periodic collective traffic from §3.7:
+
+- **data-parallel gradient all-reduce** — once per training step, but it's *every* parameter, summed across *every* replica;
+- **pipeline activations** — handed stage to stage;
+- and, when a model's tensor/expert-parallel group is forced larger than one island, some of that too (avoided where possible — that's the cliff again).
+
+**The thing that makes it brutal.** These are not independent flows. A collective is **synchronized**: thousands of GPUs launch the same all-reduce at the same instant, blast the network, then **all wait for the slowest one** before the next compute step can start. The fabric isn't carrying background traffic — it sits on the **critical path of every iteration**, and its **tail latency sets the pace of the entire job**. A single congested link doesn't slow one flow; it stalls *all* the GPUs waiting on that collective. Hold onto that — it's the reason §4.4–4.6 exist.
 
 # TODO list tracking
 
