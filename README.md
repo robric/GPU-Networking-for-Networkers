@@ -5,7 +5,7 @@
 If you have spent your career thinking in terms of routers, MPLS labels, routing tables, BGP and the occasional `tcpdump`, the world of "GPU networking" can feel like it was designed by aliens. People throw around words like *NVLink*, *NVSwitch*, *collective*, *all-reduce*, *RDMA*, *RoCE* and *rail-optimized fabric* as if they were obvious. They are not.
 
 This document is two things at once, the same way I did the [k8s service & LB testing notes](https://github.com/robric/k8s-svc-and-lb-testing) were:
-- a **personal cheat sheet** so I (and maybe you) can stop re-clauding/googling "is NVLink a network or a bus?" every three months.
+- a **personal cheat sheet** so I (and maybe you) can stop re-clauding/googling "how does this NVLink thing is network or a bus?" every three months.
 - an **educational source** to explain how GPU interconnects actually work, starting from networking intuition you already have.
 
 
@@ -27,7 +27,7 @@ But here's the **subtle difference that makes GPU networking its own beast** —
 
 That one fact changes everything. Because the payload is spread across chips, the GPUs can't work in isolation — they must **constantly collaborate**: exchange slices, sum partial results, redistribute outputs, all *mid-computation*. Where a router ASIC forwards independent packets that never need to know about each other, GPUs run a tightly-coordinated team effort. **That collaboration *is* the traffic GPU networking has to carry** — and it's a far richer, more demanding pattern than "forward this packet." The rest of this document is, fundamentally, about how that GPU-to-GPU collaboration gets wired and orchestrated.
 
-### 1.2 The words you'll actually see
+### 1.2 What a GPU looks like, and the words for its parts
 
 Before the glossary, one picture. At the highest level a GPU is **a big grid of compute tiles (Streaming Multiprocessor - SMs -) wrapped in a ring of very fast memory (HBM)**, with link interfaces (PCIe, NVLink) at the edges to talk to the outside world:
 
@@ -116,7 +116,7 @@ A GPU is not a standalone computer. It lives inside a server, attached to a CPU:
 - **PCIe** is the general-purpose bus connecting CPU and GPUs (and NICs). It's fine for loading data and control, but it is **far too slow** to be the path GPUs use to share memory with each other at HBM speeds. Hold that thought — it's the exact gap NVLink exists to fill, in §3.
 - *Aside:* "superchip" designs (Grace-Hopper, GB200) change this CPU↔GPU relationship — the CPU attaches to the GPU over a fast **NVLink-C2C** link instead of PCIe, at a different ratio (GB200 = 1 Grace CPU for 2 Blackwell GPUs). More in §3.6.
 
-### 1.4 Two categories of network: the host path and the GPU path
+### 1.4 The two network paths: host vs GPU
 
 Zoom out from the chip to the data hall, network-engineer hat on. A GPU node sits on *many* networks — but they fall into **two categories**, and the cleanest way to tell them apart is **which processor owns the path**. This is just **host vs device** (§1.3) drawn as networks:
 
