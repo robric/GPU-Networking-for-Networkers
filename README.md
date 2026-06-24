@@ -13,9 +13,9 @@ The golden rule for the whole document: **whenever something looks like magic, w
 
 ---
 
-## 1. A networker's 5-minute GPU primer
+## 1. The landscape: the GPU and the networks around it
 
-Before we can talk about how GPUs *network*, we need the bare minimum about what a GPU *is*. This is the *just enough* version — no warps, no occupancy, no kernel tuning. If you already know what an SM, HBM and `cuda:0` are, skip to §2.
+Before we can talk about how GPUs *network*, we need two things: the bare minimum about what a GPU *is* (1.1–1.3), then the wider map — the **several different networks** an AI data center actually runs (1.4), the **workloads** that drive their traffic (1.5), and the **layered stack** this whole document climbs (1.6). The GPU bits are the *just enough* version — no warps, no occupancy, no kernel tuning. If you already know what an SM, HBM and `cuda:0` are, jump to 1.4.
 
 ### 1.1 Why GPUs run the show (and what the CPU still does)
 
@@ -116,7 +116,57 @@ A GPU is not a standalone computer. It lives inside a server, attached to a CPU:
 - **PCIe** is the general-purpose bus connecting CPU and GPUs (and NICs). It's fine for loading data and control, but it is **far too slow** to be the path GPUs use to share memory with each other at HBM speeds. Hold that thought — it's the exact gap NVLink exists to fill, in §3.
 - *Aside:* "superchip" designs (Grace-Hopper, GB200) change this CPU↔GPU relationship — the CPU attaches to the GPU over a fast **NVLink-C2C** link instead of PCIe, at a different ratio (GB200 = 1 Grace CPU for 2 Blackwell GPUs). More in §3.6.
 
-### 1.4 The one-slide summary
+### 1.4 Two categories of network: the host path and the GPU path
+
+Zoom out from the chip to the data hall, network-engineer hat on. A GPU node sits on *many* networks — but they fall into **two categories**, and the cleanest way to tell them apart is **which processor owns the path**. This is just **host vs device** (§1.3) drawn as networks:
+
+```
+   +============================ FRONTEND ============================+
+   |                                                                  |   
+   |  host / CPU path  ·  conventional Ethernet / IP / TCP   (-> §6)  |
+   |                                                                  |
+   |    inference / serving      users -> model endpoints (N-S)       |
+   |    tenant / VPC             multi-tenant isolation, overlays     |
+   |    orchestration / control  k8s · Slurm · job scheduling         |
+   |    management / OOB         BMC · provisioning · telemetry       |
+   |                                                                  |   
+   +================================ ^ ===============================+
+                                     |
+                        via the CPU  |  (sockets, TCP/IP)
+                                     |
+              +----------------------+----------------------+
+              |                 one GPU node                |
+              |        host CPU        |        GPUs        |
+              |        (host)          |      (devices)     |
+              +----------------------+----------------------+
+                                     |
+                        via the GPU  |  (RDMA, GPUDirect)
+                                     |
+   +================================ v ===============================+
+   |                                                                  |   
+   |  GPU / RDMA path  ·  kernel-bypass, no sockets        (-> §3,§4) |
+   |                                                                  |
+   |    compute fabric           GPU <-> GPU  (the collective traffic)|
+   |       · scale-up            NVLink, in-rack                (§3)  |
+   |       · scale-out           IB / RoCE RDMA, cluster-wide   (§4)  |
+   |                                                                  |
+   |    storage fabric           GPU <-> high-perf storage            |
+   |       · GPUDirect Storage   NVMe / parallel-FS -> GPU HBM (RDMA) |
+   |                                                                  |   
+   +============================= BACKEND ============================+
+```
+
+- **Frontend — the host / CPU / socket path** (top of the diagram). Not one network but several, all conventional **Ethernet / IP / TCP** you already run: **inference / serving** (user requests to model endpoints, north-south, load-balanced), **tenant / VPC** (multi-tenant isolation), **orchestration** (k8s / Slurm scheduling), and **management / OOB** (BMC, provisioning). From a GPU's point of view it's all "stuff the host does for me" — and all of it is **your existing skill set** (→ §6).
+- **Backend — the GPU / RDMA / memory path** (bottom). Kernel-bypass, no sockets, and itself **two fabrics**: a **compute fabric** carrying GPU↔GPU collective traffic — **scale-up** (NVLink, in-rack — §3) and **scale-out** (IB / RoCE RDMA, cluster-wide — §4); plus a **storage fabric** for **GPU↔high-performance storage** via **GPUDirect Storage** (NVMe / parallel-FS DMA'd straight into HBM). This is the new, hard part — the rest of the document.
+
+Two things refuse to sit neatly on one side — which is exactly the tell that the split is about **path, not function**:
+
+- **Storage shows up on both.** Bulk data-loading through the host CPU is *frontend*; the high-performance GPUDirect-Storage path is *backend*. Same data — different processor carrying it.
+- **OOB management** is technically its own *out-of-band* wire (to the BMCs), but it's a host/management concern, so it rides with the frontend.
+
+The takeaway that frames the whole doc: **the frontend is your existing skill set** (Ethernet, IP, BGP, load-balancing — back in §6); **the backend is the genuinely new thing** — the GPU datapath, in two fabrics (§3 scale-up, §4 scale-out). Everything hard lives on the path that skips the CPU.
+
+### 1.5 The one-slide summary
 
 > A node = 1 CPU host + several GPU devices (`cuda:0…`). Each GPU is thousands of throughput cores (SMs / tensor cores) fronted by a small pool of very fast memory (HBM). Models are too big for one GPU's HBM, so they're split across GPUs — which forces those GPUs to exchange data fast. **That "exchange data fast" requirement is the entire reason GPU networking exists** — and it splits into two problems, which is exactly where §2 begins.
 
