@@ -5,11 +5,13 @@
 If you have spent your career thinking in terms of routers, MPLS labels, routing tables, BGP and the occasional `tcpdump`, the world of "GPU networking" can feel like it was designed by aliens. People throw around words like *NVLink*, *NVSwitch*, *collective*, *all-reduce*, *RDMA*, *RoCE* and *rail-optimized fabric* as if they were obvious. They are not.
 
 This document is two things at once, the same way I did the [k8s service & LB testing notes](https://github.com/robric/k8s-svc-and-lb-testing) were:
-- a **personal cheat sheet** so I (and maybe you) can stop re-clauding/googling "how does this NVLink thing connects GPUs to each other ?" every three months.
+- a **personal cheat sheet** so I (and maybe you) can stop re-clauding/googling "how does this NVLink thing connects GPUs to each other ?" every six months.
 - an **educational source** to explain how GPU interconnects actually work, starting from networking intuition you already have.
 
 
 The golden rule for the whole document: **whenever something looks like magic, we map it back to a networking concept you already know** — a link, a switch, a fabric, a routing decision, a congestion problem. GPUs are just a new kind of endpoint. The wires are still wires.
+
+> **One vendor as the worked example.** "GPU" here means the category, not a brand. We build the whole mental model on **NVIDIA** hardware — it is the most widely deployed and the most concrete to point at, and its vocabulary (NVLink, SM, CUDA, NCCL) is what you will hit first in the wild. But the *architecture* is universal: a die of throughput tiles, fast on-package memory, a high-bandwidth **scale-up** link to nearby peers, and an **RDMA NIC** out to the cluster. AMD and Intel assemble the same building blocks under different names. We learn it once on NVIDIA, then map the alternatives — **AMD and Intel** in their own chapter, and the **open standards (UALink, Ultra Ethernet)** that answer NVIDIA's proprietary stack in theirs — once the model is in place.
 
 ---
 
@@ -918,7 +920,7 @@ So inference is **hard to transport too**, just heterogeneously — smaller-radi
 
 ### 4.5 Keeping it lossless: PFC, ECN, and DCQCN
 
-§4.4 left us with a mandate ordinary networks never had: **don't drop** (a lost packet is a go-back-N cliff) *and* **don't even queue for long** (a slow link is a barrier-wide stall). This section is how the fabric delivers the first half — losslessness — without the cure becoming the disease.
+§4.4 left us with a mandate ordinary networks rarely had: **don't drop** (a lost packet is a go-back-N cliff) *and* **don't even queue for long** (a slow link is a barrier-wide stall). This section is how the fabric delivers the first half — losslessness — without the cure becoming the disease.
 
 The two transports get there very differently, and it's **RoCEv2** that has the real work to do — Ethernet has to *retrofit* losslessness it was never born with. So we spend this section mostly on the RoCE machinery (**PFC**, then **ECN/DCQCN**), and only at the end circle back to how **InfiniBand** gets the same two jobs for free from its architecture. Everything until that closeout is the Ethernet/RoCE story.
 
@@ -950,7 +952,9 @@ So PFC is the airbag: it must exist, but if it's deploying often, something upst
    DCQCN — the proactive loop that closes §4.3's CNP
 
                 +------------- Switch fabric -----------+
-   +--------+   |data+--------+     +--------------+    |   +--------+
+                |                                       |
+                |                                       |
+   +--------+  data  +--------+     +--------------+    |   +--------+
    | sender |------->| switch |---->|    switch    |------->| recvr  |
    |  NIC   |   |    +--------+     | (congested)  |    |   |  NIC   |
    +--------+   |                   | marks ECN=CE |    |   +--------+
