@@ -670,6 +670,124 @@ That's an **~18× drop** at the island edge (and it grows with each NVLink gener
 
 **The thing that makes it brutal.** These are not independent flows. A collective is **synchronized**: thousands of GPUs launch the same all-reduce at the same instant, blast the network, then **all wait for the slowest one** before the next compute step can start. The fabric isn't carrying background traffic — it sits on the **critical path of every iteration**, and its **tail latency sets the pace of the entire job**. A single congested link doesn't slow one flow; it stalls *all* the GPUs waiting on that collective. Hold onto that — it's the reason §4.4–4.6 exist.
 
+### 4.2 RDMA on the wire: one-sided, kernel-bypass, GPUDirect
+
+Back in §3.5 we slotted RDMA onto the spectrum between sockets and NVLink: **one-sided** like NVLink (the remote stays passive), but still **moving packets** at kilobyte granularity and microsecond latency. That was *where it fits*. This is *what it actually is* — because RDMA is the language every endpoint on the scale-out fabric speaks, and three tricks make it work.
+
+**Why sockets can't do this job.** Trace a byte over plain TCP: the app makes a syscall, the kernel's TCP/IP stack processes it, the data is copied (often twice), the CPU fields interrupts, and the same happens in reverse on the far side. At a few Gb/s on a web server, fine. At **400–800 Gb/s per NIC**, the CPU would burn *all* its cycles just shuffling bytes — the host becomes the bottleneck before the wire is half full. Scale-out throws that whole model out.
+
+```
+   TCP / sockets  (the slow path you know)
+     app -> syscall -> kernel TCP/IP -> copy -> NIC  ===>  NIC -> kernel -> copy -> app
+            the CPU touches every packet: syscalls, copies, interrupts
+
+   RDMA + GPUDirect  (the scale-out path)
+     GPU HBM ==DMA==> NIC  ================>  NIC ==DMA==> GPU HBM
+            CPU posts the request once, then never touches the data
+```
+
+**One idea, three cuts.** What follows isn't three separate inventions — it's a single goal, **no CPU touches the bytes on either end**, enforced at the three places a CPU could otherwise sit on the datapath. A router already keeps its data plane off the route processor; scale-out pushes that further, off *every* CPU, near and far:
+
+| Where a CPU could sit on the path                       | What removes it              | Side |
+|---------------------------------------------------------|------------------------------|------|
+| **local** CPU — its kernel/OS (syscalls, copies, TCP) | **kernel bypass**            | near |
+| **local** CPU — its DRAM (a staging buffer)           | **GPUDirect RDMA**           | near |
+| **remote** CPU — running receive-side code            | **one-sided `WRITE`/`READ`** | far  |
+
+Two cuts on the near side (the kernel, then the memory), one on the far side. They're genuinely different mechanisms — bypass is about *software on the path*, GPUDirect about *where the buffer lives*, one-sided about *who runs code* — but they add up to one outcome: a GPU writing into another GPU's memory with no processor in the loop.
+
+**Cut 1 — kernel bypass (near side: the local OS) — which is just how a router already works.** You invented this one. A router has *never* run its data plane through the CPU: packets are switched in the line-card ASIC at line rate, and only control-plane or exception traffic gets **punted** up to the route processor. Kernel bypass is that exact split brought to the server. The NIC becomes the line-card fast path — the application talks to it *directly* through memory-mapped queues, with **no syscall and no kernel on the data path** — and the host CPU/kernel is demoted to route-processor duty: it sets the connection up once (the control plane, §1.1), then never sees a packet again. After setup, posting a transfer is just dropping a descriptor into a queue the NIC is already watching — no per-packet OS involvement, no copies. Servers traditionally did the *opposite*, pushing every byte up through the kernel; RDMA makes the server NIC behave like the router you already run.
+
+**Cut 2 — GPUDirect RDMA (near side: the local DRAM).** Bypass took the local CPU's *software* off the path; GPUDirect takes its *memory* off too. The NIC DMAs **straight into and out of GPU HBM** over PCIe (the NIC edge from §1.2), so a cross-node GPU-to-GPU transfer is **HBM → NIC → wire → NIC → HBM** — the host's DRAM is never a stop on the way. This is the literal mechanism behind §1.4's "backend = the path that skips the CPU": the CPU sets the transfer up and is then completely out of the datapath.
+
+**Cut 3 — one-sided operations (far side: the remote CPU).** The near-side cuts freed the *initiator's* CPU; this one frees the *target's*. RDMA's headline verbs are **`WRITE`** and **`READ`**: the initiating NIC writes into, or reads out of, the *remote* node's memory **without the remote CPU doing anything** — it runs no code and fields no interrupt (the §3.5 "one-sided" property). There's also a two-sided **`SEND`/`RECV`** pair for when both ends should participate (handshakes, control):
+
+| Operation                   | Who acts       | Remote CPU     | Typical use           |
+|-----------------------------|----------------|----------------|-----------------------|
+| `SEND` / `RECV` (two-sided) | both ends      | posts a `RECV` | control, handshakes   |
+| `WRITE` (one-sided)         | initiator only | passive        | push data into a peer |
+| `READ` (one-sided)          | initiator only | passive        | pull data from a peer |
+
+Each verb rides the wire as an **opcode in the RDMA transport header — the BTH (Base Transport Header)** — alongside the destination queue-pair number and a packet sequence number. That byte layout, and how InfiniBand and RoCE wrap the *same* BTH in different lower layers, is exactly §4.3.
+
+Under the hood it's **queue pairs** (a send + receive queue per connection) and a **completion queue** the NIC posts to when a transfer finishes — the app posts "work requests" and later reaps completions, never syscalling in between. You don't need the API; you need the shape: **app ↔ NIC via queues, NIC ↔ NIC over the wire, the OS nowhere in sight.** And before any of it, the target memory must be **registered** with the NIC, which hands back a key (an `rkey`) the initiator must present to touch that memory — effectively a **capability token**: an address *plus* the permission the remote pre-authorized (it also pins the pages so the NIC can DMA them safely).
+
+Put all three cuts together and that's the scale-out endpoint: a GPU writing into another GPU's memory a row of racks away, **no processor in the loop** — the closest a packet network gets to NVLink's memory semantics. But notice what it quietly assumes. One-sided `WRITE`s blasting into remote memory at 800 Gb/s only stay correct if packets **don't drop** — the simple RDMA transport has no graceful loss recovery. *How* you carry RDMA, and how you keep it from dropping, are the next sections: **InfiniBand vs RoCE** (§4.3) and **keeping the fabric lossless** (§4.5). The library (NCCL) that turns these verbs into all-reduces is §4.7.
+
+### 4.3 InfiniBand vs RoCE: two ways to carry RDMA
+
+§4.2 left every endpoint speaking RDMA — verbs, queue pairs, one-sided `WRITE`s. This section is the wire *underneath* them: **how those RDMA messages actually get carried across the cluster.** There are two answers in production, and the most useful thing to know up front is that **they share the same transport** — the difference is only what you wrap around it.
+
+- **InfiniBand (IB)** — a purpose-built, end-to-end fabric (NVIDIA/Mellanox): its own NICs (HCAs), its own switches, its own link and network layers, **lossless by design.**
+- **RoCE** — **RDMA over Converged Ethernet**: the *same* RDMA transport repackaged to ride the **Ethernet/IP** you already run. "RoCE v2" is the version everyone means today.
+
+**The packet tells the whole story.** Lay an IB frame next to a RoCEv2 frame and the relationship is obvious — RoCEv2 takes InfiniBand's transport (the BTH and everything above it) *untouched*, and swaps only the **carrier** beneath it:
+
+```
+   On the wire (left = first byte out):
+
+                  carrier  (differs)       |  transport  (byte-identical)
+   InfiniBand   [ LRH ][ GRH* ]            |  [ BTH ][ RETH ][ payload ][ ICRC ]
+   RoCE v2      [ Eth ][ IP ][ UDP:4791 ]  |  [ BTH ][ RETH ][ payload ][ ICRC ]
+
+   * GRH is optional (inter-subnet). IB adds a trailing link VCRC;
+     RoCE rides inside an ordinary Ethernet frame (FCS).
+```
+
+Read left-to-right, that's the derivation made literal: **RoCEv2 = InfiniBand's transport layer dropped onto UDP/IP/Ethernet.** Everything from the **BTH** rightward is the same transport — same headers, same field layout (with a few fields *used* differently, noted just below); IB carries it over its own link/network headers (LRH/GRH), RoCEv2 carries it inside a normal UDP datagram — **destination port 4791**, the registered "this payload is RDMA" marker.
+
+**Zoom into the BTH itself** — 12 bytes, three 32-bit words. The *layout* is identical whether InfiniBand or a RoCEv2 UDP datagram carries it; a few fields are *interpreted* differently, which we flag right after:
+
+```
+    0                   1                   2                   3
+    0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |    OpCode     |S|M|Pad| TVer  |             P_Key             |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |F|B| Reserved  |                Destination QP                 |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |A|  Reserved   |          Packet Sequence Number (PSN)         |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+   OpCode = which RDMA op (the verb)   P_Key = partition (tenant) tag
+   F/B = FECN/BECN congestion bits     A     = AckReq
+   S/M/Pad/TVer = small control bits
+```
+
+The fields that matter to us *are* the §4.2 concepts, now as bytes on the wire:
+
+- **OpCode** — *which verb* (the `WRITE`/`READ`/`SEND` from the §4.2 table); it also tells the receiver whether an extended header like RETH follows.
+- **Destination QP** — *which queue pair* (which connection), the 24-bit address of the target's queue.
+- **PSN** (packet sequence number) — *ordering and loss detection* — the field that makes "don't drop packets" enforceable (→ §4.5).
+- the **RETH** that follows on an RDMA op carries the **remote virtual address + R_Key** — i.e. the exact `rkey` capability token from §4.2, now a header field.
+
+**Same bytes, not always the same meaning.** A handful of fields carry over structurally but diverge in use between the two fabrics:
+
+- **F / B (FECN / BECN)** — the congestion bits, and only the *forward* half changes. **InfiniBand** sets **FECN (F)** in a data packet's BTH at the congested switch, and the receiver echoes back **BECN (B)** (piggybacked on an ACK, or in a CN packet). **RoCEv2** moves the *forward* signal up to **IP-header ECN** — the switch marks IP, so the BTH **F bit goes unused** — but the *backward* half is **still the B bit**: the receiver bounces a dedicated **CNP** (BTH opcode `0x81`, **BECN=1**) to throttle the sender. So **F is IB-only; B lives on both** — RoCE just packages it as the CNP (the §4.5 story).
+- **P_Key (partition key)** — a real, Subnet-Manager-administered partition (≈ a VLAN) on InfiniBand; RoCEv2 has no Subnet Manager, so it's still *validated* on ingress but not SM-managed — isolation comes from VLANs / PFC priorities instead.
+- **ICRC** — same field, different coverage: RoCEv2 recomputes it with IP/UDP standing in for IB's LRH and the GRH blanked to `0xFF`, since those bytes change hop-to-hop.
+
+The same correspondence, layer by layer — note the transport (bottom) is structurally identical, only the carrier (top) differs:
+
+| Layer                | InfiniBand                            | RoCE v2                               |
+|----------------------|---------------------------------------|---------------------------------------|
+| Link / local         | LRH — LIDs, set by a Subnet Manager   | Ethernet — MACs                       |
+| Network / global     | GRH *(optional, IPv6-style GIDs)*     | IP — routable                         |
+| Transport shim       | —                                     | UDP :4791 *(src port = flow entropy)* |
+| **Transport (RDMA)** | **BTH** — opcode, dest QP, PSN        | **BTH** — identical                   |
+| **RDMA addressing**  | **RETH** — remote virt addr + R_Key   | **RETH** — identical                  |
+| Integrity            | ICRC + link VCRC                      | ICRC + Ethernet FCS                   |
+
+**So what actually differs?** Only the carrier — but that one swap drives every practical tradeoff:
+
+- **Routability — RoCEv2 has IP, so it rides your Clos.** Because the transport sits inside UDP/IP, a RoCEv2 packet is a *normal routable packet*: ECMP, leaf-spine, all of it. Better still, the **UDP source port is free entropy** — the NIC varies it per flow so ECMP can spread RDMA across parallel paths (a §4.6 lever). InfiniBand instead routes on its own **LIDs**, handed out by a centralized **Subnet Manager** — a single controller programming the fabric, a very different control plane from distributed IP routing. *(Aside: the original **RoCE v1** put the BTH straight over Ethernet with no IP — L2-only, non-routable; effectively dead. v2 added IP/UDP precisely to make RDMA routable.)*
+- **Who guarantees losslessness — the real fork.** RDMA's simple transport assumes packets don't drop (§4.2). InfiniBand delivers that **for free**: its link layer uses **credit-based flow control** — a sender transmits only when the receiver has advertised buffer space, so the fabric *cannot* overflow and drop. Ethernet has no such thing; it drops when congested. So RoCE has to be **made** lossless on top, with PFC and ECN/DCQCN bolted on. That's not a footnote — it's the central operational headache of running RoCE, and it gets its own section (§4.5).
+- **Ecosystem & ops.** IB is one vendor, vertically integrated, lossless out of the box — at a premium, and with its own tooling (Subnet Manager, not BGP/SNMP). RoCE runs on **standard Ethernet switches from anyone** plus RDMA-capable NICs — commodity economics and your existing skill set — but now *you* own the losslessness IB handed you for free.
+
+> **InfiniBand = buy a fabric that's lossless by construction. RoCE = make your Ethernet behave like one.**
+
+Both deliver the GPU the identical RDMA verbs; the choice is about what you operate beneath them. The rest of §4 mostly assumes the harder, more common case — **RDMA on Ethernet** — because that's where the interesting failures live: why AI traffic breaks ordinary Ethernet (§4.4), and how PFC/ECN claw back the losslessness InfiniBand never had to (§4.5).
+
 # TODO list tracking
 
 
