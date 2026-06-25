@@ -191,7 +191,7 @@ Everything so far — sharded tensors, GPUs collaborating mid-computation — ha
 
 **Inference — use the model to serve users.** The model is trained; now you run it forward to answer requests. This *is* the **inference / serving** network already sitting at the top of the §1.4 diagram — **north-south, user-facing, load-balanced**, the Ethernet/IP/TCP traffic you've run your whole career. But there's a backend twist: a frontier model is still too big for one GPU, so even *serving* it is spread across GPUs — so inference *also* produces east-west collective traffic, just **lighter and less tightly synchronized** than training.
 
-Inference also splits into **two phases** with different appetites — worth knowing because they're increasingly run on *different* GPUs:
+For the models driving all this — **autoregressive LLMs**, which generate their answer one token at a time — inference splits into **two phases** with different appetites, increasingly run on *different* GPUs. *(This split is generative-specific, not universal: a classifier, an embedding model, or a vision model just does a single forward pass — no token-by-token decode, no KV cache. It's the autoregressive LLM that makes serving its own beast.)*
 - **Prefill** — read the whole prompt and build its context in one parallel pass. **Compute-heavy, bursty** (like ingesting a full request payload at once).
 - **Decode** — emit the answer one token at a time, each token depending on the last. **Latency-bound, many tiny steps, memory-bandwidth-hungry** (like a long-lived chatty session dribbling out its reply).
 
@@ -710,13 +710,13 @@ Two cuts on the near side (the kernel, then the memory), one on the far side. Th
 
 Each verb rides the wire as an **opcode in the RDMA transport header — the BTH (Base Transport Header)** — alongside the destination queue-pair number and a packet sequence number. That byte layout, and how InfiniBand and RoCE wrap the *same* BTH in different lower layers, is exactly §4.3.
 
-Under the hood it's **queue pairs** (a send + receive queue per connection) and a **completion queue** the NIC posts to when a transfer finishes — the app posts "work requests" and later reaps completions, never syscalling in between. You don't need the API; you need the shape: **app ↔ NIC via queues, NIC ↔ NIC over the wire, the OS nowhere in sight.** And before any of it, the target memory must be **registered** with the NIC, which hands back a key (an `rkey`) the initiator must present to touch that memory — effectively a **capability token**: an address *plus* the permission the remote pre-authorized (it also pins the pages so the NIC can DMA them safely).
+The shape under the hood is just that: **app ↔ NIC via memory-mapped queues (queue pairs), NIC ↔ NIC over the wire, the OS nowhere in sight.** The one prerequisite: target memory must be **registered** with the NIC first, yielding an `rkey` the initiator presents to touch it — a **capability token** (an address *plus* pre-authorized permission) that §4.3 will show riding in the packet itself.
 
-Put all three cuts together and that's the scale-out endpoint: a GPU writing into another GPU's memory a row of racks away, **no processor in the loop** — the closest a packet network gets to NVLink's memory semantics. But notice what it quietly assumes. One-sided `WRITE`s blasting into remote memory at 800 Gb/s only stay correct if packets **don't drop** — the simple RDMA transport has no graceful loss recovery. *How* you carry RDMA, and how you keep it from dropping, are the next sections: **InfiniBand vs RoCE** (§4.3) and **keeping the fabric lossless** (§4.5). The library (NCCL) that turns these verbs into all-reduces is §4.7.
+Put the three cuts together and that's the scale-out endpoint: a GPU writing into another GPU's memory a row of racks away, **no processor in the loop** — the closest a packet network gets to NVLink's memory semantics. But it rests on one quiet assumption: those one-sided `WRITE`s only stay correct if packets **don't drop**, and the simple RDMA transport has no graceful loss recovery. That assumption drives the rest of §4 — starting with *how* RDMA is actually carried.
 
 ### 4.3 InfiniBand vs RoCE: two ways to carry RDMA
 
-§4.2 left every endpoint speaking RDMA — verbs, queue pairs, one-sided `WRITE`s. This section is the wire *underneath* them: **how those RDMA messages actually get carried across the cluster.** There are two answers in production, and the most useful thing to know up front is that **they share the same transport** — the difference is only what you wrap around it.
+Two carriers do that job in production — and the most useful thing to know up front is that **they share the same transport**; the difference is only what you wrap around it.
 
 - **InfiniBand (IB)** — a purpose-built, end-to-end fabric (NVIDIA/Mellanox): its own NICs (HCAs), its own switches, its own link and network layers, **lossless by design.**
 - **RoCE** — **RDMA over Converged Ethernet**: the *same* RDMA transport repackaged to ride the **Ethernet/IP** you already run. "RoCE v2" is the version everyone means today.
@@ -759,7 +759,25 @@ The fields that matter to us *are* the §4.2 concepts, now as bytes on the wire:
 - **OpCode** — *which verb* (the `WRITE`/`READ`/`SEND` from the §4.2 table); it also tells the receiver whether an extended header like RETH follows.
 - **Destination QP** — *which queue pair* (which connection), the 24-bit address of the target's queue.
 - **PSN** (packet sequence number) — *ordering and loss detection* — the field that makes "don't drop packets" enforceable (→ §4.5).
-- the **RETH** that follows on an RDMA op carries the **remote virtual address + R_Key** — i.e. the exact `rkey` capability token from §4.2, now a header field.
+- the **RETH** on an RDMA op carries the **remote virtual address + R_Key** — the `rkey` capability token from §4.2, now a header field.
+
+That last one is worth drawing too, because the **RETH (RDMA Extended Transport Header)** *is* §4.2's one-sided superpower as bytes — 16 bytes saying *where* to write and *by whose leave*:
+
+```
+    0                   1                   2                   3
+    0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |                    Virtual Address  [63:32]                   |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |                    Virtual Address  [31:0]                    |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |                             R_Key                             |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |                           DMA Length                          |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+**Virtual Address** = where in the peer's HBM to land the data · **R_Key** = the `rkey` capability that authorizes it · **DMA Length** = how many bytes. It rides only on the *first (or only)* packet of an RDMA `WRITE`/`READ` — the BTH OpCode flags its presence. This one header is what lets the initiator reach straight into a peer's memory with the target CPU asleep (§4.2's far-side cut).
 
 **Same bytes, not always the same meaning.** A handful of fields carry over structurally but diverge in use between the two fabrics:
 
@@ -787,6 +805,126 @@ The same correspondence, layer by layer — note the transport (bottom) is struc
 > **InfiniBand = buy a fabric that's lossless by construction. RoCE = make your Ethernet behave like one.**
 
 Both deliver the GPU the identical RDMA verbs; the choice is about what you operate beneath them. The rest of §4 mostly assumes the harder, more common case — **RDMA on Ethernet** — because that's where the interesting failures live: why AI traffic breaks ordinary Ethernet (§4.4), and how PFC/ECN claw back the losslessness InfiniBand never had to (§4.5).
+
+### 4.4 Why AI traffic breaks ordinary networks
+
+§4.1 warned that the fabric sits on the **critical path of every iteration** and its tail latency sets the job's pace. Here's *why* that's hard: AI traffic violates the one assumption every data-center network you've ever built quietly relies on.
+
+**The assumption: many small, independent flows.** Enterprise and cloud fabrics work because of **statistical multiplexing**. Thousands of users, millions of short, *independent* flows — so the aggregate is smooth, peaks rarely line up, and you can safely **oversubscribe** (provision for the average, not the sum). The law of large numbers does your capacity planning for you. And a little loss is fine: TCP backs off, retransmits, nobody notices.
+
+**AI breaks every clause of that.** A training step is **one** workload, not millions of independent ones. Its flows are **few** (one or a handful per GPU pair), **huge** (gigabytes per collective, elephants not mice), **synchronized** (they start on the same clock edge and all want peak bandwidth at once), and **correlated** (no averaging-out — it's all the same job stepping in lockstep). The very first casualty is oversubscription: AI backend fabrics are built **full-bisection (non-blocking)** because you can't lean on statistical multiplexing — but as we'll see, even a non-blocking fabric still suffers the three pathologies below, because they're about *where and when* traffic lands, not average capacity.
+
+**1. Elephant flows — and why they wreck ECMP.** ECMP spreads traffic by **hashing each flow** to a path. With millions of flows that averages out beautifully. With *eight* giant flows across *sixteen* links, hashing is a dice roll — two elephants collide on one link (running it at 200%) while others sit idle. One hot link throttles the whole collective:
+
+```
+   FEW ELEPHANTS — per-flow ECMP hashing can't spread so few flows:
+
+       flow A ==\                          link 1:  A + B   ==>  200%  HOT
+       flow B ===>--[ hash 5-tuple ]-->    link 2:  C       ==>  ok
+       flow C ==/                          link 3:  ------   idle
+                                           link 4:  ------   idle
+       a handful of giant flows over many links: collisions, hot AND cold
+```
+
+The UDP source-port entropy from §4.3 helps the hash, but more entropy can't fix *too few flows*. The real fixes are topology and smarter spreading — **§4.6**.
+
+**2. Incast — many senders, one receiver, one instant.** Here's the subtlety, and it's worth getting right: a well-built **all-reduce does *not* cause this.** NCCL runs it as a **ring** (each GPU sends to one neighbor and receives from one — never N→1) or a **double-binary tree** (fan-in of ~2), *deliberately* shaped so no GPU is an N-way sink. Incast comes from elsewhere:
+
+- **all-to-all** — the collective behind **MoE expert parallelism**: it runs *within an expert-parallel (EP) group* — the subset of GPUs that hold the sharded expert FFNs, not the whole cluster. Inside that group every GPU's router scatters its tokens to whichever members hold the chosen (top-k) experts, all at once — so each member really is receiving from many peers simultaneously. Genuine incast, just **bounded to the EP-group size**. It's already 20–60% of MoE training time, and worse once the group spans nodes.
+- **port / uplink convergence** — even perfectly balanced flows pile up when routing lands several on one switch egress port, or on an oversubscribed spine uplink (the §1 elephant problem, now hitting a buffer).
+
+Either way, N synchronized senders hit one port — and a switch buffer is **shallow**, tens of MB shared across dozens of 400G ports, only **microseconds** of absorption. It fills before any feedback loop can react, and overflows:
+
+```
+   INCAST — many flows hit one egress port at the same instant
+   (all-to-all / MoE dispatch, or routing piling flows onto one port)
+
+       GPU1 --\
+       GPU2 ---\          +=====================+
+       GPU3 ----+-------> |   switch egress     | -----> GPU0  (one receiver)
+       ....  ---/         |   buffer ~tens MB   |
+       GPUn --/           +=====================+
+                            fills in microseconds at 400G  -->  DROP
+```
+
+Storage networks have fought TCP incast for years; AI incast is worse, because it's **synchronized by design** and the transport beneath it (RDMA) despises drops. Stopping the overflow is **§4.5**.
+
+**3. Synchronized microbursts.** Arrivals aren't random (Poisson) — they're **simultaneous**. A collective launch is a wall of traffic that fills buffers in microseconds: not *sustained* oversubscription you can provision around, but *instantaneous* oversubscription far faster than any congestion signal can chase.
+
+**Why this is fatal, not merely slow.** Congestion hurts two different ways — and a collective amplifies both:
+
+- **A drop is a cliff, not a hiccup.** RDMA's reliable transport tracks order by **PSN** (§4.3). Lose one packet and the receiver sees a gap in the sequence; the classic recovery is **go-back-N** — the sender rewinds to the lost packet and **re-sends everything after it**, including packets that already arrived fine (the receiver discarded them as out-of-order). One dropped cell can throw away a whole window of in-flight data — a throughput *cliff*, not TCP's gentle selective-retransmit dip. (Newer NICs add selective retransmit, but go-back-N is the baseline, and it's why §4.5 fights so hard to *never* drop.)
+- **Even with zero drops, latency alone stalls everyone — the *tail*.** A collective is a **barrier**: an all-reduce isn't done until the *slowest* GPU's data lands, and **no GPU starts the next compute step until it's done.** So the number that matters is **tail latency** — the slowest path, not the average. A congested link that merely *queues* packets (dropping nothing) still delays its flow, makes that GPU the straggler, and **idles every other GPU in the job** until it catches up. Drops create a straggler; so does plain queueing delay — and the barrier turns *either* into a whole-cluster stall.
+
+So "fast on average" is meaningless here. The fabric inherits two jobs ordinary networks never had: **don't drop** (engineer losslessness — §4.5) and **keep the tail short** by spreading the few giant flows (congestion control — §4.5; topology and load balancing — §4.6). Both exist for one reason — a single slow flow, whether *dropped* or merely *delayed*, is paid for by tens of thousands of waiting GPUs.
+
+**Does inference break the network too? Yes — differently.** Everything above is *training*. Inference serves many independent requests, but a served model is **also sharded** (tensor-parallel, plus all-to-all if it's MoE) and **also on RDMA**, so it inherits the same drop-cliff and tail stakes. Two twists change the shape:
+
+- **Batched and disaggregated.** Requests are processed in **continuous batches** (each forward pass steps a batch of active sequences in lockstep), and modern serving is often **disaggregated** — prefill and decode run on *separate* GPU pools, so the **KV cache** built during prefill is shipped prefill-pool → decode-pool. That transfer is a bulk, point-to-point flow ECMP collides like any elephant — a traffic class training simply doesn't have.
+- **Smaller radius, latency as the metric.** The synchronized part is scoped to one serving instance (a TP/EP group of ~8–64 GPUs, not the whole cluster), and across independent requests **statistical multiplexing partly returns**. But the tail doesn't go away — it just becomes **user-facing**: the per-iteration all-reduce sits on every token's path (inter-token latency), and KV-cache transfer sits on time-to-first-token.
+
+So inference is **hard to transport too**, just heterogeneously — smaller-radius collectives plus bulk KV-cache flows, against tight latency SLOs. §5 develops the full train-vs-inference traffic catalog; the point for *this* section is that **both** workloads break the ordinary-network assumptions, for overlapping reasons.
+
+### 4.5 Keeping it lossless: PFC, ECN, and DCQCN
+
+§4.4 left us with a mandate ordinary networks never had: **don't drop** (a lost packet is a go-back-N cliff) *and* **don't even queue for long** (a slow link is a barrier-wide stall). This section is how the fabric delivers the first half — losslessness — without the cure becoming the disease.
+
+The two transports get there very differently, and it's **RoCEv2** that has the real work to do — Ethernet has to *retrofit* losslessness it was never born with. So we spend this section mostly on the RoCE machinery (**PFC**, then **ECN/DCQCN**), and only at the end circle back to how **InfiniBand** gets the same two jobs for free from its architecture. Everything until that closeout is the Ethernet/RoCE story.
+
+Start from what you already run. Ethernet has had **flow control** since forever — **802.3x PAUSE**: a receiver whose buffer is filling tells the upstream port to *stop sending* for a moment. That's backpressure, and it's exactly the instinct here. The catch is that classic PAUSE stops the *whole link* — storage, management, RDMA, all of it. AI fabrics need to pause **only the RDMA traffic class** while everything else keeps flowing, and they need a gentler loop that keeps queues short so the hard PAUSE rarely fires at all. So losslessness on Ethernet is **two control loops at two timescales**, both scoped to a priority class:
+
+```
+   TWO CONTROL LOOPS, TWO TIMESCALES, ONE PRIORITY CLASS
+
+   end-to-end  (slow, ~RTT)   queue builds -> ECN mark -> CNP -> sender slows
+   hop-by-hop  (fast, <RTT)   buffer fills  -> PFC PAUSE -> upstream link stops
+
+   ECN/DCQCN is the primary loop (keep queues short); PFC is the backstop
+   (a hard PAUSE that must almost never fire) — tune ECN to trip first.
+```
+
+**PFC (Priority Flow Control, 802.1Qbb) — the hard backstop.** This is 802.3x PAUSE you already know, made **per-priority**: each of the 8 Ethernet priority classes gets its own PAUSE, so the switch can freeze the lossless RDMA class (say priority 3) while TCP and management keep moving. When an ingress buffer for that class crosses a threshold, the switch fires a PAUSE *upstream*, hop by hop, and the link goes quiet for that class — **zero drops by construction**. It's fast (sub-RTT, no end-to-end loop) and blunt, which is exactly why it's the *last* resort, not the *first*:
+
+- **Head-of-line blocking.** PAUSE stops *everything* in the class on that link, including flows that weren't headed for the congested port — innocent bystanders stall.
+- **Congestion spreading.** A full buffer pauses its upstream, whose buffer then fills and pauses *its* upstream — the backpressure walks **backward across the fabric**, turning one hot port into a tree of paused links (the "victim flow" problem).
+- **PFC deadlock.** If paused links form a **cycle** (a buffer-dependency loop, which credit-free Ethernet doesn't prevent), the whole cycle waits on itself forever — a fabric-wide freeze. Avoiding it takes careful topology and watchdogs. This is the nightmare PFC config tries to never reach.
+
+So PFC is the airbag: it must exist, but if it's deploying often, something upstream is already wrong. The job of the second loop is to keep the airbag from firing.
+
+**ECN + DCQCN — the proactive loop.** Instead of waiting for a buffer to fill, mark *early*. A switch whose queue crosses a (lower) threshold sets **IP-ECN = CE** on passing packets — the **forward** congestion signal from §4.3, the one RoCEv2 moved out of the BTH and into the IP header. The receiver sees the CE mark and reflects it to the sender as a **CNP** — and we already drew that packet: a **BTH with opcode 0x81 and BECN=1**, the *backward* signal. The sender's NIC runs **DCQCN** (a DCTCP cousin, implemented in NIC hardware): on each CNP it **cuts its injection rate**, then probes back up when the marks stop.
+
+```
+   DCQCN — the proactive loop that closes §4.3's CNP
+
+        data
+   sender  =============================>+=====================+
+     ^                                   |    switch egress    |
+     |                                   |  queue > ECN thresh |
+     |                                   |  stamp IP-ECN = CE  |
+     |                                   +=====================+
+     |                                             |  CE-marked data
+     |                                             v
+     +<===== CNP: BTH opcode 0x81, BECN=1 ======  receiver NIC
+        sender cuts injection rate -> queue drains -> CNP stops -> rate climbs
+```
+
+The whole trick is **threshold ordering**: set the ECN marking threshold *below* the PFC PAUSE threshold, so DCQCN starts trimming rates while there's still buffer headroom — and the hard PAUSE only fires if the gentle loop couldn't keep up (a microburst faster than one RTT). ECN/DCQCN is the everyday throttle; PFC is the floor under it.
+
+**The other fabric, the same two jobs.** Step back: this section really has **two** jobs, not one — **losslessness** (never drop) and **congestion control** (keep injection rates sane so queues stay short). On RoCE those are two separate mechanisms — **PFC** for the first, **ECN/DCQCN** for the second. InfiniBand does *both* too; it just builds them into the architecture instead of bolting them on:
+
+- **Losslessness — credits, not PAUSE.** The IB link layer is **credit-based**: a sender may transmit *only* when the downstream has advertised **credits** — guaranteed buffer space for what's coming. No credits, no send; a buffer can't overflow because nobody is ever allowed to send into a full one. Losslessness by construction — no thresholds to trip, no PAUSE to propagate, no deadlock to design around. RoCE's PFC is the Ethernet *emulation* of this.
+- **Congestion control — and here §4.3's F/B bits finally cash in.** IB runs the *same shape* of loop as DCQCN, but using the **BTH bits we already drew**: a congested switch sets **FECN** in the BTH; the destination HCA, seeing it, returns a **BECN** to the source; the source throttles by bumping an index (**CCTI**) into a **Congestion Control Table (CCT)**, whose entries are **inter-packet delays** — it literally spaces its packets further apart. When the BECNs stop, a timer walks the index back down and the rate climbs. The table and timers are set by the **congestion-control manager** (the subnet manager's remit), not configured switch-by-switch — the same *SM-owns-the-fabric* pattern from §4.3.
+
+This is exactly why the **F bit was IB-only** back in §4.3: IB does forward-marking *inside* the BTH, so FECN lives there; RoCE moved forward-marking out to **IP-ECN** and repackaged the backward half as the **CNP**, leaving the BTH's F bit dead on Ethernet. Same loop, different envelope:
+
+| job                    | RoCE / Ethernet                                                             | InfiniBand                                                                        |
+|------------------------|-----------------------------------------------------------------------------|-----------------------------------------------------------------------------------|
+| **losslessness**       | PFC — per-priority PAUSE, retrofit onto Ethernet                          | credits — lossless by design, built into the link layer                         |
+| **congestion control** | switch marks IP-ECN → receiver returns CNP (BTH 0x81) → DCQCN cuts rate | switch sets FECN in BTH → receiver returns BECN → CCTI/CCT inter-packet delay |
+
+So the deep payoff of the §4.3 framing stands, just stated more carefully: **IB gets both jobs from its architecture; RoCE has to engineer both onto Ethernet** — PFC, ECN, DCQCN, and the threshold tuning that keeps them in their lanes. That's why RoCE is fiddlier to operate, and why it wins anyway: it runs on the Ethernet you already own.
+
+**Where this leaves us.** Losslessness handles §4.4's *first* axis — the drop cliff — and DCQCN starts on the second by holding queues short. But a single end-to-end rate loop can't fix flows landing on the *wrong path* in the first place: the elephant-on-ECMP collision and the few-giant-flows problem are about **placement**, not rate. Keeping the **tail** short needs the fabric to spread those flows across paths — **topology and load balancing, §4.6**.
 
 # TODO list tracking
 
