@@ -5,7 +5,7 @@
 If you have spent your career thinking in terms of routers, MPLS labels, routing tables, BGP and the occasional `tcpdump`, the world of "GPU networking" can feel like it was designed by aliens. People throw around words like *NVLink*, *NVSwitch*, *collective*, *all-reduce*, *RDMA*, *RoCE* and *rail-optimized fabric* as if they were obvious. They are not.
 
 This document is two things at once, the same way I did the [k8s service & LB testing notes](https://github.com/robric/k8s-svc-and-lb-testing) were:
-- a **personal cheat sheet** so I (and maybe you) can stop re-clauding/googling "how does this NVLink thing is network or a bus?" every three months.
+- a **personal cheat sheet** so I (and maybe you) can stop re-clauding/googling "how does this NVLink thing connects GPUs to each other ?" every three months.
 - an **educational source** to explain how GPU interconnects actually work, starting from networking intuition you already have.
 
 
@@ -54,6 +54,8 @@ Before the glossary, one picture. At the highest level a GPU is **a big grid of 
                                  scale-out fabric
 ```
 
+<p align="center"><em>A GPU: a grid of SMs wrapped in HBM, links at the edges.</em></p>
+
 The three edges leaving the box map exactly onto the two-interconnect story coming up:
 
 - **NVLink → peer GPUs** — the sideways link. This is *scale-up* (§3).
@@ -75,6 +77,8 @@ Zoom into **one SM** — this is where the actual math happens:
    | Other units                   -> specialized: TMA copies, FP64, TMEM... |
    +-------------------------------------------------------------------------+
 ```
+
+<p align="center"><em>Inside one SM: schedulers, math units, and local scratch memory.</em></p>
 
 The takeaway: **compute is the grid of SMs; memory bandwidth is the HBM ring feeding them; the network (PCIe/NVLink) hangs off the edge.** Everything in this document is about that last part — the edge — but it only makes sense once you see that the edge exists to keep the HBM, and through it the SMs, fed.
 
@@ -109,6 +113,8 @@ A GPU is not a standalone computer. It lives inside a server, attached to a CPU:
    |\_____ NUMA domain 0 _______/              \_______ NUMA domain 1 _______/       |
    +---------------------------------------------------------------------------------+
 ```
+
+<p align="center"><em>One node: two CPU sockets, eight GPUs, two NUMA domains.</em></p>
 
 - The **CPU is the "host"**; each **GPU is a "device."**
 - **Real boxes are dual-socket.** A reference 8-GPU server (NVIDIA HGX/DGX-class) has **two CPU sockets**, with the GPUs partitioned across them — typically GPU0–3 under CPU0 and GPU4–7 under CPU1 (often through PCIe switches). This is **not failover redundancy** — if a CPU dies its GPUs don't migrate. It's there for **PCIe lanes** (8 GPUs + ~8 NICs + NVMe need more lanes than one socket has) and **NUMA balance**. Note that this already makes the node a **NUMA machine** *before* NVLink enters — crossing from a CPU0-GPU to a CPU1-GPU traverses the inter-socket link (UPI / Infinity Fabric).
@@ -156,6 +162,8 @@ Zoom out from the chip to the data hall, network-engineer hat on. A GPU node sit
    +============================= BACKEND ============================+
 ```
 
+<p align="center"><em>Two paths off a node: the CPU frontend, the GPU/RDMA backend.</em></p>
+
 - **Frontend — the host / CPU / socket path** (top of the diagram). Not one network but several, all conventional **Ethernet / IP / TCP** you already run: **inference / serving** (user requests to model endpoints, north-south, load-balanced), **tenant / VPC** (multi-tenant isolation), **orchestration** (k8s / Slurm scheduling), and **management / OOB** (BMC, provisioning). From a GPU's point of view it's all "stuff the host does for me" — and all of it is **your existing skill set** (→ §6).
 - **Backend — the GPU / RDMA / memory path** (bottom). Kernel-bypass, no sockets, and itself **two fabrics**: a **compute fabric** carrying GPU↔GPU collective traffic — **scale-up** (NVLink, in-rack — §3) and **scale-out** (IB / RoCE RDMA, cluster-wide — §4); plus a **storage fabric** for **GPU↔high-performance storage** via **GPUDirect Storage** (NVMe / parallel-FS DMA'd straight into HBM). This is the new, hard part — the rest of the document.
 
@@ -182,6 +190,8 @@ Everything so far — sharded tensors, GPUs collaborating mid-computation — ha
       G === G === G === G              east-west but lighter: the model is
       (lighter collectives)            still sharded across GPUs (backend)
 ```
+
+<p align="center"><em>Training: backend lockstep. Inference: user-facing front, lighter back.</em></p>
 
 **Training — build the model.** This is the heavy one. Thousands of GPUs run in **lockstep**, grinding through the dataset for days or weeks, and after every step they reconcile what they learned — the **gradient all-reduce** from §3.7: *every parameter, summed across every replica.* Its traffic signature:
 - **East-west and internal** — GPU↔GPU collectives dominate; almost nothing leaves for a user. Pure **backend** (§1.4).
@@ -251,6 +261,8 @@ Inside a chassis, line cards talk over a backplane that is fast, short, lossless
                                   |
                               Spine fabric
 ```
+
+<p align="center"><em>Scale-up binds GPUs inside a node; scale-out links the nodes.</em></p>
 
 - The `====` and `X` **inside** each node are **NVLink** — the scale-up fabric. Memory-semantic, microsecond-and-below, hundreds of GB/s to TB/s *per GPU*.
 - The lines **between** nodes are the **scale-out** network — packet-switched, RDMA, built from NICs, leaf and spine switches, measured in hundreds of Gb/s *per port*.
@@ -347,6 +359,9 @@ NVLink looks exotic until you realize it's built from the **exact same Lego bric
 
    (NVLink 3.0+ shown: 4 pairs per sub-link; 1.0/2.0 used 8.)
 ```
+
+<p align="center"><em>Wire pairs bond into sub-links, into links, into one per-GPU pipe.</em></p>
+
 Map this to networking and it's familiar territory:
 
 - A **differential pair** is one **unidirectional** SerDes wire pair. (Heads-up: a "lane" in PCIe/Ethernet usually means a *full-duplex* pair-of-pairs — one TX, one RX. NVLink counts the one-way pairs, so keep the direction straight.)
@@ -382,9 +397,7 @@ One honest caveat before we move on: a single NVLink **link only reaches one nei
 
 We left §3.2 with a cliffhanger: a GPU has **18 links, and each link reaches exactly one neighbor.** So how do you get *all* the GPUs in a box talking to *all* the others at full bandwidth? This is a topology question you have answered a hundred times in networking — and the answer is the same one networking reached decades ago.
 
-**Option A: wire them directly to each other (a full mesh).** Give every GPU a cable to every other GPU. For a handful of GPUs this even works — early DGX-1 (V100) did a variant of it. But you already know how that ends — we don't cable every PC to every other PC, and the same reasons (O(N²) cabling, no clean way to extend) apply here. 
-
-The one GPU-specific twist worth keeping in mind: a GPU's **18 links are a fixed budget**, so a mesh has to split them across all N−1 peers — at 8 GPUs that's ~2.5 lumpy links to each, and every GPU you add shrinks the bandwidth to the others. So, exactly as in the network, you put a **switch** in the middle.
+**Option A: wire them directly to each other (a full mesh).** Give every GPU a cable to every other GPU. For a handful of GPUs this even works — early DGX-1 (V100) did a variant of it. But you already know how that ends — O(N²) cabling that won't extend, and a GPU's 18 links are a fixed budget to split across every peer. No need to dwell on it: you put a **switch** in the middle (Option B).
 
 **Option B: connect every GPU to a switch (NVSwitch).** NVSwitch is precisely that — a **non-blocking crossbar switch for NVLink traffic**. Every GPU plugs its 18 links into the switch tier instead of into other GPUs. The crossbar then lets **any GPU reach any other GPU at full NVLink bandwidth, uniformly** — no lumpy per-peer math, no favoritism:
 
@@ -401,6 +414,8 @@ The one GPU-specific twist worth keeping in mind: a GPU's **18 links are a fixed
    +------------+------------+------------+------------+
         => any GPU <-> any GPU, full ~900 GB/s, uniform
 ```
+
+<p align="center"><em>Each GPU spreads its 18 links across four NVSwitch chips: any-to-any.</em></p>
 
 In a real **8-GPU HGX H100 node** this is **4 third-generation NVSwitch chips**, and each GPU spreads its 18 links across all four — **5 links to two of the switches, 4 to the other two** (5+5+4+4 = 18, since 18 won't divide evenly by 4):
 
@@ -419,6 +434,8 @@ In a real **8-GPU HGX H100 node** this is **4 third-generation NVSwitch chips**,
                 5  +  5  +  4  +  4  = 18      (every GPU wires up
                                                 the same way)
 ```
+
+<p align="center"><em>One GPU's 18 links, split 5+5+4+4 across the four chips.</em></p>
 
 The result is **full bisection bandwidth**: all 8 GPUs can be talking to all others simultaneously, each at the full per-GPU rate, with no internal bottleneck.
 
@@ -453,6 +470,8 @@ Physically, this is where the switch **leaves the baseboard**. The pizza-box col
    each chip -> 72 ports = 1 from each GPU   =>  1,296 links, non-blocking
 ```
 
+<p align="center"><em>NVL72: one link from each GPU to each of 18 chips, over copper.</em></p>
+
 Zooming to a single GPU makes the "1 per chip" concrete (the §3.3 zoom, now 18 chips instead of 4):
 
 ```
@@ -472,6 +491,8 @@ Zooming to a single GPU makes the "1 per chip" concrete (the §3.3 zoom, now 18 
    THROUGH the chips: every chip connects to all 72 GPUs, so
         G0  ->  any chip  ->  any GPU      (always one switch hop)
 ```
+
+<p align="center"><em>Every GPU reaches all 71 others through the chips — one hop.</em></p>
 
 **So how does a GPU actually attach to those switch trays? Still NVLink** — the same protocol as on the baseboard, just carried over *cable* now instead of board traces. Each GPU's 18 NVLink ports run out the back of its compute tray into the **NVLink spine**: a **passive copper** cable backplane of ~5,000 coax cables. There's no hand-cabling — trays mate through **rear blind-mate connectors**, so sliding a tray into the rack makes it "bite" into the spine.
 
@@ -495,6 +516,8 @@ This also quietly explains the rack itself: the spine is **copper**, and copper 
 
    any GPU <-> any of the other 575  =  2 switch hops (leaf -> spine -> leaf)
 ```
+
+<p align="center"><em>NVL576: a two-tier NVLink Clos — copper in-rack, optics between racks.</em></p>
 
 Two things change from NVL72:
 
@@ -533,6 +556,8 @@ There are two fundamentally different ways for one chip to get at data sitting i
      ld R1, [addr in B's HBM]       <---    ( passive — runs no code )
      one side acts; the unit is a *memory access* to a shared address
 ```
+
+<p align="center"><em>Send/receive needs both sides; load/store needs only the issuer.</em></p>
 
 **Why this is the whole ballgame for scale-up.** The §3.1 goal was to make N GPUs a NUMA shared-memory domain — *this* is the mechanism. Because every GPU's HBM sits in one **global address space**, a pointer on GPU 0 can point into GPU 7's memory, and dereferencing it Just Works over NVLink. You don't "send the tensor to GPU 7" — you write to where GPU 7 will read it. That's why "72 GPUs act as one giant GPU" is more than a slogan: at the lowest level they share an address space the way cores in one chip do.
 
@@ -611,6 +636,8 @@ So there's a hard ceiling — today, hundreds to a few thousand GPUs per NVLink 
                   RDMA over a leaf-spine Clos   ->   all of §4
 ```
 
+<p align="center"><em>The real cluster: scale-up islands stitched by a scale-out fabric.</em></p>
+
 Inside each island, GPUs share memory over NVLink (§3.1–3.6). Between islands, they fall back to **message passing over the NIC** — RDMA packets across an InfiniBand or RoCE Clos (§4). Two fabrics, layered: a fast *memory* fabric inside the island, a routed *packet* fabric between islands.
 
 **The punchline — the boundary is also where you cut the workload.** This isn't just physics; it dictates *how a model is partitioned.* You match each kind of parallel traffic to the fabric that suits it:
@@ -686,6 +713,8 @@ Back in §3.5 we slotted RDMA onto the spectrum between sockets and NVLink: **on
             CPU posts the request once, then never touches the data
 ```
 
+<p align="center"><em>TCP touches the CPU on every packet; RDMA+GPUDirect keeps it off.</em></p>
+
 **One idea, three cuts.** What follows isn't three separate inventions — it's a single goal, **no CPU touches the bytes on either end**, enforced at the three places a CPU could otherwise sit on the datapath. A router already keeps its data plane off the route processor; scale-out pushes that further, off *every* CPU, near and far:
 
 | Where a CPU could sit on the path                       | What removes it              | Side |
@@ -734,6 +763,8 @@ Two carriers do that job in production — and the most useful thing to know up 
      RoCE rides inside an ordinary Ethernet frame (FCS).
 ```
 
+<p align="center"><em>IB and RoCEv2 share the transport; only the carrier beneath differs.</em></p>
+
 Read left-to-right, that's the derivation made literal: **RoCEv2 = InfiniBand's transport layer dropped onto UDP/IP/Ethernet.** Everything from the **BTH** rightward is the same transport — same headers, same field layout (with a few fields *used* differently, noted just below); IB carries it over its own link/network headers (LRH/GRH), RoCEv2 carries it inside a normal UDP datagram — **destination port 4791**, the registered "this payload is RDMA" marker.
 
 **Zoom into the BTH itself** — 12 bytes, three 32-bit words. The *layout* is identical whether InfiniBand or a RoCEv2 UDP datagram carries it; a few fields are *interpreted* differently, which we flag right after:
@@ -753,6 +784,8 @@ Read left-to-right, that's the derivation made literal: **RoCEv2 = InfiniBand's 
    F/B = FECN/BECN congestion bits     A     = AckReq
    S/M/Pad/TVer = small control bits
 ```
+
+<p align="center"><em>The 12-byte BTH: opcode, destination queue pair, sequence number.</em></p>
 
 The fields that matter to us *are* the §4.2 concepts, now as bytes on the wire:
 
@@ -776,6 +809,8 @@ That last one is worth drawing too, because the **RETH (RDMA Extended Transport 
    |                           DMA Length                          |
    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
+
+<p align="center"><em>The 16-byte RETH: remote address, R_Key, length — where, and by whose leave.</em></p>
 
 **Virtual Address** = where in the peer's HBM to land the data · **R_Key** = the `rkey` capability that authorizes it · **DMA Length** = how many bytes. It rides only on the *first (or only)* packet of an RDMA `WRITE`/`READ` — the BTH OpCode flags its presence. This one header is what lets the initiator reach straight into a peer's memory with the target CPU asleep (§4.2's far-side cut).
 
@@ -838,6 +873,8 @@ Both fabrics deliver the GPU the identical RDMA verbs; the choice is about what 
        a handful of giant flows over many links: collisions, hot AND cold
 ```
 
+<p align="center"><em>Too few flows for ECMP: elephants collide on one link, others idle.</em></p>
+
 The UDP source-port entropy from §4.3 helps the hash, but more entropy can't fix *too few flows*. The real fixes are topology and smarter spreading — **§4.6**.
 
 **2. Incast — many senders, one receiver, one instant.** Here's the subtlety, and it's worth getting right: a well-built **all-reduce does *not* cause this.** NCCL runs it as a **ring** (each GPU sends to one neighbor and receives from one — never N→1) or a **double-binary tree** (fan-in of ~2), *deliberately* shaped so no GPU is an N-way sink. Incast comes from elsewhere:
@@ -858,6 +895,8 @@ Either way, N synchronized senders hit one port — and a switch buffer is **sha
        GPUn --/           +=====================+
                             fills in microseconds at 400G  -->  DROP
 ```
+
+<p align="center"><em>Incast: many synchronized senders overflow one shallow egress buffer.</em></p>
 
 Storage networks have fought TCP incast for years; AI incast is worse, because it's **synchronized by design** and the transport beneath it (RDMA) despises drops. Stopping the overflow is **§4.5**.
 
@@ -895,6 +934,8 @@ Start from what you already run. Ethernet has had **flow control** since forever
    (a hard PAUSE that must almost never fire) — tune ECN to trip first.
 ```
 
+<p align="center"><em>Two loops, two timescales: ECN/DCQCN trims first, PFC is the backstop.</em></p>
+
 **PFC (Priority Flow Control, 802.1Qbb) — the hard backstop.** This is 802.3x PAUSE you already know, made **per-priority**: each of the 8 Ethernet priority classes gets its own PAUSE, so the switch can freeze the lossless RDMA class (say priority 3) while TCP and management keep moving. When an ingress buffer for that class crosses a threshold, the switch fires a PAUSE *upstream*, hop by hop, and the link goes quiet for that class — **zero drops by construction**. It's fast (sub-RTT, no end-to-end loop) and blunt, which is exactly why it's the *last* resort, not the *first*:
 
 - **Head-of-line blocking.** PAUSE stops *everything* in the class on that link, including flows that weren't headed for the congested port — innocent bystanders stall.
@@ -908,17 +949,56 @@ So PFC is the airbag: it must exist, but if it's deploying often, something upst
 ```
    DCQCN — the proactive loop that closes §4.3's CNP
 
-        data
-   sender  =============================>+=====================+
-     ^                                   |    switch egress    |
-     |                                   |  queue > ECN thresh |
-     |                                   |  stamp IP-ECN = CE  |
-     |                                   +=====================+
-     |                                             |  CE-marked data
-     |                                             v
-     +<===== CNP: BTH opcode 0x81, BECN=1 ======  receiver NIC
-        sender cuts injection rate -> queue drains -> CNP stops -> rate climbs
+                +------------- Switch fabric -----------+
+   +--------+   |data+--------+     +--------------+    |   +--------+
+   | sender |------->| switch |---->|    switch    |------->| recvr  |
+   |  NIC   |   |    +--------+     | (congested)  |    |   |  NIC   |
+   +--------+   |                   | marks ECN=CE |    |   +--------+
+       ^        |                   +--------------+    |       |
+       |        +---------------------------------------+       |
+       |                                                        |
+       +-<------- CNP: BTH opcode 0x81, BECN=1 -----------------+
+
+   sender cuts injection rate -> queue drains -> CNP stops -> rate climbs
 ```
+
+<p align="center"><em>The switch marks early; the receiver returns a CNP; the sender trims its rate.</em></p>
+
+**Where the mark actually lives.** That forward "CE" signal isn't a new field — it's **two bits of the IPv4 header you've ignored your whole career**: the low 2 bits of the **DS field**. The top 6 bits are **DSCP** (RFC 2474); the bottom 2 are **ECN** (RFC 3168, which updates 2474):
+
+```
+     0   1   2   3   4   5   6   7
+   +---+---+---+---+---+---+---+---+
+   |          DSCP         |  ECN  |
+   +---+---+---+---+---+---+---+---+
+
+   ECN codepoint (RFC 3168, the 2 low bits):
+     00  Not-ECT  (sender opted out)
+     01  ECT(1)  ┐ ECN-capable, not yet marked
+     10  ECT(0)  ┘
+     11  CE       congestion experienced  <- switch sets this
+```
+
+<p align="center"><em>ECN is the low 2 bits of the IPv4 DS field; <code>11</code> = CE, "congestion experienced."</em></p>
+
+The RoCEv2 sender ships its data marked **ECT** (`01`/`10`); a congested switch flips that to **CE (`11`)** *instead of dropping*; the receiver turns the CE into the **CNP** we just drew. Here's a real CNP on the wire (Wireshark, display filter `ip.dsfield.ecn == 1`) — and it comes with two gotchas worth knowing before you go looking for one:
+
+```
+Eth + IP Header + UDP (port 4791) 
+[...]
+   InfiniBand
+     Base Transport Header
+       Opcode: 129                       <- 0x81 = CNP                                             
+       Partition Key: 65535
+       Reserved (8 bits): 64             <- 0x40 = 0b0100_0000: the BECN bit (no
+                                            tidy "BECN" field — it hides in here)
+       Destination Queue Pair: 0x0000d2
+       Packet Sequence Number: 0
+     Vendor Specific or Unknown Header Sequence
+       Data: 0000…0000  e42dad81         <- 16 reserved bytes (no payload) + ICRC
+
+```
+<p align="center"><em>A real CNP: opcode 129 (<code>0x81</code>); BECN hides in "Reserved = 64" (<code>0x40</code>); body is 16 zero bytes + ICRC.</em></p>
 
 The whole trick is **threshold ordering**: set the ECN marking threshold *below* the PFC PAUSE threshold, so DCQCN starts trimming rates while there's still buffer headroom — and the hard PAUSE only fires if the gentle loop couldn't keep up (a microburst faster than one RTT). ECN/DCQCN is the everyday throttle; PFC is the floor under it.
 
@@ -929,14 +1009,15 @@ The whole trick is **threshold ordering**: set the ECN marking threshold *below*
 
 This is exactly why the **F bit was IB-only** back in §4.3: IB does forward-marking *inside* the BTH, so FECN lives there; RoCE moved forward-marking out to **IP-ECN** and repackaged the backward half as the **CNP**, leaving the BTH's F bit dead on Ethernet. Same loop, different envelope:
 
-| job                    | RoCE / Ethernet                                                             | InfiniBand                                                                        |
-|------------------------|-----------------------------------------------------------------------------|-----------------------------------------------------------------------------------|
-| **losslessness**       | PFC — per-priority PAUSE, retrofit onto Ethernet                          | credits — lossless by design, built into the link layer                         |
-| **congestion control** | switch marks IP-ECN → receiver returns CNP (BTH 0x81) → DCQCN cuts rate | switch sets FECN in BTH → receiver returns BECN → CCTI/CCT inter-packet delay |
+| job                    | RoCE / Ethernet                     | InfiniBand                     |
+|------------------------|-------------------------------------|--------------------------------|
+| **losslessness**       | PFC — per-priority PAUSE (retrofit) | credits — lossless by design   |
+| **congestion control** | IP-ECN mark → CNP → DCQCN cuts rate | FECN → BECN → CCTI/CCT spacing |
 
-So the §4.3 framing holds, just stated more carefully: **IB gets both jobs from its architecture; RoCE has to engineer both onto Ethernet** — PFC, ECN, DCQCN, and the threshold tuning that keeps them in their lanes. That's the trade: IB is turnkey but proprietary and largely single-vendor; RoCE is fiddlier to tune but rides the open Ethernet ecosystem — many switch vendors, commodity economics, and the IP/Ethernet skills and tooling your team already has. Which is why high-end training has leaned IB while a lot of large Ethernet-shop clusters pick RoCE and engineer the losslessness in.
+So the §4.3 framing holds, just stated more carefully: **IB gets both jobs from its architecture; RoCE has to engineer both onto Ethernet** — PFC, ECN, DCQCN, and the threshold tuning that keeps them in their lanes. *(Which fabric that means buying, from which vendor, and why the market has tipped toward Ethernet — that's the landscape back in §4.3.)*
 
 **Where this leaves us.** Losslessness handles §4.4's *first* axis — the drop cliff — and DCQCN starts on the second by holding queues short. But a single end-to-end rate loop can't fix flows landing on the *wrong path* in the first place: the elephant-on-ECMP collision and the few-giant-flows problem are about **placement**, not rate. Keeping the **tail** short needs the fabric to spread those flows across paths — **topology and load balancing, §4.6**.
+
 
 # TODO list tracking
 
