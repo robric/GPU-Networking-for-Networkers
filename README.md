@@ -1022,6 +1022,102 @@ So the §4.3 framing holds, just stated more carefully: **IB gets both jobs from
 
 **Where this leaves us.** Losslessness handles §4.4's *first* axis — the drop cliff — and DCQCN starts on the second by holding queues short. But a single end-to-end rate loop can't fix flows landing on the *wrong path* in the first place: the elephant-on-ECMP collision and the few-giant-flows problem are about **placement**, not rate. Keeping the **tail** short needs the fabric to spread those flows across paths — **topology and load balancing, §4.6**.
 
+### 4.6 Spreading the load: topology, adaptive routing, and packet spraying
+
+§4.5 left one problem deliberately unsolved. A rate loop like DCQCN reacts to congestion *after* a queue starts to build — it can throttle the senders feeding a hot link, but it can't stop two elephants from hashing onto the *same* link to begin with. That isn't a rate problem, it's a **placement** problem, and you fix placement with the two levers you already pull on any Clos: the **topology** that lays down the paths, and the **load balancing** that picks among them. What's new isn't the levers — it's that the AI traffic matrix (few, huge, synchronized flows — §4.4) punishes the lazy setting of each.
+
+**The fabric is the Clos you already build — just non-blocking.** The AI backend is a **folded Clos / fat-tree**: leaf switches under a spine, the same two- or three-tier design you'd draw for any data-center fabric. The one structural difference is from §4.4 — it's provisioned **full-bisection (non-oversubscribed)**, because you can't lean on statistical multiplexing to absorb the peaks. That part is familiar. The genuinely AI-specific choice sits on top of it: *how the GPUs are homed onto the leaves.*
+
+**Rail-optimized topology — wiring the fabric to match the collective.** On a general-purpose fabric you'd spread a box's NICs across leaves arbitrarily. AI fabrics do something deliberate: **GPU k of every scale-up island homes to the same leaf — its "rail."** Mind the unit: the grouping that matters isn't the *server*, it's the **scale-up island** from §3.7 — the GPUs that reach each other over NVLink. That was one 8-GPU server in the DGX H100 era; with **NVL72** it's a whole 72-GPU rack. Whatever its size, GPU k of each island homes to rail k (the diagram shows three islands of four for space):
+
+```
+          spine: extends each rail across the cluster (same-rail traffic)
+                    ^             ^             ^             ^
+                [ rail 0 ]    [ rail 1 ]    [ rail 2 ]    [ rail 3 ]
+                    |             |             |             |
+   island A         G0============G1============G2============G3
+                    |             |             |             |
+   island B         G0============G1============G2============G3
+                    |             |             |             |
+   island C         G0============G1============G2============G3
+   ===  NVLink within a scale-up island (any rank <-> any rank)
+    |   each GPU's NIC up to its rail-leaf switch
+```
+
+<p align="center"><em>Rail-optimized: the network carries only same-rail traffic; NVLink moves data onto the right rail.</em></p>
+
+Concretely, a "rail" is nothing exotic — it's one **leaf switch** with a single NIC from every island plugged into it; rail k gathers GPU k from across the cluster. And because island A's own GPUs all hang off its **NVSwitch** (§3), the cross-rail case resolves *locally*: GPU 0 hops over NVLink to the island's GPU 2, then leaves on rail 2 — never touching the spine:
+
+```
+                                              +===============+
+            +-----island A GPU0 -PCIe- NIC0---|               |
+            |     island B GPU0 -PCIe- NIC0---| Rail 0 switch |
+            |     island C GPU0 -PCIe- NIC0---|               |
+            |                                 +===============+
+            |
+ +--------+ |                                 +===============+
+ |NVSwitch|-+-----island A GPU1 -PCIe- NIC1---|               |
+ |island A| |     island B GPU1 -PCIe- NIC1---| Rail 1 switch |
+ +--------+ |     island C GPU1 -PCIe- NIC1---|               |
+            |                                 +===============+
+            |
+            |                                 +===============+
+            +-----island A GPU2 -PCIe- NIC2---|               |
+                  island B GPU2 -PCIe- NIC2---| Rail 2 switch |
+                  island C GPU2 -PCIe- NIC2---|               |
+                                              +===============+
+
+  cross-rail: A's GPU0 --NVLink--> A's GPU2 --NIC2--> Rail 2 switch  (no spine)
+  ...  rails 3-7 same;  NVSwitch shown for island A only
+```
+
+<p align="center"><em>A rail = one leaf switch per GPU index; island A's NVSwitch lets a cross-rail hop (GPU0→GPU2) ride NVLink, not the spine.</em></p>
+
+The point is that the heaviest collective traffic is **rank-aligned** — in a ring or an all-to-all, GPU 3 trades with the *other* GPU 3s, not with GPU 0. Pinning every rank to its own rail makes that common case cheap, and pushes the rest onto the scale-up fabric you already have:
+
+- **Same island, any rank → NVLink.** Within the scale-up island, NVLink (§3) reaches every GPU — and that same NVLink is the lever for the cross-rail case below.
+- **Same rail (same rank), other island → one hop.** A.G2 → rail-2 leaf → C.G2, NIC to leaf to NIC, within a **scalable unit** (the block of islands sharing one set of rail leaves); the spine only extends that rail to *other* SUs. Always same-rail.
+- **Cross-rail (other rank, other island) → NVLink onto the right rail, not the spine.** This is the case to get right. NCCL's **PXN** (PCIe × NVLink) moves the data over NVLink — across the scale-up island — to the GPU sitting on the *destination's* rail, then ships it out that rail as an ordinary same-rail send. The rail change happens on NVLink; cross-rail traffic never touches the fabric. (Send it cross-rail over the network instead and it would have to climb the spine — exactly the congestion rail-optimized exists to avoid.)
+
+So the network only ever carries **same-rail** traffic — every rail-changing move is absorbed by NVLink, the higher-bandwidth fabric you'd rather use anyway. That's the whole idea of rail-optimized: align the network rails with the NVLink domains so the spine stays lean (some **rail-only** designs drop the spine layer entirely). It's the opposite instinct from a general-purpose network — there you assume a uniform any-to-any matrix because you can't predict the workload; here you *can*, so you wire for it.
+
+**Load balancing — from per-flow hashing to per-packet spraying.** Topology lays the paths; load balancing assigns packets to them. The baseline you run everywhere — **per-flow ECMP** — is the exact thing §4.4 showed breaking: hash the 5-tuple, pin the whole flow to one path, and with a handful of elephants two collide while links idle. The fixes climb a ladder of finer granularity:
+
+| granularity      | unit moved | reorder risk        | where you see it |
+|------------------|------------|---------------------|------------------|
+| per-flow ECMP    | whole flow | none                | today's default  |
+| flowlet          | a burst    | low (gaps absorb)   | adaptive routing |
+| per-packet spray | one packet | high (NIC reorders) | Spectrum-X / UEC |
+
+- **Flowlet switching** splits a flow at the natural gaps between bursts and rebalances per burst; if a gap is longer than the worst path-delay difference, reordered packets can't overtake, so it's a safe win — when the gaps exist.
+- **Adaptive routing** lets the *switch* choose the output port by **real-time queue occupancy** instead of a fixed hash. InfiniBand has done this in-fabric for years (SM-computed routes plus adaptive port selection — the *subnet-manager-owns-the-fabric* pattern again); Ethernet is catching up.
+- **Per-packet spraying** is the limit case: every packet of one flow is balanced independently across *all* equal-cost paths, so a 400G elephant smears across the whole fabric and no link runs hot.
+
+```
+   sender NIC:   p1 p2 p3 p4 p5 p6   one elephant flow, sprayed
+                 |  |  |  |  |  |    packet-by-packet
+                 v  v  v  v  v  v
+              [ fabric: equal-cost paths; each switch sprays each packet
+                out its least-loaded port -- fine-grain adaptive routing ]
+                 |  |  |  |  |  |
+                 v  v  v  v  v  v
+   recv NIC:     p3 p1 p5 p2 p6 p4   arrives OUT OF ORDER
+                 place each packet by its PSN/offset; report "done"
+                 only when all have landed  ->  no go-back-N, spray is safe
+```
+
+<p align="center"><em>Spray every packet across all paths for balance; the receiving NIC restores order.</em></p>
+
+**The catch is the one §4.4 named: reordering.** Spray a flow across many paths and its packets arrive **out of order**, because the paths differ in delay — and to RDMA's reliable transport an out-of-order packet looks like a **PSN** gap, i.e. loss, which trips the **go-back-N cliff** (§4.4). So spraying is only safe if the **receiving NIC** can swallow the disorder: write each packet to its destination address by its PSN/offset as it lands, in any order, and signal completion only once the last one arrives. NVIDIA does this as **Direct Data Placement** on its Spectrum-X SuperNICs; the open **Ultra Ethernet** (UEC) transport is built on the same trick (its own chapter, later). The switch sprays; the NIC un-sprays; the §4.4 cliff never fires.
+
+**Where this leaves us — the scale-out toolkit, complete.** §4.4 handed the fabric two jobs ordinary networks never had: don't drop, and keep the tail short. Three mechanisms now cover them:
+
+- **don't drop** — PFC, the lossless backstop (§4.5).
+- **don't queue** — ECN/DCQCN holds injection rates so queues stay shallow (§4.5).
+- **don't collide** — rail-optimized topology + adaptive/sprayed load balancing keep the few giant flows off each other's links (§4.6).
+
+All three guard the same thing — the **tail** — because one slow flow, whether *dropped*, *queued*, or *collided*, is paid for by every GPU waiting at the barrier. That completes the scale-out *transport* story: how bytes cross the cluster without falling off the drop cliff or stretching the tail. What we have **not** described is the layer that *generates* those bytes — the **collectives** themselves (ring, tree, all-reduce, all-to-all) and how each maps onto the fabric. That's §5.
+
 
 # TODO list tracking
 
