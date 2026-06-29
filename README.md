@@ -1020,15 +1020,15 @@ This is exactly why the **F bit was IB-only** back in §4.3: IB does forward-mar
 
 **Where this leaves us.** Losslessness handles §4.4's *first* axis — the drop cliff — and DCQCN starts on the second by holding queues short. But a single end-to-end rate loop can't fix flows landing on the *wrong path* in the first place: the elephant-on-ECMP collision and the few-giant-flows problem are about **placement**, not rate. Keeping the **tail** short needs the fabric to spread those flows across paths — first **shaping** it (§4.6), then **steering** traffic across it (§4.7).
 
-### 4.6 Shaping the fabric: the Clos, and how GPUs hang off it
+### 4.6 Shaping the fabric: leaves, spines, and how GPUs hang off them
 
 §4.5 ended with the placement problem: two elephant flows can hash onto the same link, and rate control alone won't pull them apart. Fixing that takes two steps. First you **shape** the fabric — decide where the switches and links go, which fixes where the paths are. Then you **steer** traffic across those paths (§4.7). This section is about shape.
 
-The scale-out fabric is a **leaf-spine Clos** (a fat-tree). The GPUs' NICs plug into the leaves; the spine connects the leaves together. It's the same topology you already build, usually sized closer to non-blocking than an enterprise fabric because AI traffic doesn't statistically multiplex (§4.4). The one AI-specific question is which leaf each GPU's NIC connects to — and that choice is driven by the **scale-up fabric**, which an ordinary data center doesn't have.
+The scale-out fabric uses the same leaf and spine switches you already build a **Clos / fat-tree** from, sized closer to non-blocking than an enterprise fabric because AI traffic doesn't statistically multiplex (§4.4). What's AI-specific is how much of that hierarchy you actually need — set by the **scale-up fabric** an ordinary data center doesn't have. Two questions follow: which leaf each GPU's NIC lands on, and whether the leaves need a spine at all.
 
 #### 4.6.1 The baseline: a node homed to its leaf
 
-Start from the design you already build. A server's NICs land on its top-of-rack switch — the leaf — and the spine ties the leaves together; dual-home to two leaves for the usual redundancy if you want it. Two GPUs inside the same node never touch the leaf: that traffic stays on NVLink (§3). The leaves and spine exist only to carry traffic *between* nodes.
+Start from the design you already build. A server's NICs land on its top-of-rack switch — the leaf — and the spine ties the leaves together. Two GPUs inside the same node never touch the leaf: that traffic stays on NVLink (§3). The leaves and spine exist only to carry traffic *between* nodes.
 
 ```
              +=================================================+
@@ -1080,47 +1080,59 @@ So both cases are covered without a spine — same-rail on the rail switch, cros
 
 <p align="center"><em>Every scale-up island has an NVSwitch (one shown); it lets a cross-rail hop (GPU0→GPU2) ride NVLink, not the spine.</em></p>
 
-This is **rail-only**, and it is deliberately **not a traditional Clos**: there is no spine and no any-to-any second tier — just a set of independent rail switches stitched together by the scale-up fabric. That's the trade. You've swapped a whole spine layer for NVLink hops, which means rail-only stands or falls on scale-up:
+This is **rail-only**, and it's deliberately **not a Clos**: each rail is a single switch — a bare **crossbar** — and with no spine there's no second stage to make it one. The rails are stitched into a fabric by the scale-up layer (PXN), not by a switching tier. That's the trade. You've swapped a whole spine layer for NVLink hops, which means rail-only stands or falls on scale-up:
 
 - **Strong scale-up** (large NVLink domains) → cross-rail rides NVLink and the spine is genuinely optional.
 - **Weak or no scale-up** → cross-rail has nowhere to go, so you keep the baseline's spine.
 
-That coupling is why rail-only is NVIDIA-forward; vendors with smaller scale-up domains lean toward keeping the spine — the §8 vendor chapter gets into the specifics.
+That coupling is why rail-only is most at home on NVIDIA — but it's about the *size and speed* of the scale-up domain, not NVIDIA being the only one with one. AMD and Intel both ship scale-up today; they just bring less of it:
 
-This rail-only block has a name: NVIDIA calls it a **scalable unit (SU)** — a set of islands sharing one set of 8 rail leaves. How many GPUs fit in one SU is set by the generation:
+| Vendor | Scale-up fabric              | Domain  | Per-GPU BW |
+|--------|------------------------------|---------|------------|
+| NVIDIA | NVLink 5 + NVSwitch          | 8 or 72 | 1.8 TB/s   |
+| AMD    | Infinity Fabric, direct mesh | 8       | ~1 TB/s    |
+| Intel  | on-die RoCE (Ethernet)       | 8       | 21x200GbE  |
 
-| Design          | Scale-up island | GPUs in one SU |
-|-----------------|-----------------|----------------|
-| DGX B200        | 8-GPU node      | 32 nodes = 256 |
-| DGX GB200 NVL72 | 72-GPU rack     | 8 racks = 576  |
+<p align="center"><em>AMD and Intel have scale-up, but smaller and slower — AMD's Infinity Fabric is ~NVLink-4-class, Intel's is Ethernet-based.</em></p>
 
-<p align="center"><em>One SU's GPU count: 32 B200 nodes, or 8 NVL72 racks.</em></p>
+Two gaps matter for rail-only. **Size:** AMD and Intel top out at 8 accelerators where NVIDIA reaches 72, so far more of the collective stays on-fabric before it touches a NIC. **Speed:** AMD's ~1 TB/s is about half of Blackwell's NVLink 5, and Intel's Ethernet scale-up is lower still — a small, slower domain can't soak up cross-rail the way a big NVLink domain does, so the spine stays. (Fuller vendor treatment in §8.)
 
-That's one rail-only block — same-rail traffic one hop, cross-rail rail-local over PXN, no spine. To go bigger you join several SUs with a spine; the result is a **SuperPOD**, and that spine — plus how far it scales — is §4.6.3. (Reference designs: [B200](https://docs.nvidia.com/dgx-superpod/reference-architecture-scalable-infrastructure-b200/latest/network-fabrics.html), [GB200 NVL72](https://docs.nvidia.com/dgx-superpod/reference-architecture-scalable-infrastructure-gb200/latest/dgx-superpod-architecture.html).)
+This rail-only block has a name: NVIDIA calls it a **scalable unit (SU)** — a set of islands with one rail leaf per GPU in the island (so 8 rails for an 8-GPU node, 72 for an NVL72 rack). Its size is just **rails × leaf radix**, since spine-less means every port faces an island. Today's 128×800G leaves — Broadcom **Tomahawk 6**, NVIDIA **Spectrum-6 (SN6810)**, both 102.4T — cap an SU at 128 islands. A 512-port **SN6800** chassis will push that to 512 — but that part is still roadmap (2H 2026*), not shipping today:
+
+| Island           | Rails | Spine-less SU (128-port) | Spine-less SU (512-port*) |
+|------------------|-------|--------------------------|---------------------------|
+| DGX B200 node    | 8     | 1,024 GPU                | 4,096 GPU                 |
+| GB200 NVL72 rack | 72    | 9,216 GPU                | 36,864 GPU                |
+
+<p align="center"><em>Spine-less SU = rails × leaf radix; a 512-port chassis quadruples it — an NVL72 SU reaches ~37k GPUs with no spine at all.</em></p>
+
+> \* **Roadmap.** The 512-port figure is NVIDIA's **SN6800** chassis (4× Spectrum-6 ASICs, co-packaged optics, liquid-cooled) — [announced](https://nvidianews.nvidia.com/news/nvidia-spectrum-x-co-packaged-optics-networking-switches-ai-factories), shipping 2H 2026, not yet in volume. The 128-port parts (Tomahawk 6, SN6810) ship today and also come in liquid-cooled builds, so LC isn't the dividing line — radix and CPO integration are. And the 512-port math doesn't fully close: the four ASICs are stitched by a *passive* fiber shuffle (which reroutes light but switches nothing), and it's hard to see how 4 × 102.4T of silicon would expose a full 409.6T of **non-blocking** user bandwidth if the chips must spend ports talking to each other — on the usual arithmetic a non-blocking build would land nearer ~256 ports. NVIDIA doesn't publish the backplane/blocking ratio, so there's a piece here we can't reconcile; read 512 as raw aggregate, and treat this radix as belonging in the *spine* (§4.6.3) more than a spine-less leaf.
+
+That's the whole rail-only block — same-rail one hop, cross-rail rail-local over PXN, no spine. To go bigger you reserve part of each leaf for uplinks and add a spine; the result is a **SuperPOD**, and that spine — plus how far it scales — is §4.6.3. (NVIDIA's DGX SuperPOD reference designs: [B200](https://docs.nvidia.com/dgx-superpod/reference-architecture-scalable-infrastructure-b200/latest/network-fabrics.html), [GB200 NVL72](https://docs.nvidia.com/dgx-superpod/reference-architecture-scalable-infrastructure-gb200/latest/dgx-superpod-architecture.html).)
 
 #### 4.6.3 Scaling past one pod: a spine over the rails
 
-> **[raw material — to rework next]** the with-spine rail diagram and the radix-wall prose below are stashed here for the §4.6.3 pass. Mark 6 (cluster-sizing example, with verified switch radix) lands here.
+A single SU is bounded by one number: the port count of a rail switch. In the H100 and B200 designs each rail leaf is a Quantum-2 **QM9700** — 64 ports of 400G NDR. Split it in half: 32 ports face down to the nodes (one rail's NIC from each of 32 nodes), 32 face up. That split is why an SU is **32 nodes** — half of every leaf is reserved for what comes next.
+
+What comes next is the spine. Those upward ports land on a tier of spine switches, and once they do, every rail leaf can reach every other. Rail leaves in *different* SUs are now joined, so the traffic PXN can't keep rail-local — anything crossing between SUs — climbs the spine. A set of SUs wired together this way is a **SuperPOD**.
 
 ```
-          spine: extends each rail across the cluster (same-rail traffic)
-                    ^             ^             ^             ^
-                [ rail 0 ]    [ rail 1 ]    [ rail 2 ]    [ rail 3 ]
+             +=======================================================+
+             | spine switches: every rail leaf to every other,       |
+             | one equal-cost path per spine                         |
+             +======^=============^=============^=============^======+
                     |             |             |             |
-   island A         G0============G1============G2============G3
+                 [leaf]        [leaf]        [leaf]        [leaf]
                     |             |             |             |
-   island B         G0============G1============G2============G3
-                    |             |             |             |
-   island C         G0============G1============G2============G3
-   ===  NVLink within a scale-up island (any rank <-> any rank)
-    |   each GPU's NIC up to its rail-leaf switch
+                    \____SU A_____/             \____SU B_____/
+                       32 nodes                    32 nodes
 ```
 
-<p align="center"><em>Rail-optimized: GPU k of every island homes to rail k; same-rank traffic stays on one leaf, and NVLink carries the rest.</em></p>
+<p align="center"><em>Beyond one SU, a spine ties the rail leaves together; with many spine switches there are many equal-cost paths between any two leaves.</em></p>
 
-**Where the paths are — and the radix wall.** As long as everything that needs to talk hangs off **one switch** (one rail), there's no spine and exactly **one path** between any two of them — nothing to balance. But a switch is finite: it tops out at its **port count** (~128 endpoints on a current 800G switch — the sizing math from earlier). Past that wall you need **several leaf switches joined by a spine** — and only *now* is it a real two-tier Clos, with **one equal-cost path per spine** between any two leaves.
+The sizes follow the radix at each tier. Four SUs come to **1,024 GPUs** on two tiers — 32 leaf plus 16 spine QM9700s, still non-blocking. Past that you add a third tier (a core): the documented B200 reference reaches **16,384 GPUs** (64 SUs, ~1,280 switches), and the GB200 NVL72 reference draws its line at **9,216 GPUs** (128 racks). Neither is a hard ceiling — both docs say "and beyond," and a 64-port fat-tree can in principle address ~k³/4 ≈ 65,000 endpoints; production clusters go further still by chaining SuperPODs.
 
-So the spine is what *manufactures* multipath. Below the radix wall: one switch, one path, no spine needed. Above it: leaves plus spine, many paths. And the instant there are many paths, elephants pile onto the same one unless you spread them deliberately — that's **steering**, §4.7.
+The spine buys reach, but it also changes the traffic problem. With one switch there was exactly one path between any two endpoints. With N spine switches there are **N equal-cost paths** between any two leaves — and the moment there is more than one path, the few giant flows from §4.4 can pile onto the same one while the others sit idle. Spreading them deliberately is **steering**: §4.7.
 
 ### 4.7 Steering the traffic: picking among the paths
 
