@@ -1018,35 +1018,42 @@ This is exactly why the **F bit was IB-only** back in §4.3: IB does forward-mar
 | **losslessness**       | PFC — per-priority PAUSE (retrofit) | credits — lossless by design   |
 | **congestion control** | IP-ECN mark → CNP → DCQCN cuts rate | FECN → BECN → CCTI/CCT spacing |
 
-So the §4.3 framing holds, just stated more carefully: **IB gets both jobs from its architecture; RoCE has to engineer both onto Ethernet** — PFC, ECN, DCQCN, and the threshold tuning that keeps them in their lanes. *(Which fabric that means buying, from which vendor, and why the market has tipped toward Ethernet — that's the landscape back in §4.3.)*
+**Where this leaves us.** Losslessness handles §4.4's *first* axis — the drop cliff — and DCQCN starts on the second by holding queues short. But a single end-to-end rate loop can't fix flows landing on the *wrong path* in the first place: the elephant-on-ECMP collision and the few-giant-flows problem are about **placement**, not rate. Keeping the **tail** short needs the fabric to spread those flows across paths — first **shaping** it (§4.6), then **steering** traffic across it (§4.7).
 
-**Where this leaves us.** Losslessness handles §4.4's *first* axis — the drop cliff — and DCQCN starts on the second by holding queues short. But a single end-to-end rate loop can't fix flows landing on the *wrong path* in the first place: the elephant-on-ECMP collision and the few-giant-flows problem are about **placement**, not rate. Keeping the **tail** short needs the fabric to spread those flows across paths — **topology and load balancing, §4.6**.
+### 4.6 Shaping the fabric: the Clos, and how GPUs hang off it
 
-### 4.6 Spreading the load: topology, adaptive routing, and packet spraying
+§4.5 ended with the placement problem: two elephant flows can hash onto the same link, and rate control alone won't pull them apart. Fixing that takes two steps. First you **shape** the fabric — decide where the switches and links go, which fixes where the paths are. Then you **steer** traffic across those paths (§4.7). This section is about shape.
 
-§4.5 left one problem deliberately unsolved. A rate loop like DCQCN reacts to congestion *after* a queue starts to build — it can throttle the senders feeding a hot link, but it can't stop two elephants from hashing onto the *same* link to begin with. That isn't a rate problem, it's a **placement** problem, and you fix placement with the two levers you already pull on any Clos: the **topology** that lays down the paths, and the **load balancing** that picks among them. What's new isn't the levers — it's that the AI traffic matrix (few, huge, synchronized flows — §4.4) punishes the lazy setting of each.
+The scale-out fabric is a **leaf-spine Clos** (a fat-tree). The GPUs' NICs plug into the leaves; the spine connects the leaves together. It's the same topology you already build, usually sized closer to non-blocking than an enterprise fabric because AI traffic doesn't statistically multiplex (§4.4). The one AI-specific question is which leaf each GPU's NIC connects to — and that choice is driven by the **scale-up fabric**, which an ordinary data center doesn't have.
 
-**The fabric is the Clos you already build — just non-blocking.** The AI backend is a **folded Clos / fat-tree**: leaf switches under a spine, the same two- or three-tier design you'd draw for any data-center fabric. The one structural difference is from §4.4 — it's provisioned **full-bisection (non-oversubscribed)**, because you can't lean on statistical multiplexing to absorb the peaks. That part is familiar. The genuinely AI-specific choice sits on top of it: *how the GPUs are homed onto the leaves.*
+#### 4.6.1 The baseline: a node homed to its leaf
 
-**Rail-optimized topology — wiring the fabric to match the collective.** On a general-purpose fabric you'd spread a box's NICs across leaves arbitrarily. AI fabrics do something deliberate: **GPU k of every scale-up island homes to the same leaf — its "rail."** Mind the unit: the grouping that matters isn't the *server*, it's the **scale-up island** from §3.7 — the GPUs that reach each other over NVLink. That was one 8-GPU server in the DGX H100 era; with **NVL72** it's a whole 72-GPU rack. Whatever its size, GPU k of each island homes to rail k (the diagram shows three islands of four for space):
+Start from the design you already build. A server's NICs land on its top-of-rack switch — the leaf — and the spine ties the leaves together; dual-home to two leaves for the usual redundancy if you want it. Two GPUs inside the same node never touch the leaf: that traffic stays on NVLink (§3). The leaves and spine exist only to carry traffic *between* nodes.
 
 ```
-          spine: extends each rail across the cluster (same-rail traffic)
-                    ^             ^             ^             ^
-                [ rail 0 ]    [ rail 1 ]    [ rail 2 ]    [ rail 3 ]
-                    |             |             |             |
-   island A         G0============G1============G2============G3
-                    |             |             |             |
-   island B         G0============G1============G2============G3
-                    |             |             |             |
-   island C         G0============G1============G2============G3
-   ===  NVLink within a scale-up island (any rank <-> any rank)
-    |   each GPU's NIC up to its rail-leaf switch
+             +=================================================+
+             |  spine 0      spine 1      spine 2      spine 3  |
+             +=====^============^============^============^=====+
+                   |            |            |            |
+               [leaf 0]     [leaf 1]     [leaf 2]     [leaf 3]
+                 ||||         ||||         ||||         ||||
+                 NICs         NICs         NICs         NICs
+                 ||||         ||||         ||||         ||||
+              [ node 0 ]   [ node 1 ]   [ node 2 ]   [ node 3 ]
+                8 GPUs       8 GPUs       8 GPUs       8 GPUs
 ```
 
-<p align="center"><em>Rail-optimized: the network carries only same-rail traffic; NVLink moves data onto the right rail.</em></p>
+<p align="center"><em>Classical homing: each node's NICs land on its own ToR leaf; only cross-node traffic crosses the spine.</em></p>
 
-Concretely, a "rail" is nothing exotic — it's one **leaf switch** with a single NIC from every island plugged into it; rail k gathers GPU k from across the cluster. And because island A's own GPUs all hang off its **NVSwitch** (§3), the cross-rail case resolves *locally*: GPU 0 hops over NVLink to the island's GPU 2, then leaves on rail 2 — never touching the spine:
+This is **server-centric** homing, and it's the honest fallback when you have no strong scale-up fabric to exploit. It works for any workload and needs no special cabling rule. Its one weakness is where it puts the heavy traffic. A collective has GPU *k* of one node trading with GPU *k* of every other node — the traffic is **rank-aligned** (§5) — and here those rank-*k* NICs sit on different leaves, so it always climbs the spine. Rail-optimized homing (§4.6.2) is the one change that fixes exactly that.
+
+#### 4.6.2 Rail-only: dropping the spine
+
+The baseline spends a whole spine on rank-aligned traffic. Re-homing the NICs makes that spine unnecessary. Take one NIC per rank and change where it lands: GPU *k* of every **scale-up island** (the NVLink domain from §3.7 — 8 GPUs on an HGX box, 72 in an NVL72 rack) connects to the *same* switch — call it **rail *k***. Now rank-*k*-to-rank-*k* traffic, the bulk of a collective, stays on one switch, one hop. A rail is nothing exotic: one leaf switch with a single NIC from every island plugged into it.
+
+That covers same-rank traffic. The other case is **cross-rail** — a GPU on rail *i* needs a GPU on rail *j*. Here the scale-up fabric does the work the spine used to: hop over NVLink to the in-island GPU that already sits on rail *j*, then send normally on rail *j*. That NVLink detour is NCCL's **PXN** (PCIe x Nvlink see §3). Cross-rail traffic rides scale-up, not a second switching tier.
+
+So both cases are covered without a spine — same-rail on the rail switch, cross-rail over NVLink — and you can build the whole fabric with one switch per rail and nothing above it. Each island's GPUs hang off an **NVSwitch** (§3), which is what makes the cross-rail hop possible:
 
 ```
                                               +===============+
@@ -1071,15 +1078,51 @@ Concretely, a "rail" is nothing exotic — it's one **leaf switch** with a singl
   ...  rails 3-7 same;  NVSwitch shown for island A only
 ```
 
-<p align="center"><em>A rail = one leaf switch per GPU index; island A's NVSwitch lets a cross-rail hop (GPU0→GPU2) ride NVLink, not the spine.</em></p>
+<p align="center"><em>Every scale-up island has an NVSwitch (one shown); it lets a cross-rail hop (GPU0→GPU2) ride NVLink, not the spine.</em></p>
 
-The point is that the heaviest collective traffic is **rank-aligned** — in a ring or an all-to-all, GPU 3 trades with the *other* GPU 3s, not with GPU 0. Pinning every rank to its own rail makes that common case cheap, and pushes the rest onto the scale-up fabric you already have:
+This is **rail-only**, and it is deliberately **not a traditional Clos**: there is no spine and no any-to-any second tier — just a set of independent rail switches stitched together by the scale-up fabric. That's the trade. You've swapped a whole spine layer for NVLink hops, which means rail-only stands or falls on scale-up:
 
-- **Same island, any rank → NVLink.** Within the scale-up island, NVLink (§3) reaches every GPU — and that same NVLink is the lever for the cross-rail case below.
-- **Same rail (same rank), other island → one hop.** A.G2 → rail-2 leaf → C.G2, NIC to leaf to NIC, within a **scalable unit** (the block of islands sharing one set of rail leaves); the spine only extends that rail to *other* SUs. Always same-rail.
-- **Cross-rail (other rank, other island) → NVLink onto the right rail, not the spine.** This is the case to get right. NCCL's **PXN** (PCIe × NVLink) moves the data over NVLink — across the scale-up island — to the GPU sitting on the *destination's* rail, then ships it out that rail as an ordinary same-rail send. The rail change happens on NVLink; cross-rail traffic never touches the fabric. (Send it cross-rail over the network instead and it would have to climb the spine — exactly the congestion rail-optimized exists to avoid.)
+- **Strong scale-up** (large NVLink domains) → cross-rail rides NVLink and the spine is genuinely optional.
+- **Weak or no scale-up** → cross-rail has nowhere to go, so you keep the baseline's spine.
 
-So the network only ever carries **same-rail** traffic — every rail-changing move is absorbed by NVLink, the higher-bandwidth fabric you'd rather use anyway. That's the whole idea of rail-optimized: align the network rails with the NVLink domains so the spine stays lean (some **rail-only** designs drop the spine layer entirely). It's the opposite instinct from a general-purpose network — there you assume a uniform any-to-any matrix because you can't predict the workload; here you *can*, so you wire for it.
+That coupling is why rail-only is NVIDIA-forward; vendors with smaller scale-up domains lean toward keeping the spine — the §8 vendor chapter gets into the specifics.
+
+This rail-only block has a name: NVIDIA calls it a **scalable unit (SU)** — a set of islands sharing one set of 8 rail leaves. How many GPUs fit in one SU is set by the generation:
+
+| Design          | Scale-up island | GPUs in one SU |
+|-----------------|-----------------|----------------|
+| DGX B200        | 8-GPU node      | 32 nodes = 256 |
+| DGX GB200 NVL72 | 72-GPU rack     | 8 racks = 576  |
+
+<p align="center"><em>One SU's GPU count: 32 B200 nodes, or 8 NVL72 racks.</em></p>
+
+That's one rail-only block — same-rail traffic one hop, cross-rail rail-local over PXN, no spine. To go bigger you join several SUs with a spine; the result is a **SuperPOD**, and that spine — plus how far it scales — is §4.6.3. (Reference designs: [B200](https://docs.nvidia.com/dgx-superpod/reference-architecture-scalable-infrastructure-b200/latest/network-fabrics.html), [GB200 NVL72](https://docs.nvidia.com/dgx-superpod/reference-architecture-scalable-infrastructure-gb200/latest/dgx-superpod-architecture.html).)
+
+#### 4.6.3 Scaling past one pod: a spine over the rails
+
+> **[raw material — to rework next]** the with-spine rail diagram and the radix-wall prose below are stashed here for the §4.6.3 pass. Mark 6 (cluster-sizing example, with verified switch radix) lands here.
+
+```
+          spine: extends each rail across the cluster (same-rail traffic)
+                    ^             ^             ^             ^
+                [ rail 0 ]    [ rail 1 ]    [ rail 2 ]    [ rail 3 ]
+                    |             |             |             |
+   island A         G0============G1============G2============G3
+                    |             |             |             |
+   island B         G0============G1============G2============G3
+                    |             |             |             |
+   island C         G0============G1============G2============G3
+   ===  NVLink within a scale-up island (any rank <-> any rank)
+    |   each GPU's NIC up to its rail-leaf switch
+```
+
+<p align="center"><em>Rail-optimized: GPU k of every island homes to rail k; same-rank traffic stays on one leaf, and NVLink carries the rest.</em></p>
+
+**Where the paths are — and the radix wall.** As long as everything that needs to talk hangs off **one switch** (one rail), there's no spine and exactly **one path** between any two of them — nothing to balance. But a switch is finite: it tops out at its **port count** (~128 endpoints on a current 800G switch — the sizing math from earlier). Past that wall you need **several leaf switches joined by a spine** — and only *now* is it a real two-tier Clos, with **one equal-cost path per spine** between any two leaves.
+
+So the spine is what *manufactures* multipath. Below the radix wall: one switch, one path, no spine needed. Above it: leaves plus spine, many paths. And the instant there are many paths, elephants pile onto the same one unless you spread them deliberately — that's **steering**, §4.7.
+
+### 4.7 Steering the traffic: picking among the paths
 
 **Load balancing — from per-flow hashing to per-packet spraying.** Topology lays the paths; load balancing assigns packets to them. The baseline you run everywhere — **per-flow ECMP** — is the exact thing §4.4 showed breaking: hash the 5-tuple, pin the whole flow to one path, and with a handful of elephants two collide while links idle. The fixes climb a ladder of finer granularity:
 
@@ -1090,7 +1133,7 @@ So the network only ever carries **same-rail** traffic — every rail-changing m
 | per-packet spray | one packet | high (NIC reorders) | Spectrum-X / UEC |
 
 - **Flowlet switching** splits a flow at the natural gaps between bursts and rebalances per burst; if a gap is longer than the worst path-delay difference, reordered packets can't overtake, so it's a safe win — when the gaps exist.
-- **Adaptive routing** lets the *switch* choose the output port by **real-time queue occupancy** instead of a fixed hash. InfiniBand has done this in-fabric for years (SM-computed routes plus adaptive port selection — the *subnet-manager-owns-the-fabric* pattern again); Ethernet is catching up.
+- **Adaptive routing** lets the *switch* choose the output port by **real-time queue occupancy** instead of a fixed hash. InfiniBand has done this in-fabric for years (SM-computed routes plus adaptive port selection — the *subnet-manager-owns-the-fabric* pattern again). On Ethernet it's recent: **NVIDIA's Spectrum-X** does per-packet adaptive routing — the Spectrum-4 switch picks the least-loaded port, the SuperNIC puts the packets back in order — and the open **Ultra Ethernet (UEC)** standard reaches the same end a different way — per-packet **spraying** that the NIC reorders (deep-dives in §8/§9).
 - **Per-packet spraying** is the limit case: every packet of one flow is balanced independently across *all* equal-cost paths, so a 400G elephant smears across the whole fabric and no link runs hot.
 
 ```
