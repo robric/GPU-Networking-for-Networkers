@@ -1225,21 +1225,56 @@ The spine is not the only way between rails. The scale-up fabric — NVLink/NVSw
 
 The trade is cost against generality. The MIT/Meta [*rail-only* study](https://arxiv.org/abs/2307.12169) actually put numbers on it: 38–77% less network cost and 37–75% less power for the same training performance, at an 8.2–11.2% completion-time overhead on MoE all-to-all traffic. The bet is that cross-rail traffic stays light enough to live on scale-up.
 
-Here is the maximum cluster size each design reaches on 128-port spines:
+Here is the maximum cluster size each design reaches on 128-port spines for DGX B200 (8 GPU node)
 
 | Design                    | GPUs per SU | Max SUs (2-tier) | Max GPUs (2-tier) |
 |---------------------------|-------------|------------------|-------------------|
 | DGX B200, shared spine    | 512         | 16               | 8,192             |
 | DGX B200, rail-only       | 512         | 128              | 65,536            |
 
+Next, NVL 72 is a bit different since a single SU can have up to 4608 GPUs over (72 rails !), with plans for 2 tier scale up domains NVL 576, 1152 and beyond which blur the performance line with scale-out SUs.
 
+| Design                    | GPUs per SU | Max SUs (2-tier) | Max GPUs (2-tier) |
+|---------------------------|-------------|------------------|-------------------|
 | GB200 NVL72, shared spine | 4,608       | 1                | 4,608             |
 
 <p align="center"><em>Same SU size either way; a shared spine caps B200 at 16 SUs, dedicated per-rail planes reach 128.</em></p>
 
 An NVL72 SU spans 72 leaves against the 128 a spine can reach, so a second full SU won't fit in two tiers — which is why the documented 9,216-GPU NVL72 pods need a third tier.
 
-With one switch between two endpoints there was a single path. A spine tier adds many — one equal-cost path per leaf uplink — and the few giant flows of §4.4 will pile onto one while the rest sit idle. Spreading them across the paths is the next problem: §4.7.
+With one switch between two endpoints there was a single path; a spine tier adds many, one equal-cost path per leaf uplink.
+
+#### 4.6.4 Multi-plane: splitting the NIC across fabrics
+
+There is one more way to widen the fabric — stop building a single fabric and run several in parallel. That is multi-plane, and you already run the shape in storage. A Fibre Channel SAN is two fabrics, **SAN A** and **SAN B**, that never touch; every host attaches to both, and losing a fabric just means traffic rides the other. A multi-plane GPU backend is the same move: several independent leaf-spine fabrics — *planes* — never joined at the spine, every GPU attached to all of them.
+
+The attachment is a split at the NIC, and modern GPU NICs are built for it — a ConnectX-8-class SuperNIC carries its own small Ethernet switch, so one 800 Gb/s port fans out to several planes instead of homing to one. Two hyperscale designs make it concrete:
+
+- **NVIDIA twin-planar** (DGX B300 reference): the 800G port breaks out into **2× 400GbE**, one link to each of **two** planes. The planes are "not connected at a core layer level," so a switch, cable, or transceiver failure drops the job to half bandwidth instead of killing it — and NVIDIA fits roughly twice the nodes under the same two tiers.
+- **Oracle Acceleron** (OCI Zettascale10): the NIC's built-in **four-port switch** fans the 800G port across **four planes** (4× 200G; an 8× 100G breakout gives eight), wired with **shuffle cables** (breakout at both ends, NIC and switch). Each plane is its own full-bisection Clos, so scaling is near-linear — "two planes double the nodes, three triple it" — reaching **131,072 GPUs** and beyond.
+
+```
+                      +---------------+
+                      |   GPU + NIC   |   the NIC is a 4-port switch
+                      +---------------+
+                      /    /     \    \
+                 200G/200G/   200G\    \200G    split via shuffle cable
+                    v    v        v     v
+            +-------+ +-------+ +-------+ +-------+
+            |plane A| |plane B| |plane C| |plane D|
+            | leaf+ | | leaf+ | | leaf+ | | leaf+ |
+            | spine | | spine | | spine | | spine |
+            +-------+ +-------+ +-------+ +-------+
+            (4 independent planes  -  never joined at the spine)
+```
+
+<p align="center"><em>Oracle Acceleron: one 800G NIC fans across four planes (4×200G); NVIDIA twin-planar does the same with two.</em></p>
+
+It's the networker's A/B-fabric promise at training scale: more planes for more scale, and a failed plane degrades bandwidth instead of aborting the run.
+
+One catch rides along. RDMA's Reliable Connection assumed *one* path; spread a single queue pair across several planes and you need a transport that tolerates many paths and reorders cleanly. Oracle pairs Acceleron with **Multipath Reliable Connection (MRC)** — a multi-vendor effort (AMD, Broadcom, Intel, Microsoft, NVIDIA, OpenAI) that holds single-QP throughput across "multiple ports and many network paths." That's the steering problem of §4.7, pushed into the transport.
+
+Multi-plane is one bet on getting past a single Clos, and the hyperscalers don't all take it: Meta adds an oversubscribed third tier across "AI Zones," Google rewires the topology itself with optical circuit switches, and AWS leaves the Clos alone and sprays packets across it. Every one of them — multi-plane included — ends up manufacturing the same thing: many equal-cost paths between any two GPUs, which the few giant flows of §4.4 overload one at a time while the rest sit idle. Spreading them is the steering problem of §4.7.
 
 ### 4.7 Steering the traffic: picking among the paths
 
