@@ -1246,7 +1246,7 @@ With one switch between two endpoints there was a single path; a spine tier adds
 
 #### 4.6.4 Multi-plane: splitting the NIC across fabrics
 
-There is one more way to widen the fabric — stop building a single fabric and run several in parallel. That is multi-plane, and you already run the shape in storage. A Fibre Channel SAN is two fabrics, **SAN A** and **SAN B**, that never touch; every host attaches to both, and losing a fabric just means traffic rides the other. A multi-plane GPU backend is the same move: several independent leaf-spine fabrics — *planes* — never joined at the spine, every GPU attached to all of them.
+There is one more way to widen the fabric — stop building a single fabric and run several in parallel. That is multi-plane. It is the design a Fibre Channel SAN already uses: two fabrics, **SAN A** and **SAN B**, that never touch, with every host attached to both, so losing a fabric just means traffic rides the other. A multi-plane GPU backend is the same move: several independent leaf-spine fabrics — *planes* — never joined at the spine, every GPU attached to all of them.
 
 The attachment is a split at the NIC, and modern GPU NICs are built for it — a ConnectX-8-class SuperNIC carries its own small Ethernet switch, so one 800 Gb/s port fans out to several planes instead of homing to one. Two hyperscale designs make it concrete:
 
