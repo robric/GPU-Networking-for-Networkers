@@ -293,6 +293,8 @@ This document tackles **scale-up first** (NVLink), then scale-out later.
 
 ---
 
+
+
 ## 3. Scale-up: the NVLink fabric
 
 > Goal of this section: by the end you should be able to explain, to another networking person, what NVLink *is*, what problem it solves, and why it is **not** just "a faster PCIe" and **not** quite "an Ethernet for GPUs" either.
@@ -1297,7 +1299,17 @@ It's the networker's A/B-fabric promise at training scale: a failed plane degrad
 
 One catch rides along. RDMA's Reliable Connection assumed *one* path; spread a single queue pair across several planes and you need a transport that tolerates many paths and reorders cleanly. Oracle pairs Acceleron with **Multipath Reliable Connection (MRC)** [[10]](#ref-10) — a multi-vendor effort (AMD, Broadcom, Intel, Microsoft, NVIDIA, OpenAI) that holds single-QP throughput across "multiple ports and many network paths." That's the steering problem of §4.7, pushed into the transport.
 
-Multi-plane is one bet on getting past a single Clos, and the hyperscalers don't all take it: Meta adds an oversubscribed third tier across "AI Zones" [[11]](#ref-11), Google rewires the topology itself with optical circuit switches [[12]](#ref-12), and AWS leaves the Clos alone and sprays packets across it [[13]](#ref-13). Every one of them — multi-plane included — ends up manufacturing the same thing: many equal-cost paths between any two GPUs, which the few giant flows of §4.4 overload one at a time while the rest sit idle. Spreading them is the steering problem of §4.7.
+Multi-plane is one bet on getting past a single Clos, and the hyperscalers don't all take it: Meta adds an oversubscribed third tier across "AI Zones" [[11]](#ref-11), Google rewires the topology itself with optical circuit switches [[12]](#ref-12), and AWS leaves the Clos alone and sprays packets across it [[13]](#ref-13). Every one of them — multi-plane included — manufactures the same thing: many equal-cost paths between any two GPUs. And every one of them still lives inside a single datacenter, which the largest clusters are starting to outgrow.
+
+#### 4.6.5 Scaling across datacenters
+
+Past scale-up and scale-out sits a third axis, and it is the one a networker already runs: DCI. **Scale-up** wires GPUs inside a rack — NVLink, a few meters, copper for now. **Scale-out** is everything from §4.1 to here: the RDMA fabric across a datacenter hall, pluggable optics over hundreds of meters to a few kilometers. **Scale-across** is scale-out for the WAN — one XPU cluster spread over several datacenters, tens to thousands of kilometers apart [[17]](#ref-17). Oracle's Zettascale10, the hundreds-of-thousands-of-GPU build from the last section, already spans multiple sites [[9]](#ref-9).
+
+The driver is power, not networking. You cannot get the megawatts, land, and cooling to sit a million XPUs in one building, and multiple million-XPU clusters are planned for around 2027*. So the cluster spills across buildings, a campus, or a metro, and the back-end fabric follows it out onto fiber that no longer stays inside one hall.
+
+The limit is the barrier from §4.4. Synchronous training is one giant collective, and the slowest path sets the step time — except now a link's delay is the speed of light over distance, not queueing. That caps a tightly-coupled run at a few hundred kilometers of separation [[17]](#ref-17); past that you fall back on the latency-tolerant parallelism of §5 — pipeline stages, which can hide a long link, rather than tensor shards, which cannot. The physical layer is coherent optics over DWDM — 800G ZR/ZR+ pluggables in the backend routers today, 1.6T pluggables and hollow-core fiber* on the way — front-ended by deep-buffer DCI routers (Broadcom's Jericho class) that absorb the bandwidth-delay product a long link builds up. Nokia calls the move scaling *beyond* the datacenter, and packages it as optical DCI plus a Data Center Gateway [[17]](#ref-17).
+
+Zoom back into any one of these fabrics — a plane, a pod, a hall — and the §4.4 problem is unchanged: a few giant flows overload one path at a time while the parallel paths sit idle. Spreading them is the steering problem of §4.7.
 
 ### 4.7 Steering the traffic: picking among the paths
 
@@ -1371,6 +1383,7 @@ All three guard the same thing — the **tail** — because one slow flow, wheth
 14. <a id="ref-14"></a>NVIDIA — *NVIDIA Contributes GB200 NVL72 Designs to the Open Compute Project* (rack composition: 18 compute + 9 switch trays + NVLink5). <https://developer.nvidia.com/blog/nvidia-contributes-nvidia-gb200-nvl72-designs-to-open-compute-project/>
 15. <a id="ref-15"></a>S. Khashab, A. Gran Alcoz, et al. (NVIDIA, Technion) — *High-speed Networking for Giga-Scale AI Factories* (Spectrum-X multiplane + hardware-accelerated load balancing). arXiv:2605.21187. <https://arxiv.org/abs/2605.21187>
 16. <a id="ref-16"></a>*The Multipath Reliable Connection (MRC) Transport* (OpenAI / OCP; open multipath RDMA spec). arXiv:2606.18170; OCP MRC 1.0. <https://arxiv.org/abs/2606.18170>
+17. <a id="ref-17"></a>Nokia — *Scale-across networking: Unlocking AI factory scale with optical innovation* (blog: DCI for back-end AI networks; synchronous-training distance limits; 800G ZR/ZR+, 1.6T coherent pluggables, hollow-core fiber). <https://www.nokia.com/blog/scale-across-networking-unlocking-ai-factory-scale-with-optical-innovation/>
 
 # TODO list tracking
 
