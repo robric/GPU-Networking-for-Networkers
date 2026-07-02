@@ -15,6 +15,44 @@ The golden rule for the whole document: **whenever something looks like magic, w
 
 > **One vendor as the worked example.** "GPU" here means the category, not a brand. We build the whole mental model on **NVIDIA** hardware — it is the most widely deployed and the most concrete to point at, and its vocabulary (NVLink, SM, CUDA, NCCL) is what you will hit first in the wild. But the *architecture* is universal: a die of throughput tiles, fast on-package memory, a high-bandwidth **scale-up** link to nearby peers, and an **RDMA NIC** out to the cluster. AMD and Intel assemble the same building blocks under different names. We learn it once on NVIDIA, then map the alternatives — **AMD and Intel** in their own chapter, and the **open standards (UALink, Ultra Ethernet)** that answer NVIDIA's proprietary stack in theirs — once the model is in place.
 
+## Contents
+
+- [1. The landscape: the GPU and the networks around it](#1-the-landscape-the-gpu-and-the-networks-around-it)
+  - [1.1 Why GPUs run the show (and what the CPU still does)](#11-why-gpus-run-the-show-and-what-the-cpu-still-does)
+  - [1.2 What a GPU looks like, and the words for its parts](#12-what-a-gpu-looks-like-and-the-words-for-its-parts)
+  - [1.3 Host vs device](#13-host-vs-device)
+  - [1.4 The two network paths: host vs GPU](#14-the-two-network-paths-host-vs-gpu)
+  - [1.5 The two workloads: training vs inference](#15-the-two-workloads-training-vs-inference)
+  - [1.6 The one-slide summary](#16-the-one-slide-summary)
+- [2. GPU Networking, the big picture: two fundamentally different problems](#2-gpu-networking-the-big-picture-two-fundamentally-different-problems)
+  - [2.1 Scale-up vs scale-out](#21-scale-up-vs-scale-out)
+  - [2.2 A picture to anchor everything](#22-a-picture-to-anchor-everything)
+  - [2.3 Why two layers at all? (the networking intuition)](#23-why-two-layers-at-all-the-networking-intuition)
+- [3. Scale-up: the NVLink fabric](#3-scale-up-the-nvlink-fabric)
+  - [3.1 The problem NVLink solves](#31-the-problem-nvlink-solves)
+  - [3.2 NVLink as a link: lanes, sublinks, and how to read a spec sheet](#32-nvlink-as-a-link-lanes-sublinks-and-how-to-read-a-spec-sheet)
+  - [3.3 From links to a fabric: a single NVSwitch (one node)](#33-from-links-to-a-fabric-a-single-nvswitch-one-node)
+  - [3.4 Scaling past the box: NVL72, then NVL576](#34-scaling-past-the-box-nvl72-then-nvl576)
+    - [3.4.1 NVL72: one rack, one switch tier](#341-nvl72-one-rack-one-switch-tier)
+    - [3.4.2 NVL576: eight racks, two switch tiers (a folded Clos)](#342-nvl576-eight-racks-two-switch-tiers-a-folded-clos)
+  - [3.5 Memory semantics: load/store vs send/receive](#35-memory-semantics-loadstore-vs-sendreceive)
+  - [3.6 Decoding the names: DGX/HGX/MGX, Oberon/Kyber, and the NVL## trap](#36-decoding-the-names-dgxhgxmgx-oberonkyber-and-the-nvl-trap)
+  - [3.7 Where scale-up ends and scale-out must begin](#37-where-scale-up-ends-and-scale-out-must-begin)
+- [4. Scale-out: the GPU cluster network](#4-scale-out-the-gpu-cluster-network)
+  - [4.1 The job: connect the islands](#41-the-job-connect-the-islands)
+  - [4.2 RDMA on the wire: one-sided, kernel-bypass, GPUDirect](#42-rdma-on-the-wire-one-sided-kernel-bypass-gpudirect)
+  - [4.3 InfiniBand vs RoCE: two ways to carry RDMA](#43-infiniband-vs-roce-two-ways-to-carry-rdma)
+  - [4.4 Why AI traffic breaks ordinary networks](#44-why-ai-traffic-breaks-ordinary-networks)
+  - [4.5 Keeping it lossless: PFC, ECN, and DCQCN](#45-keeping-it-lossless-pfc-ecn-and-dcqcn)
+  - [4.6 Shaping the fabric: leaves, spines, and how GPUs hang off them](#46-shaping-the-fabric-leaves-spines-and-how-gpus-hang-off-them)
+    - [4.6.1 The baseline: a node homed to its leaf](#461-the-baseline-a-node-homed-to-its-leaf)
+    - [4.6.2 Rail-only: dropping the spine](#462-rail-only-dropping-the-spine)
+    - [4.6.3 Scaling past one pod: a spine over the rails](#463-scaling-past-one-pod-a-spine-over-the-rails)
+    - [4.6.4 Multi-plane: splitting the NIC across fabrics](#464-multi-plane-splitting-the-nic-across-fabrics)
+    - [4.6.5 Scaling across datacenters](#465-scaling-across-datacenters)
+  - [4.7 Steering the traffic: picking among the paths](#47-steering-the-traffic-picking-among-the-paths)
+- [References](#references)
+
 ---
 
 ## 1. The landscape: the GPU and the networks around it
@@ -298,6 +336,8 @@ This document tackles **scale-up first** (NVLink), then scale-out later.
 
 
 ## 3. Scale-up: the NVLink fabric
+
+<p align="center"><img src="image.png" alt="James Brown 'AI Scale' meme: SCALE UP! (scale on up) / STAY IN THE RACK, (scale on up) / LIKE A GPU MACHINE, (scale on up)" width="520"></p>
 
 > Goal of this section: by the end you should be able to explain, to another networking person, what NVLink *is*, what problem it solves, and why it is **not** just "a faster PCIe" and **not** quite "an Ethernet for GPUs" either.
 
@@ -1309,7 +1349,7 @@ Past scale-up and scale-out sits a third axis, and it is the one a networker alr
 
 The driver is power, not networking. You cannot get the megawatts, land, and cooling to sit a million XPUs in one building, and multiple million-XPU clusters are planned for around 2027*. So the cluster spills across buildings, a campus, or a metro, and the back-end fabric follows it out onto fiber that no longer stays inside one hall.
 
-The limit is the barrier from §4.4. Synchronous training is one giant collective, and the slowest path sets the step time — except now a link's delay is the speed of light over distance, not queueing. That caps a tightly-coupled run at a few hundred kilometers of separation [[17]](#ref-17); past that you fall back on the latency-tolerant parallelism of §5 — pipeline stages, which can hide a long link, rather than tensor shards, which cannot. The physical layer is coherent optics over DWDM — 800G ZR/ZR+ pluggables in the backend routers today, 1.6T pluggables and hollow-core fiber* on the way — front-ended by deep-buffer DCI routers (Broadcom's Jericho class) that absorb the bandwidth-delay product a long link builds up. Nokia calls the move scaling *beyond* the datacenter, and packages it as optical DCI plus a Data Center Gateway [[17]](#ref-17).
+The limit is the barrier from §4.4. Synchronous training is one giant collective, and the slowest path sets the step time — except now a link's delay is the speed of light over distance, not queueing. That caps a tightly-coupled run at a few hundred kilometers of separation [[17]](#ref-17); past that you fall back on the latency-tolerant parallelism of §5 — pipeline stages, which can hide a long link, rather than tensor shards, which cannot. The physical layer is coherent optics over DWDM — 800G ZR/ZR+ pluggables in the backend routers today, 1.6T pluggables and hollow-core fiber* on the way — front-ended by deep-buffer DCI routers (Broadcom's Jericho class) that absorb the bandwidth-delay product a long link builds up.
 
 Zoom back into any one of these fabrics — a plane, a pod, a hall — and the §4.4 problem is unchanged: a few giant flows overload one path at a time while the parallel paths sit idle. Spreading them is the steering problem of §4.7.
 
