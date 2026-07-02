@@ -1503,7 +1503,7 @@ A collective is an *algorithm*, not a single transfer. The same all-reduce can b
 
 **Tree — latency-optimal.** For *small* messages those 2(N−1) hops dominate. A tree instead reduces up to a root and broadcasts back down in about **2·log2(N)** hops — for 16k GPUs, ~28 steps instead of ~32,000. NCCL ships a double binary tree and picks it automatically for small buffers, ring for large ones; you rarely choose by hand.
 
-**Let the switch do the math (SHARP).** Return to §5.2's split: reduce-scatter and all-reduce *compute* a sum, while all-gather and all-to-all only move bytes. A sum can be done **inside the switch** instead of on the GPUs. NVIDIA's **SHARP** does exactly that — the Quantum InfiniBand switch (and NVSwitch, as NVLink SHARP) adds the contributions as they arrive and sends one result back down:
+**Let the switch do the math (SHARP).** Return to §5.2's split: reduce-scatter and all-reduce *compute* a sum, while all-gather and all-to-all only move bytes. A sum can be done **inside the switch** instead of on the GPUs. NVIDIA's **SHARP** does exactly that, and on *both* of the doc's fabrics: the **Quantum InfiniBand** switch out on the scale-out side (§4), and the **NVSwitch** inside the scale-up domain (§3), where it goes by **NVLink SHARP** (NVLS, 3rd-gen NVSwitch onward). Either way the switch adds the contributions as they arrive and sends one result back down:
 
 ```
    g0      g1      g2      g3     (1) each GPU sends its buffer up
