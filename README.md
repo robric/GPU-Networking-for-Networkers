@@ -337,8 +337,6 @@ This document tackles **scale-up first** (NVLink), then scale-out later.
 
 ## 3. Scale-up: the NVLink fabric
 
-<p align="center"><img src="image.png" alt="James Brown 'AI Scale' meme: SCALE UP! (scale on up) / STAY IN THE RACK, (scale on up) / LIKE A GPU MACHINE, (scale on up)" width="520"></p>
-
 > Goal of this section: by the end you should be able to explain, to another networking person, what NVLink *is*, what problem it solves, and why it is **not** just "a faster PCIe" and **not** quite "an Ethernet for GPUs" either.
 
 ### 3.1 The problem NVLink solves
