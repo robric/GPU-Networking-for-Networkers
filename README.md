@@ -1402,8 +1402,49 @@ Keeping them apart stops them fighting each other — a microburst that adaptive
 - **don't queue** — ECN/DCQCN holds injection rates so queues stay shallow (§4.5).
 - **don't collide** — rail-optimized topology + adaptive/sprayed load balancing keep the few giant flows off each other's links (§4.6).
 
-All three guard the same thing — the **tail** — because one slow flow, whether *dropped*, *queued*, or *collided*, is paid for by every GPU waiting at the barrier. That completes the scale-out *transport* story: how bytes cross the cluster without falling off the drop cliff or stretching the tail. What we have **not** described is the layer that *generates* those bytes — the **collectives** themselves (ring, tree, all-reduce, all-to-all) and how each maps onto the fabric. That's §5.
+All three guard the same thing — the **tail** — because one slow flow, whether *dropped*, *queued*, or *collided*, is paid for by every GPU waiting at the barrier. That slow flow is a **straggler** [[15]](#ref-15):
 
+> It is well known that the Collective Completion Time (CCT) of synchronous collectives (AllReduce, AllGather, All2All) is determined by network stragglers — individual slow flows that delay the CCT, and in turn collective performance affects the performance of the entire training run.
+
+That completes the scale-out *transport* story: how bytes cross the cluster without falling off the drop cliff or stretching the tail. What we have **not** described is the layer that *generates* those bytes — the **collectives** themselves (ring, tree, all-reduce, all-to-all) and how each maps onto the fabric. That's §5.
+
+
+## 5. Collectives: the traffic the fabric carries
+
+> Goal of this section: by the end you should be able to name the handful of group operations every training and inference job is built from, say what each one does to a tensor, and picture how it lands on the wire — ring versus tree, and when the switch itself does the math.
+
+§3 and §4 built the roads — a memory fabric inside the island, a packet fabric between islands. This section is the traffic on them, and the traffic is not arbitrary. Most of it is a **small, fixed vocabulary of group operations** called **collectives**; the rest is plain **point-to-point** send/receive — one rank to one rank, the ordinary transfer you already know (a pipeline-stage handoff, or an inference KV-cache transfer). Learn the handful of collectives plus that one exception and you know essentially every byte the fabric carries.
+
+A collective is what the name says: an operation *all* the ranks run together. Not one GPU sending to another, but every GPU in a group feeding into — and coming out of — a single coordinated exchange, usually with arithmetic folded in (sum the gradients, average the weights). The closest thing you already run is a group primitive like multicast or a flood, with two twists: a collective *computes* as it moves, and it is a **barrier** — it finishes only when the last rank arrives. That is why the straggler of §4.7 is fatal: a collective *is* the barrier it stalls.
+
+The vocabulary is portable. The same operations run on every vendor's silicon through a matched library — **NCCL** on NVIDIA (say "nickel"), **RCCL** on AMD, **oneCCL** on Intel — same shapes, same names. So this is the one layer of the stack that does not care whether it rides NVLink, InfiniBand, or RoCE; it sits *above* the scale-up/scale-out split, and above the IB-vs-RoCE argument entirely. We have already borrowed its words — all-reduce in §4.4, the MoE all-to-all, the AllReduce/AllGather/All2All of the straggler quote. Now we define them, in four steps:
+
+- **§5.1** — which parallelism strategy generates which pattern: the collectives, and the point-to-point handoffs.
+- **§5.2** — the collectives catalog: what each one does to a tensor.
+- **§5.3** — on the wire: ring versus tree, and when the switch does the math (SHARP).
+- **§5.4** — how the mix shifts for training versus inference, where disaggregated serving turns the KV cache into a point-to-point elephant.
+
+### 5.1 Where the traffic comes from: parallelism
+
+You never train a frontier model on one GPU, so you cut it across many — and every cut leaves a **seam** that communication has to sew shut. The cut you choose *is* the traffic you generate. Four of them matter:
+
+| Parallelism   | Splits                       | Pattern on the wire                        | Cadence         | Rides on            |
+|---------------|------------------------------|--------------------------------------------|-----------------|---------------------|
+| Data (DP)     | the batch; model replicated  | all-reduce (gradients)                     | once / step     | scale-out           |
+| Tensor (TP)   | each weight matrix           | all-reduce (= reduce-scatter + all-gather) | ~2× / layer     | scale-up (NVLink)   |
+| Pipeline (PP) | the layer stack, into stages | point-to-point send/recv                   | per micro-batch | scale-out           |
+| Expert (MoE)  | the FFN experts              | all-to-all (dispatch + combine)            | per MoE layer   | scale-up (EP group) |
+
+<p align="center"><em>The four ways to split a model, and the communication each one leaves behind.</em></p>
+
+What the table flattens:
+
+- **Cadence is the whole game.** TP and MoE exchange data *inside every layer*, so their traffic is fine-grained and latency-bound — which is why §4 kept it on NVLink, inside the island. DP and PP communicate once per step or per micro-batch, coarse enough to ride the scale-out Clos.
+- **All-to-all is MoE-only.** A dense model never issues one, and even in an MoE model it stays within the **expert-parallel group** that holds the sharded experts — not across the whole cluster (§4.4).
+- **Real jobs stack the cuts.** A frontier run does DP × TP × PP, often × MoE, at once — "3D/4D parallelism" — so the fabric carries every one of these patterns simultaneously, each pinned to the layer that suits it.
+- **Scale-across is the next tier out.** The same rule — coarsest dimension on the slowest fabric — decides what crosses a datacenter boundary (§4.6.5). When a cluster spans sites, the outermost loop is what stretches over the WAN: the data-parallel gradient all-reduce (once per step, and easy to overlap with the backward pass or desynchronize), with pipeline the next candidate. TP and MoE never leave the building — their per-layer traffic can't survive hundreds of kilometers of light.
+
+One variant to log now, because it reshapes the traffic: **sharded** data parallelism (ZeRO / FSDP) keeps DP's split batch but shards the weights and optimizer state across the replicas too. So instead of a single gradient all-reduce it does an **all-gather** to rebuild each layer's weights before use and a **reduce-scatter** to spread the gradients after — the same arithmetic as an all-reduce, unrolled into the two halves we take apart in §5.3.
 
 ## References
 
