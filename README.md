@@ -1,5 +1,7 @@
 # GPU Networking for Networker Dummies
 
+![alt text](image.png)
+
 > A deep dive into how GPUs talk to each other, written by a networking person, for networking people.
 
 If you have spent your career thinking in terms of routers, MPLS labels, routing tables, BGP and the occasional `tcpdump`, the world of "GPU networking" can feel like it was designed by aliens. People throw around words like *NVLink*, *NVSwitch*, *collective*, *all-reduce*, *RDMA*, *RoCE* and *rail-optimized fabric* as if they were obvious. They are not.
