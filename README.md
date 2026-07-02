@@ -1447,6 +1447,82 @@ What the table flattens:
 
 One variant to log now, because it reshapes the traffic: **sharded** data parallelism (ZeRO / FSDP [[19]](#ref-19)) keeps DP's split batch but shards the weights and optimizer state across the replicas too. So instead of a single gradient all-reduce it does an **all-gather** to rebuild each layer's weights before use and a **reduce-scatter** to spread the gradients after — the same arithmetic as an all-reduce, unrolled into the two halves we take apart in §5.3.
 
+### 5.2 The catalog: what each collective does to a tensor
+
+The library ships a short, fixed list. Here is what each one does to a buffer spread across four GPUs — read each block left (before) to right (after):
+
+```
+   4 GPUs (g0..g3).  Si = ai+bi+ci+di, the sum of column i across all four (a reduction).
+
+Broadcast  -  copy one GPU's buffer to all (no math)
+   g0 [A]           -->  [A]
+   g1 [.]           -->  [A]
+   g2 [.]           -->  [A]
+   g3 [.]           -->  [A]
+
+All-gather  -  every GPU collects every chunk (no math)
+   g0 [a]           -->  [a b c d]
+   g1 [b]           -->  [a b c d]
+   g2 [c]           -->  [a b c d]
+   g3 [d]           -->  [a b c d]
+
+Reduce-scatter  -  sum the chunks, keep one slice each
+   g0 [a0 a1 a2 a3] -->  [S0]
+   g1 [b0 b1 b2 b3] -->  [S1]               Si = ai+bi+ci+di
+   g2 [c0 c1 c2 c3] -->  [S2]
+   g3 [d0 d1 d2 d3] -->  [S3]
+
+All-reduce  -  every GPU ends with the summed vector   ( = reduce-scatter + all-gather )
+   g0 [a0 a1 a2 a3] -->  [S0 S1 S2 S3]
+   g1 [b0 b1 b2 b3] -->  [S0 S1 S2 S3]  each GPU: same summed vector
+   g2 [c0 c1 c2 c3] -->  [S0 S1 S2 S3]
+   g3 [d0 d1 d2 d3] -->  [S0 S1 S2 S3]
+
+All-to-all  -  each GPU sends chunk j to GPU j (a transpose, no math)
+   g0 [a0 a1 a2 a3] -->  [a0 b0 c0 d0]
+   g1 [b0 b1 b2 b3] -->  [a1 b1 c1 d1]
+   g2 [c0 c1 c2 c3] -->  [a2 b2 c2 d2]
+   g3 [d0 d1 d2 d3] -->  [a3 b3 c3 d3]
+```
+
+<p align="center"><em>The five workhorse collectives; two carry a sum (the "reduce" ones), the rest only move bytes.</em></p>
+
+Three things to take from the picture:
+
+- **Two of them compute, the rest just move.** Reduce-scatter and all-reduce carry the sum — the "reduce" in the name; broadcast, all-gather, and all-to-all only shuffle bytes. That split matters on the wire: a reduction can be done *by the switch itself* (§5.3), a plain shuffle cannot.
+- **The one identity to memorize: all-reduce = reduce-scatter + all-gather** (in that order). Sum-and-split so each GPU owns the finished sum of one slice (reduce-scatter), then gather the slices back so everyone has the whole result (all-gather) — you can't gather a sum you haven't computed yet. Trace it in the picture: reduce-scatter leaves `S0..S3` one per GPU, and all-reduce's `[S0 S1 S2 S3]` on every GPU is exactly those gathered. It isn't trivia; it's how a fast all-reduce is actually built (§5.3). FSDP (§5.1) uses the *same two primitives in the opposite order and for different buffers*: an **all-gather** to rebuild the weights *before* a layer runs, a **reduce-scatter** to shard the gradients *after* — the two halves repurposed, not one all-reduce.
+- **Which job fires which is the §5.1 table.** DP and TP live on all-reduce; FSDP on all-gather + reduce-scatter; MoE on all-to-all; broadcast mostly shows up at setup, handing the initial weights to every replica. The point-to-point send/recv of pipeline and KV cache isn't here — it never was a collective.
+
+### 5.3 On the wire: ring, tree, and letting the switch do the math
+
+A collective is an *algorithm*, not a single transfer. The same all-reduce can be laid over the physical links several ways, and the choice sets how many bytes cross the wire and how long the barrier lasts. Two families matter.
+
+**Ring — bandwidth-optimal.** Line the GPUs up in a logical ring, each sending only to its right-hand neighbour, and run the §5.2 identity around it. In the reduce-scatter phase the buffer is cut into N chunks passed hand to hand, each GPU adding the chunk it receives, so after N−1 hops every GPU holds the finished sum of one chunk; the all-gather phase carries those finished chunks around the same ring. The point is that no GPU ever moves the whole buffer — only 1/N of it per step. Add the steps up and each GPU sends **2(N−1)/N** buffers' worth of data: for four GPUs that's 1.5×, and as the ring grows it creeps up to **2× and stops**. A 16-GPU ring and a 16,000-GPU ring push the *same* bytes per GPU — that flat cost is why ring all-reduce is the training workhorse. The price is latency: 2(N−1) hops in sequence, so a longer ring takes longer wall-clock even at the same per-GPU volume. Ring loves *big* messages.
+
+*Networker read: a token ring, pipelined — every link carries the same load, no root, no hotspot.*
+
+**Tree — latency-optimal.** For *small* messages those 2(N−1) hops dominate. A tree instead reduces up to a root and broadcasts back down in about **2·log2(N)** hops — for 16k GPUs, ~28 steps instead of ~32,000. NCCL ships a double binary tree and picks it automatically for small buffers, ring for large ones; you rarely choose by hand.
+
+**Let the switch do the math (SHARP).** Return to §5.2's split: reduce-scatter and all-reduce *compute* a sum, while all-gather and all-to-all only move bytes. A sum can be done **inside the switch** instead of on the GPUs. NVIDIA's **SHARP** does exactly that — the Quantum InfiniBand switch (and NVSwitch, as NVLink SHARP) adds the contributions as they arrive and sends one result back down:
+
+```
+   g0      g1      g2      g3     (1) each GPU sends its buffer up
+   |       |       |       |
+   v       v       v       v
+ +----------------------------+
+ |        switch:  sum        |     (2) the switch adds the four
+ +----------------------------+
+   |       |       |       |
+   v       v       v       v
+   g0      g1      g2      g3     (3) one summed result back to each
+```
+
+<p align="center"><em>In-network reduction: each GPU sends its buffer up once, the switch sums, one result comes back — no ring, no N−1 laps.</em></p>
+
+So instead of a buffer circling the ring N−1 times, each GPU sends its data up once and gets the total back; the fabric roughly halves the bytes and erases the ring's latency. Two limits, both from §5.2: only the *reduce* collectives can be offloaded (there must be a sum to fold in — a pure all-to-all has nothing to reduce), and the switches must be able to do arithmetic — SHARP is an NVIDIA InfiniBand/NVSwitch feature, not something a plain Ethernet switch does (open Ultra Ethernet is adding in-network collectives; its own chapter, later).
+
+Ring, tree, or in-network, the collective is still a barrier — the whole reason §4's don't-drop / don't-queue / don't-collide effort exists. What changes the *shape* of this traffic is the workload above it: training and inference stress the fabric in different ways, and that's §5.4.
+
 ## References
 
 1. <a id="ref-1"></a>NVIDIA — *DGX GB200 User Guide: Hardware* (NVLink switch trays: 9 × 2 NVSwitch chips = 18). <https://docs.nvidia.com/dgx/dgxgb200-user-guide/hardware.html>
