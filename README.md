@@ -1248,12 +1248,12 @@ An NVL72 SU spans 72 leaves against the 128 a spine can reach, so a second full 
 
 #### 4.6.4 Multi-plane: splitting the NIC across fabrics
 
-Adding that third tier is one way to grow. Multi-plane is the other — not a deeper fabric but a wider one: several two-tier fabrics run in parallel. That is multi-plane, and it is the design a Fibre Channel SAN already uses: two fabrics, **SAN A** and **SAN B**, that never touch, with every host attached to both, so losing a fabric just means traffic rides the other. A multi-plane GPU backend is the same move: several independent leaf-spine fabrics — *planes* — never joined at the spine, every GPU attached to all of them.
+Adding that third tier is one way to grow. Multi-plane is the other — not a deeper fabric but a wider one: several two-tier fabrics run in parallel. That is multi-plane, and it is the design a Fibre Channel SAN already uses: two fabrics, **SAN A** and **SAN B**, that never touch, with every host attached to both, so losing a fabric just means traffic rides the other. A multi-plane GPU backend is the same move: several independent, disjoint leaf-spine fabrics — *planes* — every GPU attached to all of them.
 
-The attachment is a split at the NIC, and modern GPU NICs are built for it — a ConnectX-8-class SuperNIC [[6]](#ref-6) carries its own small Ethernet switch, so one 800 Gb/s port fans out to several planes instead of homing to one. Two hyperscale designs make it concrete:
+The attachment is a split at the NIC, and modern GPU NICs are built for it — a SuperNIC like NVIDIA's ConnectX-8 [[6]](#ref-6) carries its own small Ethernet switch, so one 800 Gb/s port fans out to several planes instead of homing to one. Two public designs make it concrete:
 
-- **NVIDIA Spectrum-X** [15]: the ConnectX-8's built-in switch fans the 800G port across four planes (4× 200G), each a two-level fat-tree, none joined at the core — a switch, cable, or transceiver failure costs one plane's bandwidth, not the job. (Plane count is a deployment knob: the DGX B300 SuperPOD is a 2-plane "twin-planar" build [7].)
-- **Oracle Acceleron** [[8]](#ref-8) (OCI Zettascale10 [[9]](#ref-9)): the NIC's built-in **four-port switch** fans the 800G port across **four planes** (4× 200G; an 8× 100G breakout gives eight), wired with **shuffle cables** (breakout at both ends, NIC and switch). Each plane is its own full-bisection Clos, and Oracle documents the design reaching **131,072 GPUs** and beyond.
+- **NVIDIA Spectrum-X** [[15]](#ref-15): the ConnectX-8's built-in switch fans the 800G port across four planes (4× 200G), each a two-level fat-tree, none joined at the spine — a switch, cable, or transceiver failure costs one plane's bandwidth, not the job. (Plane count is a deployment knob: the DGX B300 SuperPOD is a 2-plane "twin-planar" build [[7]](#ref-7).)
+- **Oracle Acceleron** [[8]](#ref-8) (OCI Zettascale10 [[9]](#ref-9)): the NIC's built-in **four-port switch** fans the 800G port across **four planes** (4× 200G; an 8× 100G breakout gives eight), wired with **shuffle cables** (breakout at both ends, NIC and switch). Each plane is its own full-bisection Clos — built on a smaller **64-port 800G switch** than the 128-port part the walkthrough below uses — together interconnecting **hundreds of thousands of GPUs**.
 
 ```
                       +---------------+
@@ -1272,7 +1272,24 @@ The attachment is a split at the NIC, and modern GPU NICs are built for it — a
 
 <p align="center"><em>NVIDIA Spectrum-X and Oracle Acceleron: one 800G NIC fanned across four independent planes (4×200G)</em></p>
 
-The scale win is structural, not just bandwidth. Splitting an 800G port into 4× 200G lets each plane's switches run slower ports, and a switch of fixed capacity carries four times as many of them. A two-tier fat-tree's reach grows with the *square* of switch radix, so four times the ports is sixteen times the endpoints — NVIDIA puts a two-tier multiplane fabric at **128K GPUs** [[15]](#ref-15), the size that used to demand a third tier; the four planes then restore the 800G per GPU. The reach of three tiers, at the latency of two.
+The scale win is structural, not just bandwidth. A switch has a fixed capacity: you can spend it on 128 ports of 800G or on 512 ports of 200G — four times as many, each a quarter as fast. The extra ports don't add GPUs in proportion; they add them by the *square*. That is worth counting out rather than asserting. Take the §4.6.3 baseline — a 128-port 800G switch, half its ports down to GPUs, half up to the spine — and slice every port into 4× 200G. Walk the two columns of the table:
+
+1. **GPUs per SU — the down-links.** Each leaf's down-ports each home one GPU, and an SU is 8 rail-leaves, so GPUs per SU = 8 × (down-ports per leaf). Splitting the 64 down-links into 256 quadruples that column: 8 × 64 = 512 → 8 × 256 = **2,048**.
+2. **Max SUs — the up-links.** The up-ports split the same way, and so does the spine: a 128-port 800G spine becomes a 512-port 200G one. A spine reaches one leaf per port, and 8 leaves make an SU, so Max SUs = spine ports ÷ 8. Quadrupling the spine's ports quadruples that column too: 128 ÷ 8 = 16 → 512 ÷ 8 = **64**. This is the step that needs the uplinks split as well — leave them at 800G and the spine stays 128 ports, stuck at 16 SUs.
+3. **Multiply the columns.** 2,048 GPUs per SU × 64 SUs = **131,072** = 512² ÷ 2 — the 128K two-tier fabric NVIDIA documents [[15]](#ref-15). The 4× lands once on each column, and that is the square: quarter the port speed, sixteen times the fabric.
+
+Every link in that fabric is now 200G, though, so each GPU sits on a quarter of its bandwidth — the last column. The planes pay it back: run **four** 200G fabrics side by side, one 200G link from each GPU into each, and 4 × 200G = 800G is restored. The GPU count doesn't move — every plane spans the *same* 131,072 GPUs. The radix bought the endpoints; the planes only buy back the bandwidth.
+
+| Design         | Radix | GPUs per SU | Max SUs (2-tier) | Max GPUs (2-tier) | BW/GPU |
+|----------------|-------|-------------|------------------|-------------------|--------|
+| 1× 800G plane  | 128   | 512         | 16               | 8,192             | 800G   |
+| 1× 200G plane  | 512   | 2,048       | 64               | 131,072           | 200G   |
+| 4× 200G planes | 512   | 2,048       | 64               | 131,072           | 800G   |
+
+<p align="center"><em>The 4× radix buys the 16× jump to 131,072 GPUs; the four planes only lift each GPU from 200G back to 800G.</em></p>
+
+The reach of three tiers, at the latency of two.
+
 
 **Isn't the NIC a third tier, then?** By hop-count, almost: a cross-plane path runs GPU → NIC-switch → leaf → spine → leaf → NIC-switch → GPU, three tiers of switches. But the NIC-switch does neither thing a real third tier does. It adds no *reach* — a shared aggregation tier takes a fabric from radix² to radix³, yet two-tier multiplane stops at **128K**, exactly radix² (512²/2); reaching the millions takes a third tier *inside the planes*, so the NIC contributes no endpoints. And it adds no *fabric hop* — it sits on the host (nanoseconds), not a switch box out in the datacenter (microseconds). A real third tier is *in series*: every long path threads leaf→agg→spine→agg→leaf, deeper and slower. The planes run *in parallel*: a packet crosses one, and the NIC just picks which. It is the GPU multi-homed to several independent fabrics with ECMP across them — the SAN A/B picture again, an edge endpoint that load-balances, not a tier of the fabric.
 
