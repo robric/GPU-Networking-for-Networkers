@@ -5,7 +5,7 @@
 If you have spent your career thinking in terms of routers, MPLS labels, routing tables, BGP and the occasional `tcpdump`, the world of "GPU networking" can feel like it was designed by aliens. People throw around words like *NVLink*, *NVSwitch*, *collective*, *all-reduce*, *RDMA*, *RoCE* and *rail-optimized fabric* as if they were obvious. They are not.
 
 This document is two things at once, the same way I did the [k8s service & LB testing notes](https://github.com/robric/k8s-svc-and-lb-testing) were:
-- a **personal cheat sheet** so I (and maybe you) can stop re-clauding/googling "how does this NVLink thing connects GPUs to each other ?" every six months.
+- a **personal cheat sheet** so I (and maybe you) can stop re-clauding/googling "how does this NVLink thing connect GPUs to each other ?" every six months.
 - an **educational source** to explain how GPU interconnects actually work, starting from networking intuition you already have.
 
 
@@ -228,7 +228,7 @@ The takeaway for the rest of the doc: **§3 and §4 are mostly the *training* st
 
 When we say "GPU networking", we are actually talking about **two different interconnects** solving **two different problems**. Almost every confusion in this space comes from mixing them up. So before anything else, we separate them cleanly.
 
-### 2.1 Scale-up vs scale-out, in one sentence each
+### 2.1 Scale-up vs scale-out
 
 - **Scale-up** = bind a *small number* of GPUs (8, 72, …) into a single **tightly-coupled shared-memory domain** — one global address space, memory-speed sharing — so they can cooperate on one problem *as if* they were one giant GPU. Note the *as if*: software still sees N distinct GPUs (the `cuda:0…` from §1.3), each with its own memory and scheduler; the fabric just makes "pretending" cheap. This is **NVLink / NVSwitch** territory.
 - **Scale-out** = connect a *large number* of those domains together into a *cluster* of thousands or tens of thousands of GPUs, using a packet-switched network. This is **InfiniBand / RoCE-over-Ethernet** territory, and it is the part that looks most like the networking you already know.
@@ -242,13 +242,13 @@ Inside a chassis, line cards talk over a backplane that is fast, short, lossless
 ### 2.2 A picture to anchor everything
 
 ```
-                        ███  SCALE-OUT  ███
+                        ---  SCALE-OUT  ---
             (cluster of many nodes, packet-switched network:
                      InfiniBand or RoCE/Ethernet)
 
          Node A                                   Node B
    +-------------------+                    +-------------------+
-   |   ███ SCALE-UP ███|                    |   ███ SCALE-UP ███|
+   |   --- SCALE-UP ---|                    |   --- SCALE-UP ---|
    |                   |                    |                   |
    | GPU0 ==== GPU1    |     RDMA over      | GPU0 ==== GPU1    |
    |  ||   X    ||     | <================> |  ||   X    ||     |
@@ -451,12 +451,12 @@ You've climbed this ladder before. In networking, when a **single pizza-box swit
 
 #### 3.4.1 NVL72: one rack, one switch tier
 
-The on-board NVSwitch handles 8 GPUs. To go bigger, NVIDIA lifts the same switch chips *out* of the server and into dedicated **NVLink Switch trays** wired across a whole rack. That's what a **GB200 NVL72** is: 72 Blackwell GPUs (18 compute trays) + **9 NVLink Switch trays**, all stitched into **one single NVLink domain** where any of the 72 GPUs can load/store any other's HBM at full speed. *This* is where "72 GPUs act as one giant GPU" (the abstraction from §1.1) stops being marketing and becomes a wiring diagram — it's a non-blocking NVLink fabric, just scaled from 8 ports to 72.
+The on-board NVSwitch handles 8 GPUs. To go bigger, NVIDIA lifts the same switch chips *out* of the server and into dedicated **NVLink Switch trays** wired across a whole rack. That's what a **GB200 NVL72** is: 72 Blackwell GPUs (18 compute trays) + **9 NVLink Switch trays** (two NVSwitch chips each — 18 in all), all stitched into **one single NVLink domain** where any of the 72 GPUs can load/store any other's HBM at full speed [[1]](#ref-1)[[14]](#ref-14). *This* is where "72 GPUs act as one giant GPU" (the abstraction from §1.1) stops being marketing and becomes a wiring diagram — it's a non-blocking NVLink fabric, just scaled from 8 ports to 72.
 
 Physically, this is where the switch **leaves the baseboard**. The pizza-box collapses into a true chassis: compute trays and **NVLink Switch trays** become separate units in the rack, joined by the **NVLink spine** — a copper-cable backplane down the back. Now the chassis-router comparison is no longer an analogy — it's the literal build: **compute trays = line cards, switch trays = fabric cards, the spine = the backplane. The rack *is* the chassis.**
 
 ```
-   GB200 NVL72 = the 8-GPU NVSwitch fabric, scaled 4 -> 18 chips:
+   GB200 NVL72 = the 8-GPU NVSwitch fabric, scaled 4 -> 18 nvswitch chips:
 
      G0    G1    G2    ......    G69   G70   G71      72 GPUs
       |     |     |      ...      |     |     |        each GPU: 18 NVLinks,
@@ -464,9 +464,13 @@ Physically, this is where the switch **leaves the baseboard**. The pizza-box col
    ==== NVLink spine: passive copper backplane (~5,000 cables) ====
        /    |     |              |     |    \
       |     |     |      ...      |     |     |
-   +-----+-----+-----+-------+-----+-----+-----+
-   |NVS0 |NVS1 |NVS2 |  ...  |NVS15|NVS16|NVS17|      18 NVSwitch chips
-   +-----+-----+-----+-------+-----+-----+-----+       (across 9 switch trays)
+   +-------------+ +-------------+       +-------------+
+   | +---+ +---+ | | +---+ +---+ |       | +---+ +---+ |
+   | |NVS| |NVS| | | |NVS| |NVS| |  ...  | |NVS| |NVS| |   9 switch trays
+   | | 0 | | 1 | | | | 2 | | 3 | |       | |16 | |17 | |   x 2 NVS chips
+   | +---+ +---+ | | +---+ +---+ |       | +---+ +---+ |   = 18 chips
+   +-------------+ +-------------+       +-------------+
+      tray 0          tray 1                tray 8
 
    each GPU  -> 1 link to each of the 18 chips
    each chip -> 72 ports = 1 from each GPU   =>  1,296 links, non-blocking
@@ -1135,9 +1139,9 @@ Run it spine-less, though, and every port goes to an island, leaving none for up
 
 <p align="center"><em>Spine-less SU = rails × leaf radix; a 512-port chassis quadruples it — an NVL72 SU reaches ~37k GPUs with no spine at all.</em></p>
 
-> \* **Roadmap.** The 512-port figure is NVIDIA's **SN6800** chassis (4× Spectrum-6 ASICs, co-packaged optics, liquid-cooled) — [announced](https://nvidianews.nvidia.com/news/nvidia-spectrum-x-co-packaged-optics-networking-switches-ai-factories), shipping 2H 2026, not yet in volume. The 128-port parts (Tomahawk 6, SN6810) ship today and also come in liquid-cooled builds, so LC isn't the dividing line — radix and CPO integration are. And the 512-port math doesn't fully close: the four ASICs are stitched by a *passive* fiber shuffle (which reroutes light but switches nothing), and it's hard to see how 4 × 102.4T of silicon would expose a full 409.6T of **non-blocking** user bandwidth if the chips must spend ports talking to each other — on the usual arithmetic a non-blocking build would land nearer ~256 ports. NVIDIA doesn't publish the backplane/blocking ratio, so there's a piece here we can't reconcile; read 512 as raw aggregate, and treat this radix as belonging in the *spine* (§4.6.3) more than a spine-less leaf.
+> \* **Roadmap.** The 512-port figure is NVIDIA's **SN6800** chassis (4× Spectrum-6 ASICs, co-packaged optics, liquid-cooled) — announced [[2]](#ref-2), shipping 2H 2026, not yet in volume. The 128-port parts (Tomahawk 6, SN6810) ship today and also come in liquid-cooled builds, so LC isn't the dividing line — radix and CPO integration are. And the 512-port math doesn't fully close: the four ASICs are stitched by a *passive* fiber shuffle (which reroutes light but switches nothing), and it's hard to see how 4 × 102.4T of silicon would expose a full 409.6T of **non-blocking** user bandwidth if the chips must spend ports talking to each other — on the usual arithmetic a non-blocking build would land nearer ~256 ports. NVIDIA doesn't publish the backplane/blocking ratio, so there's a piece here we can't reconcile; read 512 as raw aggregate, and treat this radix as belonging in the *spine* (§4.6.3) more than a spine-less leaf.
 
-That's the whole rail-only block — same-rail one hop, cross-rail rail-local over PXN, no spine. To get *more than one* of them — to make the SU actually replicable — you reserve part of each leaf for uplinks and add a spine; the result is a **SuperPOD**, and that spine, plus how far it scales, is §4.6.3. (NVIDIA's DGX SuperPOD reference designs: [B200](https://docs.nvidia.com/dgx-superpod/reference-architecture-scalable-infrastructure-b200/latest/network-fabrics.html), [GB200 NVL72](https://docs.nvidia.com/dgx-superpod/reference-architecture-scalable-infrastructure-gb200/latest/dgx-superpod-architecture.html).)
+That's the whole rail-only block — same-rail one hop, cross-rail rail-local over PXN, no spine. To get *more than one* of them — to make the SU actually replicable — you reserve part of each leaf for uplinks and add a spine; the result is a **SuperPOD**, and that spine, plus how far it scales, is §4.6.3. (NVIDIA's DGX SuperPOD reference designs: B200 [[3]](#ref-3), GB200 NVL72 [[4]](#ref-4).)
 
 #### 4.6.3 Scaling past one pod: a spine over the rails
 
@@ -1223,7 +1227,7 @@ The spine is not the only way between rails. The scale-up fabric — NVLink/NVSw
 
 <p align="center"><em>Shared spine vs rail-only: the same 512-GPU SU attaches to one shared tier (16 SUs) or to isolated per-rail planes (128 SUs).</em></p>
 
-The trade is cost against generality. The MIT/Meta [*rail-only* study](https://arxiv.org/abs/2307.12169) actually put numbers on it: 38–77% less network cost and 37–75% less power for the same training performance, at an 8.2–11.2% completion-time overhead on MoE all-to-all traffic. The bet is that cross-rail traffic stays light enough to live on scale-up.
+The trade is cost against generality. The MIT/Meta *rail-only* study [[5]](#ref-5) actually put numbers on it: 38–77% less network cost and 37–75% less power for the same training performance, at an 8.2–11.2% completion-time overhead on MoE all-to-all traffic. The bet is that cross-rail traffic stays light enough to live on scale-up.
 
 Here is the maximum cluster size each design reaches on 128-port spines for DGX B200 (8 GPU node)
 
@@ -1232,7 +1236,7 @@ Here is the maximum cluster size each design reaches on 128-port spines for DGX 
 | DGX B200, shared spine    | 512         | 16               | 8,192             |
 | DGX B200, rail-only       | 512         | 128              | 65,536            |
 
-Next, NVL 72 is a bit different since a single SU can have up to 4608 GPUs over (72 rails !), with plans for 2 tier scale up domains NVL 576, 1152 and beyond which blur the performance line with scale-out SUs.
+Next, NVL 72 is a bit different since a single SU can have up to 4608 GPUs over (72 rails !), with plans for 2 tier scale up domains NVL 576, 1152 and beyond which blurs the performance line with scale-out SUs. 
 
 | Design                    | GPUs per SU | Max SUs (2-tier) | Max GPUs (2-tier) |
 |---------------------------|-------------|------------------|-------------------|
@@ -1242,16 +1246,14 @@ Next, NVL 72 is a bit different since a single SU can have up to 4608 GPUs over 
 
 An NVL72 SU spans 72 leaves against the 128 a spine can reach, so a second full SU won't fit in two tiers — which is why the documented 9,216-GPU NVL72 pods need a third tier.
 
-With one switch between two endpoints there was a single path; a spine tier adds many, one equal-cost path per leaf uplink.
-
 #### 4.6.4 Multi-plane: splitting the NIC across fabrics
 
-There is one more way to widen the fabric — stop building a single fabric and run several in parallel. That is multi-plane. It is the design a Fibre Channel SAN already uses: two fabrics, **SAN A** and **SAN B**, that never touch, with every host attached to both, so losing a fabric just means traffic rides the other. A multi-plane GPU backend is the same move: several independent leaf-spine fabrics — *planes* — never joined at the spine, every GPU attached to all of them.
+Adding that third tier is one way to grow. Multi-plane is the other — not a deeper fabric but a wider one: several two-tier fabrics run in parallel. That is multi-plane, and it is the design a Fibre Channel SAN already uses: two fabrics, **SAN A** and **SAN B**, that never touch, with every host attached to both, so losing a fabric just means traffic rides the other. A multi-plane GPU backend is the same move: several independent leaf-spine fabrics — *planes* — never joined at the spine, every GPU attached to all of them.
 
-The attachment is a split at the NIC, and modern GPU NICs are built for it — a ConnectX-8-class SuperNIC carries its own small Ethernet switch, so one 800 Gb/s port fans out to several planes instead of homing to one. Two hyperscale designs make it concrete:
+The attachment is a split at the NIC, and modern GPU NICs are built for it — a ConnectX-8-class SuperNIC [[6]](#ref-6) carries its own small Ethernet switch, so one 800 Gb/s port fans out to several planes instead of homing to one. Two hyperscale designs make it concrete:
 
-- **NVIDIA twin-planar** (DGX B300 reference): the 800G port breaks out into **2× 400GbE**, one link to each of **two** planes. The planes are "not connected at a core layer level," so a switch, cable, or transceiver failure drops the job to half bandwidth instead of killing it — and NVIDIA fits roughly twice the nodes under the same two tiers.
-- **Oracle Acceleron** (OCI Zettascale10): the NIC's built-in **four-port switch** fans the 800G port across **four planes** (4× 200G; an 8× 100G breakout gives eight), wired with **shuffle cables** (breakout at both ends, NIC and switch). Each plane is its own full-bisection Clos, so scaling is near-linear — "two planes double the nodes, three triple it" — reaching **131,072 GPUs** and beyond.
+- **NVIDIA Spectrum-X** [15]: the ConnectX-8's built-in switch fans the 800G port across four planes (4× 200G), each a two-level fat-tree, none joined at the core — a switch, cable, or transceiver failure costs one plane's bandwidth, not the job. (Plane count is a deployment knob: the DGX B300 SuperPOD is a 2-plane "twin-planar" build [7].)
+- **Oracle Acceleron** [[8]](#ref-8) (OCI Zettascale10 [[9]](#ref-9)): the NIC's built-in **four-port switch** fans the 800G port across **four planes** (4× 200G; an 8× 100G breakout gives eight), wired with **shuffle cables** (breakout at both ends, NIC and switch). Each plane is its own full-bisection Clos, and Oracle documents the design reaching **131,072 GPUs** and beyond.
 
 ```
                       +---------------+
@@ -1268,17 +1270,21 @@ The attachment is a split at the NIC, and modern GPU NICs are built for it — a
             (4 independent planes  -  never joined at the spine)
 ```
 
-<p align="center"><em>Oracle Acceleron: one 800G NIC fans across four planes (4×200G); NVIDIA twin-planar does the same with two.</em></p>
+<p align="center"><em>NVIDIA Spectrum-X and Oracle Acceleron: one 800G NIC fanned across four independent planes (4×200G)</em></p>
 
-It's the networker's A/B-fabric promise at training scale: more planes for more scale, and a failed plane degrades bandwidth instead of aborting the run.
+The scale win is structural, not just bandwidth. Splitting an 800G port into 4× 200G lets each plane's switches run slower ports, and a switch of fixed capacity carries four times as many of them. A two-tier fat-tree's reach grows with the *square* of switch radix, so four times the ports is sixteen times the endpoints — NVIDIA puts a two-tier multiplane fabric at **128K GPUs** [[15]](#ref-15), the size that used to demand a third tier; the four planes then restore the 800G per GPU. The reach of three tiers, at the latency of two.
 
-One catch rides along. RDMA's Reliable Connection assumed *one* path; spread a single queue pair across several planes and you need a transport that tolerates many paths and reorders cleanly. Oracle pairs Acceleron with **Multipath Reliable Connection (MRC)** — a multi-vendor effort (AMD, Broadcom, Intel, Microsoft, NVIDIA, OpenAI) that holds single-QP throughput across "multiple ports and many network paths." That's the steering problem of §4.7, pushed into the transport.
+**Isn't the NIC a third tier, then?** By hop-count, almost: a cross-plane path runs GPU → NIC-switch → leaf → spine → leaf → NIC-switch → GPU, three tiers of switches. But the NIC-switch does neither thing a real third tier does. It adds no *reach* — a shared aggregation tier takes a fabric from radix² to radix³, yet two-tier multiplane stops at **128K**, exactly radix² (512²/2); reaching the millions takes a third tier *inside the planes*, so the NIC contributes no endpoints. And it adds no *fabric hop* — it sits on the host (nanoseconds), not a switch box out in the datacenter (microseconds). A real third tier is *in series*: every long path threads leaf→agg→spine→agg→leaf, deeper and slower. The planes run *in parallel*: a packet crosses one, and the NIC just picks which. It is the GPU multi-homed to several independent fabrics with ECMP across them — the SAN A/B picture again, an edge endpoint that load-balances, not a tier of the fabric.
 
-Multi-plane is one bet on getting past a single Clos, and the hyperscalers don't all take it: Meta adds an oversubscribed third tier across "AI Zones," Google rewires the topology itself with optical circuit switches, and AWS leaves the Clos alone and sprays packets across it. Every one of them — multi-plane included — ends up manufacturing the same thing: many equal-cost paths between any two GPUs, which the few giant flows of §4.4 overload one at a time while the rest sit idle. Spreading them is the steering problem of §4.7.
+It's the networker's A/B-fabric promise at training scale: a failed plane degrades bandwidth instead of aborting the run.
+
+One catch rides along. RDMA's Reliable Connection assumed *one* path; spread a single queue pair across several planes and you need a transport that tolerates many paths and reorders cleanly. Oracle pairs Acceleron with **Multipath Reliable Connection (MRC)** [[10]](#ref-10) — a multi-vendor effort (AMD, Broadcom, Intel, Microsoft, NVIDIA, OpenAI) that holds single-QP throughput across "multiple ports and many network paths." That's the steering problem of §4.7, pushed into the transport.
+
+Multi-plane is one bet on getting past a single Clos, and the hyperscalers don't all take it: Meta adds an oversubscribed third tier across "AI Zones" [[11]](#ref-11), Google rewires the topology itself with optical circuit switches [[12]](#ref-12), and AWS leaves the Clos alone and sprays packets across it [[13]](#ref-13). Every one of them — multi-plane included — ends up manufacturing the same thing: many equal-cost paths between any two GPUs, which the few giant flows of §4.4 overload one at a time while the rest sit idle. Spreading them is the steering problem of §4.7.
 
 ### 4.7 Steering the traffic: picking among the paths
 
-**Load balancing — from per-flow hashing to per-packet spraying.** Topology lays the paths; load balancing assigns packets to them. The baseline you run everywhere — **per-flow ECMP** — is the exact thing §4.4 showed breaking: hash the 5-tuple, pin the whole flow to one path, and with a handful of elephants two collide while links idle. The fixes climb a ladder of finer granularity:
+**Load balancing — from a static hash to adaptive spray.** Topology lays down many paths between two GPUs; steering decides which one each packet takes. The baseline you run everywhere is **per-flow ECMP**: hash the 5-tuple, pin the whole flow to one path. §4.4 showed why it breaks on AI traffic — a handful of huge, long-lived flows have almost no entropy to hash on, so two elephants collide on one link while parallel links idle. Fixing it takes two moves at once: **finer granularity** (stop moving whole flows) and **feedback** (stop choosing blind). Start with granularity:
 
 | granularity      | unit moved | reorder risk        | where you see it |
 |------------------|------------|---------------------|------------------|
@@ -1287,8 +1293,14 @@ Multi-plane is one bet on getting past a single Clos, and the hyperscalers don't
 | per-packet spray | one packet | high (NIC reorders) | Spectrum-X / UEC |
 
 - **Flowlet switching** splits a flow at the natural gaps between bursts and rebalances per burst; if a gap is longer than the worst path-delay difference, reordered packets can't overtake, so it's a safe win — when the gaps exist.
-- **Adaptive routing** lets the *switch* choose the output port by **real-time queue occupancy** instead of a fixed hash. InfiniBand has done this in-fabric for years (SM-computed routes plus adaptive port selection — the *subnet-manager-owns-the-fabric* pattern again). On Ethernet it's recent: **NVIDIA's Spectrum-X** does per-packet adaptive routing — the Spectrum-4 switch picks the least-loaded port, the SuperNIC puts the packets back in order — and the open **Ultra Ethernet (UEC)** standard reaches the same end a different way — per-packet **spraying** that the NIC reorders (deep-dives in §8/§9).
 - **Per-packet spraying** is the limit case: every packet of one flow is balanced independently across *all* equal-cost paths, so a 400G elephant smears across the whole fabric and no link runs hot.
+
+**Feedback: two places to decide.** Granularity says *how much* to move at a time; feedback says *choose by load, not by hash* — and that decision lives in two places, both now in play:
+
+- **In the switch — adaptive routing.** The switch picks the egress port by **real-time queue occupancy** instead of a fixed hash. InfiniBand has done this in-fabric for years (SM-computed routes plus adaptive port selection — the *subnet-manager-owns-the-fabric* pattern again); on Ethernet it is recent, the **Spectrum-X** switch picking the least-loaded port per packet [[15]](#ref-15).
+- **At the edge — the transport sprays and steers.** The sending NIC scatters a flow's packets across many paths or planes, watches **per-path congestion** (ECN), shifts off the hot ones, and the receiver reorders. This is where the industry converged, under three names: AWS **SRD** (RTT-aware spray, reorder in the Nitro NIC) [[13]](#ref-13); the open **MRC** transport (OpenAI / OCP — per-packet entropy-value spray, per-path ECN feedback, out-of-order placement straight into GPU memory) [[16]](#ref-16); and Spectrum-X's NIC **Plane Load Balancer**, the "which plane" decision §4.6.4 left open [[15]](#ref-15). Same shape all three: endpoint-driven adaptive spray with hardware reorder.
+
+Both moves point the same way — off the static per-flow hash toward **adaptive, fine-grained** placement, split between a switch that picks ports and a NIC that picks paths and cleans up the disorder.
 
 ```
    sender NIC:   p1 p2 p3 p4 p5 p6   one elephant flow, sprayed
@@ -1305,7 +1317,15 @@ Multi-plane is one bet on getting past a single Clos, and the hyperscalers don't
 
 <p align="center"><em>Spray every packet across all paths for balance; the receiving NIC restores order.</em></p>
 
-**The catch is the one §4.4 named: reordering.** Spray a flow across many paths and its packets arrive **out of order**, because the paths differ in delay — and to RDMA's reliable transport an out-of-order packet looks like a **PSN** gap, i.e. loss, which trips the **go-back-N cliff** (§4.4). So spraying is only safe if the **receiving NIC** can swallow the disorder: write each packet to its destination address by its PSN/offset as it lands, in any order, and signal completion only once the last one arrives. NVIDIA does this as **Direct Data Placement** on its Spectrum-X SuperNICs; the open **Ultra Ethernet** (UEC) transport is built on the same trick (its own chapter, later). The switch sprays; the NIC un-sprays; the §4.4 cliff never fires.
+**The catch is the one §4.4 named: reordering.** Spray a flow across many paths and its packets arrive **out of order**, because the paths differ in delay — and to RDMA's reliable transport an out-of-order packet looks like a **PSN** gap, i.e. loss, which trips the **go-back-N cliff** (§4.4). So spraying is only safe if the **receiving NIC** can swallow the disorder: write each packet to its destination address by its PSN/offset as it lands, in any order, and signal completion only once the last one arrives. NVIDIA does this as **Direct Data Placement** on its Spectrum-X SuperNICs; the open **Ultra Ethernet** (UEC) transport is built on the same trick (its own chapter, later). The switch sprays; the NIC un-sprays; the §4.4 cliff never fires. And it only works on a lossless fabric (§4.5): with per-packet spray a real drop is indistinguishable from reordering, so the NIC can treat every gap as out-of-order only while genuine loss stays rare [[15]](#ref-15).
+
+**One system, three loops.** Put in one place, that division of labor is how Spectrum-X is built [[15]](#ref-15): three congestion points, three decoupled control loops, each at its own timescale.
+
+- **Switch fabric ports → adaptive routing** — stateless, per-packet, reacting within *hundreds of nanoseconds* to local queue buildup.
+- **NIC plane ports → plane load balancing** — per-packet, steering across planes on per-plane congestion feedback.
+- **Endpoint → congestion control** — stateful, per-destination rate at *RTT* timescale, and only for the incast that adaptive routing can't resolve in-network.
+
+Keeping them apart stops them fighting each other — a microburst that adaptive routing would absorb shouldn't trip the sender's rate limiter — and because all three must close within an 800G bandwidth-delay budget, they run in silicon: "hardware acceleration is a structural requirement, not a performance optimization."
 
 **Where this leaves us — the scale-out toolkit, complete.** §4.4 handed the fabric two jobs ordinary networks never had: don't drop, and keep the tail short. Three mechanisms now cover them:
 
@@ -1316,6 +1336,25 @@ Multi-plane is one bet on getting past a single Clos, and the hyperscalers don't
 All three guard the same thing — the **tail** — because one slow flow, whether *dropped*, *queued*, or *collided*, is paid for by every GPU waiting at the barrier. That completes the scale-out *transport* story: how bytes cross the cluster without falling off the drop cliff or stretching the tail. What we have **not** described is the layer that *generates* those bytes — the **collectives** themselves (ring, tree, all-reduce, all-to-all) and how each maps onto the fabric. That's §5.
 
 
+## References
+
+1. <a id="ref-1"></a>NVIDIA — *DGX GB200 User Guide: Hardware* (NVLink switch trays: 9 × 2 NVSwitch chips = 18). <https://docs.nvidia.com/dgx/dgxgb200-user-guide/hardware.html>
+2. <a id="ref-2"></a>NVIDIA — *Spectrum-X Co-Packaged Optics Networking Switches for AI Factories* (SN6800, news release). <https://nvidianews.nvidia.com/news/nvidia-spectrum-x-co-packaged-optics-networking-switches-ai-factories>
+3. <a id="ref-3"></a>NVIDIA — *DGX SuperPOD (B200): Network Fabrics.* <https://docs.nvidia.com/dgx-superpod/reference-architecture-scalable-infrastructure-b200/latest/network-fabrics.html>
+4. <a id="ref-4"></a>NVIDIA — *DGX SuperPOD (GB200 NVL72): Architecture.* <https://docs.nvidia.com/dgx-superpod/reference-architecture-scalable-infrastructure-gb200/latest/dgx-superpod-architecture.html>
+5. <a id="ref-5"></a>W. Wang, M. Ghobadi, K. Shakeri, Y. Zhang, N. Hasani — *Rail-only: A Low-Cost High-Performance Network for Training LLMs with Trillion Parameters.* arXiv:2307.12169. <https://arxiv.org/abs/2307.12169>
+6. <a id="ref-6"></a>NVIDIA — *ConnectX-8 SuperNIC: Introduction* (port splitting). <https://docs.nvidia.com/networking/display/connectx8SuperNIC/Introduction>
+7. <a id="ref-7"></a>NVIDIA — *DGX SuperPOD (B300, Spectrum-4): Network Fabrics* (twin-planar). <https://docs.nvidia.com/dgx-superpod/reference-architecture/scalable-infrastructure-b300/latest/network-fabrics.html>
+8. <a id="ref-8"></a>Oracle — *First Principles: Oracle Acceleron Multiplanar Networking Architecture.* <https://blogs.oracle.com/cloud-infrastructure/first-principles-acceleron-multiplanar-networking>
+9. <a id="ref-9"></a>Oracle — *OCI Zettascale10* (announcement, Oct 2025). <https://www.oracle.com/news/announcement/ai-world-oracle-unveils-next-generation-oci-zettascale10-cluster-for-ai-2025-10-14/>
+10. <a id="ref-10"></a>Oracle — *First Principles: Unlocking Oracle Acceleron Multiplanar Fabric with Multipath Reliable Connection (MRC).* <https://blogs.oracle.com/cloud-infrastructure/first-principles-multipath-reliable-connection>
+11. <a id="ref-11"></a>Meta Engineering — *RoCE networks for distributed AI training at scale.* <https://engineering.fb.com/2024/08/05/data-center-engineering/roce-network-distributed-ai-training-at-scale/>
+12. <a id="ref-12"></a>L. Poutievski et al. — *Jupiter Evolving: Transforming Google's Datacenter Network via Optical Circuit Switches and SDN.* ACM SIGCOMM 2022. <https://research.google/pubs/jupiter-evolving-transforming-googles-datacenter-network-via-optical-circuit-switches-and-software-defined-networking/>
+13. <a id="ref-13"></a>Amazon — *A Cloud-Optimized Transport Protocol for Elastic and Scalable HPC* (SRD/EFA). <https://assets.amazon.science/a6/34/41496f64421faafa1cbe301c007c/a-cloud-optimized-transport-protocol-for-elastic-and-scalable-hpc.pdf>
+14. <a id="ref-14"></a>NVIDIA — *NVIDIA Contributes GB200 NVL72 Designs to the Open Compute Project* (rack composition: 18 compute + 9 switch trays + NVLink5). <https://developer.nvidia.com/blog/nvidia-contributes-nvidia-gb200-nvl72-designs-to-open-compute-project/>
+15. <a id="ref-15"></a>S. Khashab, A. Gran Alcoz, et al. (NVIDIA, Technion) — *High-speed Networking for Giga-Scale AI Factories* (Spectrum-X multiplane + hardware-accelerated load balancing). arXiv:2605.21187. <https://arxiv.org/abs/2605.21187>
+16. <a id="ref-16"></a>*The Multipath Reliable Connection (MRC) Transport* (OpenAI / OCP; open multipath RDMA spec). arXiv:2606.18170; OCP MRC 1.0. <https://arxiv.org/abs/2606.18170>
+
 # TODO list tracking
 
 
@@ -1325,4 +1364,9 @@ All three guard the same thing — the **tail** — because one slow flow, wheth
 - how much non nvidia the doc should be ???
 - UAlink ?
 - ESUN ?
-
+- small fix quote: It is well known that the Collective Completion Time (CCT)
+of synchronous collectives (AllReduce, AllGather, All2All)
+is determined by network stragglers [13] - individual slow
+flows that delay the CCT, and in turn collective performance
+affects the performance of the entire training run
+- check here scale accross https://nvidianews.nvidia.com/news/nvidia-introduces-spectrum-xgs-ethernet-to-connect-distributed-data-centers-into-giga-scale-ai-super-factories
