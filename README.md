@@ -51,6 +51,15 @@ The golden rule for the whole document: **whenever something looks like magic, w
     - [4.6.4 Multi-plane: splitting the NIC across fabrics](#464-multi-plane-splitting-the-nic-across-fabrics)
     - [4.6.5 Scaling across datacenters](#465-scaling-across-datacenters)
   - [4.7 Steering the traffic: picking among the paths](#47-steering-the-traffic-picking-among-the-paths)
+- [5. Collectives: the traffic the fabric carries](#5-collectives-the-traffic-the-fabric-carries)
+  - [5.1 Where the traffic comes from: parallelism](#51-where-the-traffic-comes-from-parallelism)
+  - [5.2 The catalog: what each collective does to a tensor](#52-the-catalog-what-each-collective-does-to-a-tensor)
+  - [5.3 On the wire: ring, tree, and letting the switch do the math](#53-on-the-wire-ring-tree-and-letting-the-switch-do-the-math)
+  - [5.4 Two workloads, two traffic shapes: training vs inference](#54-two-workloads-two-traffic-shapes-training-vs-inference)
+- [6. The software stack: from the model to the silicon](#6-the-software-stack-from-the-model-to-the-silicon-draft)
+  - [6.1 The stack, from driver to app](#61-the-stack-from-driver-to-app)
+  - [6.2 How code becomes GPU instructions](#62-how-code-becomes-gpu-instructions)
+  - [6.3 Two software worlds: training and serving](#63-two-software-worlds-training-and-serving)
 - [References](#references)
 
 ---
@@ -239,7 +248,7 @@ Everything so far — sharded tensors, GPUs collaborating mid-computation — ha
 - **East-west and internal** — GPU↔GPU collectives dominate; almost nothing leaves for a user. Pure **backend** (§1.4).
 - **Synchronized and bursty** — everyone hits the network at the same instant, then waits for the slowest before the next step (§4.1). **Tail latency sets the pace of the whole job.**
 - **Throughput-bound** — you care about sustained bandwidth, not single-request microseconds.
-- Networker's analogy: a giant **MPI/HPC batch job**, or a fabric-wide **bulk sync** where every node must reach the barrier before anyone moves on.
+
 
 **Inference — use the model to serve users.** The model is trained; now you run it forward to answer requests. This *is* the **inference / serving** network already sitting at the top of the §1.4 diagram — **north-south, user-facing, load-balanced**, the Ethernet/IP/TCP traffic you've run your whole career. But there's a backend twist: a frontier model is still too big for one GPU, so even *serving* it is spread across GPUs — so inference *also* produces east-west collective traffic, just **lighter and less tightly synchronized** than training.
 
@@ -957,12 +966,7 @@ Storage networks have fought TCP incast for years; AI incast is worse, because i
 
 So "fast on average" is meaningless here. The fabric inherits two jobs ordinary networks never had: **don't drop** (engineer losslessness — §4.5) and **keep the tail short** by spreading the few giant flows (congestion control — §4.5; topology and load balancing — §4.6). Both exist for one reason — a single slow flow, whether *dropped* or merely *delayed*, is paid for by tens of thousands of waiting GPUs.
 
-**Does inference break the network too? Yes — differently.** Everything above is *training*. Inference serves many independent requests, but a served model is **also sharded** (tensor-parallel, plus all-to-all if it's MoE) and **also on RDMA**, so it inherits the same drop-cliff and tail stakes. Two twists change the shape:
-
-- **Batched and disaggregated.** Requests are processed in **continuous batches** (each forward pass steps a batch of active sequences in lockstep), and modern serving is often **disaggregated** — prefill and decode run on *separate* GPU pools, so the **KV cache** built during prefill is shipped prefill-pool → decode-pool. That transfer is a bulk, point-to-point flow ECMP collides like any elephant — a traffic class training simply doesn't have.
-- **Smaller radius, latency as the metric.** The synchronized part is scoped to one serving instance (a TP/EP group of ~8–64 GPUs, not the whole cluster), and across independent requests **statistical multiplexing partly returns**. But the tail doesn't go away — it just becomes **user-facing**: the per-iteration all-reduce sits on every token's path (inter-token latency), and KV-cache transfer sits on time-to-first-token.
-
-So inference is **hard to transport too**, just heterogeneously — smaller-radius collectives plus bulk KV-cache flows, against tight latency SLOs. §5 develops the full train-vs-inference traffic catalog; the point for *this* section is that **both** workloads break the ordinary-network assumptions, for overlapping reasons.
+**Does inference break the network too? Yes — differently.** A served model is **also sharded** (TP, plus all-to-all if MoE) and **also on RDMA**, so it inherits the same drop-cliff and tail stakes — but at a smaller radius (one ~8–64-GPU serving instance, not the whole cluster), with **statistical multiplexing partly returning** across independent requests, and with one traffic class training doesn't have: the **KV cache** shipped between disaggregated **prefill** and **decode** pools, a bulk **point-to-point** elephant ECMP collides with. The full train-vs-inference catalog is **§5.4**; the point *here* is that **both** workloads break the ordinary-network assumptions, for overlapping reasons.
 
 ### 4.5 Keeping it lossless: PFC, ECN, and DCQCN
 
@@ -1519,9 +1523,100 @@ A collective is an *algorithm*, not a single transfer. The same all-reduce can b
 
 <p align="center"><em>In-network reduction: each GPU sends its buffer up once, the switch sums, one result comes back — no ring, no N−1 laps.</em></p>
 
-So instead of a buffer circling the ring N−1 times, each GPU sends its data up once and gets the total back; the fabric roughly halves the bytes and erases the ring's latency. Two limits, both from §5.2: only the *reduce* collectives can be offloaded (there must be a sum to fold in — a pure all-to-all has nothing to reduce), and the switches must be able to do arithmetic — SHARP is an NVIDIA InfiniBand/NVSwitch feature, not something a plain Ethernet switch does (open Ultra Ethernet is adding in-network collectives; its own chapter, later).
+So instead of a buffer circling the ring N−1 times, each GPU sends its data up once and gets the total back; the fabric roughly halves the bytes and erases the ring's latency. Two limits, both from §5.2: only the *reduce* collectives can be offloaded (there must be a sum to fold in — a pure all-to-all has nothing to reduce), and the switches must be able to do arithmetic — SHARP is an NVIDIA InfiniBand/NVSwitch feature, not something a plain Ethernet switch does yet (open Ultra Ethernet is adding in-network collectives; its own chapter, later).
 
 Ring, tree, or in-network, the collective is still a barrier — the whole reason §4's don't-drop / don't-queue / don't-collide effort exists. What changes the *shape* of this traffic is the workload above it: training and inference stress the fabric in different ways, and that's §5.4.
+
+### 5.4 Two workloads, two traffic shapes: training vs inference
+
+§1.5 introduced the two workloads and §4.4 flagged that inference breaks the fabric too; this is the full catalog. Everything §5.1–§5.3 built is **training** traffic: one job, every GPU on the barrier, collectives dominating. **Inference** — serving the trained model — reuses those same collectives (the model is still sharded: TP all-reduce, MoE all-to-all) but reshapes the traffic in four ways.
+
+- **Smaller blast radius.** A serving instance is one model replica — roughly 8–64 GPUs (a TP, or TP×EP, group), not the whole cluster. The collectives are the §5.2 shapes, run at that smaller scale.
+- **Statistical multiplexing partly returns.** Training is one correlated job; serving is thousands of independent requests from independent users, so across requests the aggregate drifts back toward the ordinary many-small-flows traffic §4.4 said AI had lost.
+- **The tail turns user-facing.** Not job-completion time but **time-to-first-token** (gated by prefill and the KV-cache hand-off) and **inter-token latency** (the per-token all-reduce on the critical path) — a p99 a human is waiting on.
+- **A phase split with opposite bottlenecks.** Autoregressive serving isn't one forward pass; it's two phases that stress different resources:
+  - **Prefill** — one **compute-bound** pass over the whole prompt, which builds the **KV cache**.
+  - **Decode** — one token at a time, **memory-bandwidth-bound**: each token streams the model's weights (plus the KV cache) out of HBM once, so decode speed tracks *bytes read*, not FLOPs. Model size lands here directly — a 10T-parameter model reads ~10× the bytes per token as a 1T one, or, for a sparse MoE, whatever its *active* experts weigh. (Hence decode is batched hard, to amortize that one weight-read across many requests' tokens.)
+
+Because the two phases want different hardware, modern serving **disaggregates** them onto separate GPU pools and ships the KV cache between:
+
+```
++--------------------+                  +--------------------+
+|    PREFILL pool    |                  |    DECODE pool     |
+|--------------------|   KV cache       |--------------------|
+|  compute-bound     | =============>   |  memory-BW-bound   |
+|  runs whole prompt | point-to-point   |  1 token per step  |
+|  -> KV cache + tok1| NVLink/IB (NIXL) |  reads the KV cache|
++--------------------+                  +--------------------+
+```
+
+<p align="center"><em>Disaggregated prefill/decode: the KV cache moves prefill → decode as a point-to-point transfer, not a collective.</em></p>
+
+That KV-cache hand-off is a **bulk point-to-point** flow — one worker to one, not a collective, the only big transfer in this section that isn't — and an elephant ECMP collides with like any other (§4.4). The serving stack built around it is NVIDIA's **Dynamo** [[20]](#ref-20): a **KV-aware router** that steers each request to the decode worker already holding its cache (avoiding recompute), and **NIXL**, a point-to-point library that moves the KV blocks over whatever transport is closest — NVLink inside a node, InfiniBand or RoCE across. Scope it as §1.5 did: prefill/decode and the KV cache are **autoregressive-LLM** specifics — a classifier, embedding, or vision model is a single forward pass, no decode loop, no KV cache.
+
+That closes §5, the communication layer: the collectives themselves (§5.2), how they ride the wire (§5.3), and how the traffic reshapes from training to serving (§5.4). What *drives* these collectives — the CUDA / NCCL software stack — is §6.
+
+## 6. The software stack: from the model to the silicon [DRAFT]
+
+> Goal: by the end you should have a map of the software between the model and the GPU — where CUDA sits and why it is the lock-in, how model code becomes GPU instructions, and how the training and serving stacks differ.
+
+§1–§5 were hardware and wire: the GPU, NVLink, the RDMA fabric, and the collectives running on it. On top of all that sits a deep stack of software — but a networker needs a map, not a manual, so this chapter stays a map. And the map has a shape you already run: your switches carry the same kind of stack — silicon, a vendor SDK you program it through, feature and protocol libraries, a platform, and the services on top.
+
+| GPU software                       | the box you already run    |
+|------------------------------------|----------------------------|
+| model / recipe (Llama, GPT)        | the service you deliver    |
+| framework (PyTorch, JAX)           | the platform you build on  |
+| math + comms libs (cuDNN, NCCL §5) | protocol + feature stacks  |
+| CUDA runtime + driver              | the ASIC SDK — the lock-in |
+| GPU + NVLink + NIC (§3-4)          | the ASIC + its ports       |
+
+<p align="center"><em>The GPU software stack, and the same shape on the switch you already run.</em></p>
+
+One row carries the chapter: **CUDA is NVIDIA's ASIC SDK — and the moat.** Every layer above is written against it, which is why there is a whole vendor chapter (§8: AMD's ROCm/HIP, Intel's oneAPI) and a standards chapter (§9) devoted to prying it open. The rest of §6 reads the map three ways: the layers themselves (§6.1), how code becomes GPU instructions (§6.2), and how the training and serving stacks diverge (§6.3).
+
+### 6.1 The stack, from driver to app
+
+Bottom to top, the software above the silicon is five thin layers — and you spend your time in the top two.
+
+- **CUDA driver** (kernel mode) — loads compiled code onto the GPU, maps memory, and drives the PCIe/NVLink links. The counterpart of the platform driver beneath your NOS.
+- **CUDA runtime + toolkit** — the programming model: kernels (functions that run on the GPU), **streams** (ordered queues of work — the handles that let compute and communication overlap, §5.1), and device memory. This is the SDK every layer above targets.
+- **Math and comms libraries** — almost nobody writes raw kernels; you call libraries. **cuBLAS / cuDNN / CUTLASS** for the matrix math a model is mostly built from, and **NCCL** for the collectives of §5. AMD ships the mirror set (rocBLAS, MIOpen, **RCCL**); Intel has oneAPI (oneMKL, **oneCCL**).
+- **Framework** — **PyTorch**, **JAX**, or **TensorFlow**: tensors, autograd, and a dispatcher that turns each operation into the right library or kernel call. This is where the model is written.
+- **App / recipe** — the model and its training or serving loop, usually assembled from higher-level libraries: **Hugging Face**, **Megatron-LM**, **DeepSpeed**.
+
+The reason to draw it as a stack is the reason it matters to you: every layer above the driver ultimately binds to CUDA. That binding is the lock-in — why "just run it on another vendor's GPU" is hard, and why §8 and §9 exist at all.
+
+### 6.2 How code becomes GPU instructions
+
+Two questions hide in that CUDA layer: *when* the kernels run, and *how* they are built.
+
+**Eager versus compiled.** By default a framework runs **eagerly** — it dispatches each operation and launches a kernel the moment Python reaches it. Flexible for debugging, but the CPU is in the loop launching every kernel, the way a router crawls if it punts every packet to the route processor. The fix is to **compile**: capture the whole graph of operations, **fuse** it into far fewer kernels, and cut both launch overhead and memory traffic. `torch.compile` does this for PyTorch — it traces the graph, then generates fused kernels, often in **Triton** (OpenAI's Python kernel language, not the similarly-named inference server); **XLA** does it for JAX and TensorFlow; **TensorRT** does it ahead of inference.
+
+**Source to machine code.** Whichever route a kernel takes, it lands in the same two-stage pipeline:
+
+```
+  your kernel  (CUDA C++, or a Triton kernel)
+       |    NVCC / Triton       build time
+       v
+  PTX   -- a virtual ISA, portable "GPU bytecode"
+       |    driver JIT          load time, per GPU
+       v
+  SASS  -- machine code for the exact GPU it lands on
+```
+
+<p align="center"><em>PTX is the portable middle stage; the driver JIT-compiles it to per-GPU SASS at load.</em></p>
+
+The middle stage is the one to remember: **PTX is a virtual ISA — portable "GPU bytecode" — and the driver JIT-compiles it to SASS**, the machine code for the exact GPU, at load time [[21]](#ref-21). That indirection is why a binary built today can run on a GPU architecture that ships years later: the PTX is forward-portable, recompiled per box, like any bytecode. **CUDA graphs** add a second trick — capture a whole launch sequence once and replay it as a unit, erasing per-launch overhead in the tight loops where it hurts most (the decode loop of §5.4).
+
+### 6.3 Two software worlds: training and serving
+
+The same silicon runs two different software stacks, tuned for opposite goals.
+
+**Training** optimizes **throughput**. A framework (PyTorch, JAX) plus a parallelism engine — **DDP / FSDP**, **DeepSpeed**, **Megatron-LM** — shards the model across GPUs and emits the collectives of §5, wrapped around autograd, an optimizer, and periodic checkpointing. One long job, every GPU on the barrier.
+
+**Serving** optimizes **latency**. A single-node **inference engine** — **vLLM**, **TensorRT-LLM**, or **SGLang** — runs the model with the tricks §5.4 named: continuous batching, a **paged KV cache** (vLLM's PagedAttention [[22]](#ref-22)), and quantization. Above the engines, **NVIDIA Dynamo** [[20]](#ref-20) orchestrates a whole fleet — disaggregated prefill/decode, KV-aware routing, KV-cache offload to cheaper memory tiers — the distributed serving layer §5.4 described.
+
+The split even replays the CUDA moat: **TensorRT-LLM** is the fastest path but NVIDIA-only, while **vLLM** deliberately runs across NVIDIA, AMD, Intel, and TPU — the same portability fight §8 and §9 take up. That is the software map. §7 turns to the networks around this stack that we have so far ignored: storage, management, and the frontend.
 
 ## References
 
@@ -1544,6 +1639,9 @@ Ring, tree, or in-network, the collective is still a barrier — the whole reaso
 17. <a id="ref-17"></a>Nokia — *Scale-across networking: Unlocking AI factory scale with optical innovation* (blog: DCI for back-end AI networks; synchronous-training distance limits; 800G ZR/ZR+, 1.6T coherent pluggables, hollow-core fiber). <https://www.nokia.com/blog/scale-across-networking-unlocking-ai-factory-scale-with-optical-innovation/>
 18. <a id="ref-18"></a>A. Douillard, Q. Feng, A. A. Rusu, R. Chhaparia, Y. Donchev, A. Kuncoro, M. Ranzato, A. Szlam, J. Shen (Google DeepMind) — *DiLoCo: Distributed Low-Communication Training of Language Models* (local-SGD / federated-averaging variant; matches fully-synchronous quality while communicating ~500× less, over poorly-connected islands). arXiv:2311.08105. <https://arxiv.org/abs/2311.08105>
 19. <a id="ref-19"></a>S. Rajbhandari, J. Rasley, O. Ruwase, Y. He (Microsoft) — *ZeRO: Memory Optimizations Toward Training Trillion Parameter Models* (shards optimizer, gradient, and parameter state across data-parallel ranks; PyTorch's **FSDP** is the mainstream implementation, arXiv:2304.11277). arXiv:1910.02054. <https://arxiv.org/abs/1910.02054>
+20. <a id="ref-20"></a>NVIDIA — *NVIDIA Dynamo: A Low-Latency Distributed Inference Framework for Scaling Reasoning AI Models* (disaggregated prefill/decode; KV-aware router; **NIXL** point-to-point KV-cache transfer over NVLink/IB). <https://developer.nvidia.com/blog/introducing-nvidia-dynamo-a-low-latency-distributed-inference-framework-for-scaling-reasoning-ai-models/>
+21. <a id="ref-21"></a>NVIDIA — *Parallel Thread Execution ISA* (PTX: a virtual ISA / portable "GPU bytecode"; the driver JIT-compiles PTX to per-GPU SASS, giving forward compatibility across GPU architectures). <https://docs.nvidia.com/cuda/parallel-thread-execution/>
+22. <a id="ref-22"></a>W. Kwon, Z. Li, S. Zhuang, Y. Sheng, L. Zheng, C. H. Yu, J. E. Gonzalez, H. Zhang, I. Stoica — *Efficient Memory Management for Large Language Model Serving with PagedAttention* (vLLM; paged KV cache). arXiv:2309.06180. <https://arxiv.org/abs/2309.06180>
 
 # TODO list tracking
 
