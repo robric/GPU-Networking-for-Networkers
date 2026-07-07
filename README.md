@@ -275,12 +275,19 @@ The takeaway for the rest of the doc: **§3 and §4 are mostly the *training* st
 
 ## 2. GPU Networking, the big picture: two fundamentally different problems
 
-When we say "GPU networking", we are actually talking about **two different interconnects** solving **two different problems**. Almost every confusion in this space comes from mixing them up. So before anything else, we separate them cleanly.
+When we say "GPU networking", we are actually talking about **two different interconnects** solving **two different problems** — plus a **third scale** (**scale-across**) that appears once a single cluster outgrows one building. Almost every confusion in this space comes from mixing the first two up, so before anything else we separate them cleanly.
+
+We do it in three steps:
+
+- **§2.1** — scale-up vs scale-out, side by side.
+- **§2.2** — one picture to anchor the whole document.
+- **§2.3** — why two layers at all, in networking terms.
 
 ### 2.1 Scale-up vs scale-out
 
 - **Scale-up** = bind a *small number* of GPUs (8, 72, …) into a single **tightly-coupled shared-memory domain** — one global address space, memory-speed sharing — so they can cooperate on one problem *as if* they were one giant GPU. Note the *as if*: software still sees N distinct GPUs (the `cuda:0…` from §1.3), each with its own memory and scheduler; the fabric just makes "pretending" cheap. This is **NVLink / NVSwitch** territory.
 - **Scale-out** = connect a *large number* of those domains together into a *cluster* of thousands or tens of thousands of GPUs, using a packet-switched network. This is **InfiniBand / RoCE-over-Ethernet** territory, and it is the part that looks most like the networking you already know.
+- **Scale-across** = stretch a *single* cluster across **more than one building** — several datacenters, tens to thousands of km apart — once power and space run out in one site. It rides dedicated **DCI** (data-center-interconnect) optics, *not* the public WAN, and only the *least chatty* traffic can tolerate the distance. It is really scale-out pulled long, so we meet it here and detail it in §4.6.5.
 
 A useful mental model from the networking world:
 
@@ -311,12 +318,23 @@ Inside a chassis, line cards talk over a backplane that is fast, short, lossless
              +-------------- Leaf switch -------------+
                                   |
                               Spine fabric
+             (all of the above = one site / datacenter)
+                                  |
+                    ---  SCALE-ACROSS (DCI)  ---
+              coherent optics over DWDM, 10s-100s of km
+                                  |
+                   +-----------------------------+
+                   | Site B: a 2nd datacenter    |
+                   | (another full scale-out     |
+                   |  cluster of scale-up nodes) |
+                   +-----------------------------+
 ```
 
-<p align="center"><em>Scale-up binds GPUs inside a node; scale-out links the nodes.</em></p>
+<p align="center"><em>Scale-up binds GPUs inside a node; scale-out links the nodes; scale-across links the datacenters.</em></p>
 
 - The `====` and `X` **inside** each node are **NVLink** — the scale-up fabric. Memory-semantic, microsecond-and-below, hundreds of GB/s to TB/s *per GPU*.
 - The lines **between** nodes are the **scale-out** network — packet-switched, RDMA, built from NICs, leaf and spine switches, measured in hundreds of Gb/s *per port*.
+- The tier at the **bottom** is **scale-across** — the same scale-out idea stretched between *sites* over DCI optics, carrying only the traffic that rarely talks (detailed in §4.6.5).
 
 Two interconnects, two units even (GB/s vs Gb/s — note the capital B vs little b, we'll come back to that). Keep them separate in your head and 80% of the confusion disappears.
 
@@ -347,6 +365,16 @@ This document tackles **scale-up first** (NVLink), then scale-out later.
 ## 3. Scale-up: the NVLink fabric
 
 > Goal of this section: by the end you should be able to explain, to another networking person, what NVLink *is*, what problem it solves, and why it is **not** just "a faster PCIe" and **not** quite "an Ethernet for GPUs" either.
+
+NVLink, in seven steps:
+
+- **§3.1** — the problem NVLink solves.
+- **§3.2** — NVLink as a link: lanes, sublinks, reading a spec sheet.
+- **§3.3** — from links to a fabric: a single NVSwitch.
+- **§3.4** — scaling past the box: NVL72, then NVL576.
+- **§3.5** — memory semantics: load/store vs send/receive.
+- **§3.6** — decoding the names: DGX/HGX/MGX, Oberon/Kyber, the NVL## trap.
+- **§3.7** — where scale-up ends and scale-out begins.
 
 ### 3.1 The problem NVLink solves
 
@@ -721,15 +749,15 @@ This half is home turf. Where scale-up (§3) was an alien *memory* fabric, scale
 
 Same golden rule as §3: map each piece to networking you already know, then flag exactly where GPU clusters diverge — because the places they diverge are where all the pain (and all the interesting engineering) lives.
 
-*Section outline:*
+Scale-out, in seven steps:
 
-- 4.1 The job: connect the islands — scale, and what actually crosses the boundary.
-- 4.2 RDMA on the wire: one-sided, kernel-bypass, and GPUDirect.
-- 4.3 InfiniBand vs RoCE: two ways to carry RDMA at scale.
-- 4.4 Why AI traffic breaks ordinary networks: elephant flows, incast, synchronized bursts.
-- 4.5 Keeping it lossless: PFC, ECN / DCQCN, and where it's heading.
-- 4.6 Topology & load balancing: why ECMP isn't enough, then the two answers — rail-optimized fabrics vs flat Clos with adaptive LB (adaptive routing / packet spraying).
-- 4.7 Collectives on the wire: what NCCL actually sends (and in-network reduction).
+- **§4.1** — the job: connect the islands.
+- **§4.2** — RDMA on the wire: one-sided, kernel-bypass, GPUDirect.
+- **§4.3** — InfiniBand vs RoCE: two carriers, one transport.
+- **§4.4** — why AI traffic breaks ordinary networks.
+- **§4.5** — keeping it lossless: PFC, ECN, and DCQCN.
+- **§4.6** — shaping the fabric: leaves, spines, and how GPUs attach.
+- **§4.7** — steering the traffic: picking among the paths.
 
 ### 4.1 The job: connect the islands
 
@@ -1546,13 +1574,13 @@ Because the two phases want different hardware, modern serving **disaggregates**
 |--------------------|   KV cache       |--------------------|
 |  compute-bound     | =============>   |  memory-BW-bound   |
 |  runs whole prompt | point-to-point   |  1 token per step  |
-|  -> KV cache + tok1| NVLink/IB (NIXL) |  reads the KV cache|
+|  -> KV cache + tok1|     via NIXL     |  reads the KV cache|
 +--------------------+                  +--------------------+
 ```
 
 <p align="center"><em>Disaggregated prefill/decode: the KV cache moves prefill → decode as a point-to-point transfer, not a collective.</em></p>
 
-That KV-cache hand-off is a **bulk point-to-point** flow — one worker to one, not a collective, the only big transfer in this section that isn't — and an elephant ECMP collides with like any other (§4.4). The serving stack built around it is NVIDIA's **Dynamo** [[20]](#ref-20): a **KV-aware router** that steers each request to the decode worker already holding its cache (avoiding recompute), and **NIXL**, a point-to-point library that moves the KV blocks over whatever transport is closest — NVLink inside a node, InfiniBand or RoCE across. Scope it as §1.5 did: prefill/decode and the KV cache are **autoregressive-LLM** specifics — a classifier, embedding, or vision model is a single forward pass, no decode loop, no KV cache.
+That KV-cache hand-off is a **bulk point-to-point** flow — one worker to one, not a collective, the only big transfer in this section that isn't — and an elephant ECMP collides with like any other (§4.4). The serving stack built around it is NVIDIA's **Dynamo** [[20]](#ref-20): a **KV-aware router** that steers each request to the decode worker already holding its cache (avoiding recompute), and **NIXL** (NVIDIA Inference Xfer Library), a point-to-point library that moves the KV blocks over whatever transport is available — NVLink inside a node; InfiniBand, RoCE, or plain TCP/IP across nodes — and across memory and storage tiers, abstracting the path beneath the hand-off [[26]](#ref-26). Scope it as §1.5 did: prefill/decode and the KV cache are **autoregressive-LLM** specifics — a classifier, embedding, or vision model is a single forward pass, no decode loop, no KV cache.
 
 That closes §5, the communication layer: the collectives themselves (§5.2), how they ride the wire (§5.3), and how the traffic reshapes from training to serving (§5.4). What *drives* these collectives — the CUDA / NCCL software stack — is §6.
 
@@ -1572,7 +1600,11 @@ That closes §5, the communication layer: the collectives themselves (§5.2), ho
 
 <p align="center"><em>The GPU software stack, and the same shape on the switch you already run.</em></p>
 
-One row carries the chapter: **CUDA is NVIDIA's ASIC SDK — and the moat.** Every layer above is written against it, which is why there is a whole vendor chapter (§8: AMD's ROCm/HIP, Intel's oneAPI) and a standards chapter (§9) devoted to prying it open. The rest of §6 reads the map three ways: the layers themselves (§6.1), how code becomes GPU instructions (§6.2), and how the training and serving stacks diverge (§6.3).
+One row carries the chapter: **CUDA is NVIDIA's ASIC SDK — and the moat.** Every layer above is written against it, which is why there is a whole vendor chapter (§8: AMD's ROCm/HIP, Intel's oneAPI) and a standards chapter (§9) devoted to prying it open. The rest of §6 reads the map three ways:
+
+- **§6.1** — the layers themselves, driver to app.
+- **§6.2** — how code becomes GPU instructions.
+- **§6.3** — how the training and serving stacks diverge.
 
 ### 6.1 The stack, from driver to app
 
@@ -1592,21 +1624,47 @@ Two questions hide in that CUDA layer: *when* the kernels run, and *how* they ar
 
 **Eager versus compiled.** By default a framework runs **eagerly** — it dispatches each operation and launches a kernel the moment Python reaches it. Flexible for debugging, but the CPU is in the loop launching every kernel, the way a router crawls if it punts every packet to the route processor. The fix is to **compile**: capture the whole graph of operations, **fuse** it into far fewer kernels, and cut both launch overhead and memory traffic. `torch.compile` does this for PyTorch — it traces the graph, then generates fused kernels, often in **Triton** (OpenAI's Python kernel language, not the similarly-named inference server); **XLA** does it for JAX and TensorFlow; **TensorRT** does it ahead of inference.
 
-**Source to machine code.** Whichever route a kernel takes, it lands in the same two-stage pipeline:
+**Source to machine code.** Whichever front end compiles a kernel, every road converges on one virtual ISA (i.e. **PTX** — Parallel Thread Execution) and one per-GPU final step. Two front ends are in common use — NVIDIA's **`nvcc`** (NVIDIA CUDA Compiler, the default) and **Clang**'s native CUDA mode — and they differ only until they reach PTX:
 
 ```
-  your kernel  (CUDA C++, or a Triton kernel)
-       |    NVCC / Triton       build time
-       v
-  PTX   -- a virtual ISA, portable "GPU bytecode"
-       |    driver JIT          load time, per GPU
-       v
-  SASS  -- machine code for the exact GPU it lands on
+   +===================== foo.cu =====================+
+   |          one source, compiled two ways           |
+   +==================================================+
+                             |
+             +---------------+---------------+
+             |                               |
+    Clang path (native)             nvcc path (default)
+           clang                      cudafe++ (EDG)
+             v                               v
+   +------------------+            +------------------+
+   |     LLVM IR      |            |     NVVM IR      |
+   +------------------+            +------------------+
+             |                               |
+       NVPTX backend                  cicc / libNVVM
+             |                               |
+             +---------------+---------------+
+                             |
+                             v
+   +====================== PTX =======================+
+   |      virtual ISA - portable "GPU bytecode"       |
+   +==================================================+
+                             |
+       ptxas (AOT)   or   driver JIT (load, per GPU)
+                             v
+   +====================== SASS ======================+
+   |          machine code for the exact GPU          |
+   +==================================================+
 ```
 
-<p align="center"><em>PTX is the portable middle stage; the driver JIT-compiles it to per-GPU SASS at load.</em></p>
+<p align="center"><em>Two front ends, one back end — Clang and nvcc reach PTX by different roads, then the same ptxas (or driver JIT) makes SASS.</em></p>
 
-The middle stage is the one to remember: **PTX is a virtual ISA — portable "GPU bytecode" — and the driver JIT-compiles it to SASS**, the machine code for the exact GPU, at load time [[21]](#ref-21). That indirection is why a binary built today can run on a GPU architecture that ships years later: the PTX is forward-portable, recompiled per box, like any bytecode. **CUDA graphs** add a second trick — capture a whole launch sequence once and replay it as a unit, erasing per-launch overhead in the tight loops where it hurts most (the decode loop of §5.4).
+Reading the two lanes:
+
+- **Front end (differs).** Clang parses CUDA straight into **LLVM IR** — the **intermediate representation** (IR) of the **LLVM** compiler framework (originally "Low Level Virtual Machine", now just the project's name) — and LLVM's **NVPTX** back end (its target for NVIDIA GPUs) lowers that to PTX [[23]](#ref-23). `nvcc` instead splits host and device code with **`cudafe++`**, built on the **EDG** (Edison Design Group) C++ front end, then compiles the device side in **`cicc`**, which lowers NVIDIA's LLVM-based **NVVM IR** to PTX through **`libNVVM`** [[24]](#ref-24)[[25]](#ref-25).
+- **The convergence.** Both roads emit **PTX** — **Parallel Thread Execution**, a *virtual* **ISA** (instruction set architecture) — portable "GPU bytecode" [[21]](#ref-21).
+- **To the metal (identical).** PTX becomes **SASS** — the low-level GPU machine code (NVIDIA doesn't officially expand the name) — either **ahead-of-time** (**AOT**) by **`ptxas`**, the PTX assembler, at build, or **just-in-time** (**JIT**) by the driver at load, for the exact GPU in the box.
+
+The middle stage is the one to remember: PTX is that virtual ISA, and the driver JIT-compiles it to SASS at load time — which is why a binary built today can run on a GPU architecture that ships years later: the PTX is forward-portable, recompiled per box, like any bytecode. (**Triton** from the compiled path above is a third front end that also lowers to PTX, so it rides the same tail.) **CUDA graphs** add a second trick — capture a whole launch sequence once and replay it as a unit, erasing per-launch overhead in the tight loops where it hurts most (the decode loop of §5.4).
 
 ### 6.3 Two software worlds: training and serving
 
@@ -1617,6 +1675,31 @@ The same silicon runs two different software stacks, tuned for opposite goals.
 **Serving** optimizes **latency**. A single-node **inference engine** — **vLLM**, **TensorRT-LLM**, or **SGLang** — runs the model with the tricks §5.4 named: continuous batching, a **paged KV cache** (vLLM's PagedAttention [[22]](#ref-22)), and quantization. Above the engines, **NVIDIA Dynamo** [[20]](#ref-20) orchestrates a whole fleet — disaggregated prefill/decode, KV-aware routing, KV-cache offload to cheaper memory tiers — the distributed serving layer §5.4 described.
 
 The split even replays the CUDA moat: **TensorRT-LLM** is the fastest path but NVIDIA-only, while **vLLM** deliberately runs across NVIDIA, AMD, Intel, and TPU — the same portability fight §8 and §9 take up. That is the software map. §7 turns to the networks around this stack that we have so far ignored: storage, management, and the frontend.
+
+## 7. The other planes: frontend, storage, and management
+
+> Goal: close the §1.4 map. We spent §3–§6 on the backend — the GPU datapath and its software — but a GPU node sits on *several* networks, and so far we have wired exactly one.
+
+Back in §1.4 we split every network off a GPU node into a **frontend** (the host/CPU path) and a **backend** (the GPU/RDMA path), then spent the whole document on the backend, because that is the new and hard part. The other planes we deferred with a promise; this section keeps it. Most of what follows is conventional datacenter networking — which is why this chapter is short. The one exception is storage, the plane that reaches across the line into the backend.
+
+The other planes, in three steps:
+
+- **§7.1** — the frontend: the host-side, north-south networks.
+- **§7.2** — storage: the plane that lives on both sides of the line.
+- **§7.3** — management and out-of-band: the wire that never carries a tensor.
+
+### 7.1 The frontend: the host-side networks
+
+The frontend is not one network but a handful, and every one is **conventional Ethernet / IP**. §1.4 named them; here is what each is doing:
+
+- **Serving / inference** — user requests reaching model endpoints, **north-south**, behind the usual **L4/L7 load balancers**. This is the *inference* workload of §1.5 seen from the front: a request-response tier no different in shape from any other API service. The cluster behind it is exotic; the load balancing, TLS termination, and health checks are not.
+- **Tenant / VPC** — often not a network concern at all. If you're serving a model, tenants can be separated at the load-balancer level; but if you rent out the GPUs themselves, isolation moves into the fabric — dedicated L2/L3 domains (e.g. **VXLAN / EVPN, per-tenant VPCs**).
+- **Orchestration / control** — the schedulers that place work on GPUs, from opposite worlds. **Slurm** is an **HPC batch scheduler**: jobs wait in a queue, and it reserves *all* the GPUs a job needs **at once** (**gang scheduling**: launch only some ranks of a synchronous run and they block waiting for the rest, holding those GPUs idle — so it reserves the whole set or none), launches them across nodes, runs to completion, then frees them. **Kubernetes** keeps long-running containers alive and elastic — self-healing, autoscaling, rolling updates — what a serving endpoint needs; its scheduler places pods independently, so gang-scheduled training on K8s leans on add-ons (Volcano, Kueue). So the usual split is **training → Slurm, serving → Kubernetes** — a convention, not a rule.
+
+None of this is GPU-specific the way NVLink or RDMA are — it is standard datacenter networking, pointed at an unusually expensive set of servers. What it still owes the cluster is to stay out of the way: a serving tier that stalls, or a scheduler that mis-places a job onto the wrong rail, idles GPUs just as effectively as a slow collective does.
+
+- **Tenant / VPC** — the real question is whether tenancy is a *network* problem at all, and often it isn't; it depends on what tenants **share**. Share a **service** — one model behind an API, many callers — and tenancy lives at the **front door**: separate public/private endpoints, per-tenant load-balancer VIPs, auth and quotas, all resolved *before* the LB. The GPU fabric behind it stays **flat** — no overlay in the cluster. Only when tenants share the **infrastructure** — you rent them GPUs to run their own code — must the *network* isolate them: untrusted workloads now sit on one fabric, each needing its own L2/L3 domain (**VXLAN / EVPN, per-tenant VPCs**). The test is a trust boundary — **do tenants run their own code on the fabric?** If not, this whole plane collapses into the load balancer.
+
 
 ## References
 
@@ -1639,9 +1722,13 @@ The split even replays the CUDA moat: **TensorRT-LLM** is the fastest path but N
 17. <a id="ref-17"></a>Nokia — *Scale-across networking: Unlocking AI factory scale with optical innovation* (blog: DCI for back-end AI networks; synchronous-training distance limits; 800G ZR/ZR+, 1.6T coherent pluggables, hollow-core fiber). <https://www.nokia.com/blog/scale-across-networking-unlocking-ai-factory-scale-with-optical-innovation/>
 18. <a id="ref-18"></a>A. Douillard, Q. Feng, A. A. Rusu, R. Chhaparia, Y. Donchev, A. Kuncoro, M. Ranzato, A. Szlam, J. Shen (Google DeepMind) — *DiLoCo: Distributed Low-Communication Training of Language Models* (local-SGD / federated-averaging variant; matches fully-synchronous quality while communicating ~500× less, over poorly-connected islands). arXiv:2311.08105. <https://arxiv.org/abs/2311.08105>
 19. <a id="ref-19"></a>S. Rajbhandari, J. Rasley, O. Ruwase, Y. He (Microsoft) — *ZeRO: Memory Optimizations Toward Training Trillion Parameter Models* (shards optimizer, gradient, and parameter state across data-parallel ranks; PyTorch's **FSDP** is the mainstream implementation, arXiv:2304.11277). arXiv:1910.02054. <https://arxiv.org/abs/1910.02054>
-20. <a id="ref-20"></a>NVIDIA — *NVIDIA Dynamo: A Low-Latency Distributed Inference Framework for Scaling Reasoning AI Models* (disaggregated prefill/decode; KV-aware router; **NIXL** point-to-point KV-cache transfer over NVLink/IB). <https://developer.nvidia.com/blog/introducing-nvidia-dynamo-a-low-latency-distributed-inference-framework-for-scaling-reasoning-ai-models/>
+20. <a id="ref-20"></a>NVIDIA — *NVIDIA Dynamo: A Low-Latency Distributed Inference Framework for Scaling Reasoning AI Models* (disaggregated prefill/decode; KV-aware router; **NIXL** point-to-point KV-cache transfer). <https://developer.nvidia.com/blog/introducing-nvidia-dynamo-a-low-latency-distributed-inference-framework-for-scaling-reasoning-ai-models/>
 21. <a id="ref-21"></a>NVIDIA — *Parallel Thread Execution ISA* (PTX: a virtual ISA / portable "GPU bytecode"; the driver JIT-compiles PTX to per-GPU SASS, giving forward compatibility across GPU architectures). <https://docs.nvidia.com/cuda/parallel-thread-execution/>
 22. <a id="ref-22"></a>W. Kwon, Z. Li, S. Zhuang, Y. Sheng, L. Zheng, C. H. Yu, J. E. Gonzalez, H. Zhang, I. Stoica — *Efficient Memory Management for Large Language Model Serving with PagedAttention* (vLLM; paged KV cache). arXiv:2309.06180. <https://arxiv.org/abs/2309.06180>
+23. <a id="ref-23"></a>LLVM Project — *Compiling CUDA with clang* (Clang's native CUDA path: parse to LLVM IR, the NVPTX back end emits PTX, then ptxas produces SASS). <https://llvm.org/docs/CompileCudaWithLLVM.html>
+24. <a id="ref-24"></a>NVIDIA — *CUDA Compiler Driver NVCC* (the compilation trajectory: cudafe++ EDG front end and host/device split, cicc device compiler, ptxas PTX-to-SASS assembler, fatbinary). <https://docs.nvidia.com/cuda/cuda-compiler-driver-nvcc/index.html>
+25. <a id="ref-25"></a>NVIDIA — *NVVM IR Specification* (NVVM IR is a compiler IR based on LLVM IR; the NVVM compiler / libNVVM generates PTX from it). <https://docs.nvidia.com/cuda/nvvm-ir-spec/index.html>
+26. <a id="ref-26"></a>NVIDIA — *NIXL: NVIDIA Inference Xfer Library* (ai-dynamo/nixl; point-to-point transfer abstraction with pluggable backends — UCX over NVLink / InfiniBand / RoCE / TCP — across GPU, CPU, file, block, and object-storage tiers). <https://github.com/ai-dynamo/nixl>
 
 # TODO list tracking
 
