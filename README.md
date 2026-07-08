@@ -493,7 +493,9 @@ We left §3.2 with a cliffhanger: a GPU has **18 links, and each link reaches ex
 
 **Option A: wire them directly to each other (a full mesh).** Give every GPU a cable to every other GPU. For a handful of GPUs this even works — early DGX-1 (V100) did a variant of it. But you already know how that ends — O(N²) cabling that won't extend, and a GPU's 18 links are a fixed budget to split across every peer. No need to dwell on it: you put a **switch** in the middle (Option B).
 
-**Option B: connect every GPU to a switch (NVSwitch).** NVSwitch is precisely that — a **non-blocking crossbar switch for NVLink traffic**. Every GPU plugs its 18 links into the switch tier instead of into other GPUs. The crossbar then lets **any GPU reach any other GPU at full NVLink bandwidth, uniformly** — no lumpy per-peer math, no favoritism:
+**Option B: connect every GPU to a switch (NVSwitch).** NVSwitch is precisely that — a **non-blocking crossbar switch for NVLink traffic**. Every GPU plugs its 18 links into the switch tier instead of into other GPUs. The crossbar then lets **any GPU reach any other GPU at full NVLink bandwidth, uniformly**.
+
+In a real server that switch is not a separate box. The standard building block is an **8-GPU node**: eight GPUs and the NVSwitch chips share one baseboard (NVIDIA's **HGX** board), soldered down and wired by board traces, not cables, in a single ~**8 RU** chassis — so the whole scale-up fabric sits *inside one box*:
 
 ```
    8-GPU HGX H100 — each GPU spreads its 18 links across 4 NVSwitch chips
@@ -509,16 +511,17 @@ We left §3.2 with a cliffhanger: a GPU has **18 links, and each link reaches ex
    | +------------+------------+------------+------------+ |
    |      => any GPU <-> any GPU, full ~900 GB/s, uniform  |
    +-------------------------------------------------------+
+
 ```
 
 <p align="center"><em>One 8 RU HGX H100 server: 8 GPUs and their 4-chip NVSwitch crossbar, any-to-any.</em></p>
 
-In a real 8-GPU node the chip count depends on the generation, but the wiring rule is the same: every GPU fans its 18 links evenly across all the NVSwitch chips on the baseboard.
+The chip count depends on the generation, but the wiring rule is the same: every GPU fans its 18 links evenly across all the NVSwitch chips on the baseboard.
 
 - **Hopper (HGX H100)** — **4** third-generation NVSwitch chips; each GPU's 18 links split **5+5+4+4** (18 won't divide evenly by 4). NVLink 4, 900 GB/s per GPU — 7.2 TB/s aggregate across the eight [[30]](#ref-30).
 - **Blackwell (HGX B200)** — a higher-radix switch, so just **2** chips; the same 18 links now divide cleanly **9+9**. NVLink 5, 1.8 TB/s per GPU — 14.4 TB/s aggregate [[31]](#ref-31).
 
-The zoom below traces the Hopper split — one GPU's 18 links landing on its four chips:
+The zoom below traces the Hopper split — one GPU's 18 links landing on its four chips for the HGX H100:
 
 ```
    Zoom — how ONE GPU's 18 links land on the 4 chips:
@@ -540,13 +543,13 @@ The zoom below traces the Hopper split — one GPU's 18 links landing on its fou
 
 The result is **full bisection bandwidth**: all 8 GPUs can be talking to all others simultaneously, each at the full per-GPU rate, with no internal bottleneck.
 
-If that picture feels familiar, it should — a **non-blocking crossbar is just a switch fabric**, the same principle inside any switch: the ports never cable to each other, they all connect to the fabric, and it sprays traffic across its planes so every pair gets full bandwidth. NVSwitch is that fabric, built for GPUs. The *only* real difference is the payload: a network fabric moves **packet cells**, NVSwitch moves **memory reads and writes**.
+If that picture feels familiar, it should — a **non-blocking crossbar is just a switch fabric**, the same principle inside any switch: the ports never cable to each other, they all connect to the fabric, and it sprays traffic across its planes so every pair gets full bandwidth. NVSwitch is that fabric, built for GPUs. The *only* real difference is the payload: a switch fabric moves **cells** (packets sliced into fixed-size units, sprayed and reassembled), NVSwitch moves **memory reads and writes**.
 
-One physical detail: in this 8-GPU node the NVSwitch chips are **soldered onto the same baseboard as the GPUs** and wired by board traces, not cables. The whole scale-up fabric lives *inside the box* — a **"pizza-box" switch**, where the fabric silicon shares the board with the ports. That changes at rack scale (§3.4).
+But the node has a hard ceiling: one baseboard holds eight GPUs and no more. To grow the domain further, NVIDIA lifts the same NVSwitch chips off the board and out into the rack — §3.4.
 
 ### 3.4 Scaling past the box: NVL72, then NVL576
 
-You've climbed this ladder before. In networking, when a **single pizza-box switch** runs out of ports you move to a **modular chassis**; when the chassis runs out, you build an **IP fabric** — a Clos of many switches. Scale-up climbs the *same* ladder: §3.3 was the pizza box (8 GPUs, fabric on the baseboard), and now we take the next two rungs — the chassis (NVL72, §3.4.1) and the two-tier Clos (NVL576, §3.4.2).
+You've climbed this ladder before. In networking, when a **single pizza-box switch** runs out of ports you move to a **modular chassis**; when the chassis runs out, you build an **IP fabric** — a Clos of many switches. Scale-up climbs the *same* ladder: §3.3's 8-GPU node was the pizza box — a *fat* one (8 RU, since its ports are 700 W GPUs), but a pizza box in the way that matters here, with the fabric fixed on the baseboard rather than in swappable cards. Now we take the next two rungs — the chassis (NVL72, §3.4.1) and the two-tier Clos (NVL576, §3.4.2).
 
 #### 3.4.1 NVL72: one rack, one switch tier
 
