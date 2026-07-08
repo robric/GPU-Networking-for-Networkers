@@ -1976,17 +1976,10 @@ AMD is the biggest backer of open interconnects, but it is not the whole open st
 
 # TODO list tracking
 
-
+- AI grid
+- open play (Llm-d and vllm ) ->  decription of the stack 
 - different types of GPU with different capabilities ? they may not all have nvlink for example ? connectX vs BF ? 
-- structure in 4. is not consistent with 3 (section names )
-- we should talk about  the split inference (P/D A/F), KV cache -> dynamo 
-- how much non nvidia the doc should be ???
-- UAlink ?
-- ESUN ?
-- small fix quote: It is well known that the Collective Completion Time (CCT)
-of synchronous collectives (AllReduce, AllGather, All2All)
-is determined by network stragglers [13] - individual slow
-flows that delay the CCT, and in turn collective performance
-affects the performance of the entire training run
+- structure of section is  not consistent 
+- dual dimenstion in split inference (P/D A/F), KV cache  
+- dynamo deep dive ?
 - check here scale accross https://nvidianews.nvidia.com/news/nvidia-introduces-spectrum-xgs-ethernet-to-connect-distributed-data-centers-into-giga-scale-ai-super-factories
-- RU of 8 GPU nodes ?
