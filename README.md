@@ -1790,7 +1790,7 @@ NVIDIA makes the switch on both ends — **NVSwitch** for scale-up (§3), **Spec
 
 That shapes the scale-up story directly. Today's MI300X wires **Infinity Fabric** over **xGMI** as a direct **mesh** across the 8 GPUs on a board — point-to-point, no switch, and past those 8 you are already on Ethernet. On raw bandwidth AMD is within a generation: ~**0.9 TB/s** per GPU (MI300X, ≈ NVLink 4 / H100-era), ~**1.075 TB/s** on MI355X — still under NVLink 5's **1.8 TB/s** on a B200. But the wider gap is *domain size*: the mesh stops at **8 GPUs** against NVL72's **72** (§3.4), and you cannot grow past a mesh without a switch. The switch, not the wire speed, is what separates them.
 
-The **MI400\*** generation closes the world-size gap to 72 — but not with an NVSwitch of its own. **Helios\*** runs **UALink-over-Ethernet**, tunnelling the fabric protocol over an Ethernet physical layer on **Broadcom Tomahawk** switches. That is the honest state of UALink: a standard and a bet, not yet a shipping fabric — its dedicated switch silicon is a 2026–27 arrival, and Broadcom, once a UALink founder, has already defected to the rival Ethernet-scale-up camp [[29]](#ref-29) (§9). Even AMD's scale-up is Ethernet underneath.
+The **MI400\*** generation closes the world-size gap to 72 — but not with an NVSwitch of its own. **Helios\*** runs **UALink-over-Ethernet**, tunnelling the fabric protocol over an Ethernet physical layer on **Broadcom Tomahawk** switches. That is the honest state of UALink: a standard and a bet, not yet a shipping fabric — its dedicated switch silicon is a 2026–27 arrival, and **Broadcom**, the volume switch vendor and a UALink founder, has since backed the Ethernet path (ESUN) instead, leaving no high-volume UALink switch to buy [[29]](#ref-29). So AMD carries the protocol over Ethernet — UALink and ESUN compose rather than compete; §9 has the full contest. Even AMD's scale-up is Ethernet underneath.
 
 So AMD's openness is not just a philosophy — it is **structural**. A vendor that does not make switch silicon *has* to bet on an open, multi-vendor fabric: UALink for scale-up, Ultra Ethernet for scale-out, plain Ethernet under both. NVIDIA can stay proprietary precisely because it owns the switch on both ends; AMD cannot close the loop alone, so it works to keep the loop open.
 
@@ -1886,12 +1886,29 @@ This is the chapter with the most familiar shape for a networker: it is the indu
 
 ### 9.1 The scale-up front: answering NVLink
 
-The prize is NVLink + NVSwitch, the one layer that had no open equivalent for years. Two efforts now go after it, and (as §8.2 noted) they disagree on *how*:
+The prize is NVLink + NVSwitch, the one layer that had no open equivalent for years. The open answer is usually cast as a fight — **UALink vs ESUN** — but that framing is wrong: one is a *protocol*, the other a *substrate*, and they **compose** [[40]](#ref-40).
 
-- **UALink** (Ultra Accelerator Link) is the **purpose-built** answer — a switched, memory-semantic accelerator fabric, the direct structural analog of NVLink + NVSwitch. Its 200G 1.0 spec (April 2025) runs 200 GT/s per lane and scales a pod to **1,024 accelerators** — nearly double NVL576 — over a small, low-overhead link stack. It borrows only the Ethernet *PHY*; the transaction and protocol layers are its own. Backed by AMD, Intel, Google, Microsoft, Meta, AWS, Apple, and ~70 others [[38]](#ref-38). The catch is timing: dedicated UALink switch silicon (AMD, Intel, Astera Labs) is a **late-2026** arrival, so today it is a ratified spec waiting on its hardware.
-- **ESUN + SUE-T** is the **Ethernet-native** answer — don't build a new switched fabric, make ordinary Ethernet do scale-up. **ESUN** (Ethernet for Scale-Up Networking, the OCP effort from §8.2 [[29]](#ref-29)) standardizes the lower layers so any Ethernet switch can forward scale-up traffic; **SUE-T** (Scale-Up Ethernet Transport, AMD's contribution) rides on top. No special switch silicon required — the switches already exist.
+**UALink is the open load/store fabric — a protocol.** Its premise is that scale-up is not networking at all; it is *memory*. Where a scale-out NIC posts a message and waits for a completion (RDMA, §4.2), a UALink accelerator issues a **read, write, or atomic directly against another accelerator's memory** — the same load/store model as NVLink (§3.5), now an open spec instead of NVIDIA's. The stack is thin and purpose-built: a **Protocol** layer for the load/store/atomic operations, a **Transaction** layer that packs them into **64-byte flits** (the fabric's fixed-size unit) at up to ~95% efficiency, a **Data Link** layer with CRC and replay, and underneath an ordinary **Ethernet PHY** (the 200 GT/s-per-lane IEEE 802.3dj SerDes). It scales to **1,024 accelerators** in one pod with low-latency, memory-semantic access [[38]](#ref-38).
 
-The tell, again, is **Broadcom**: it left the UALink board and joined ESUN, the biggest merchant-switch vendor betting that scale-up is *just Ethernet*. AMD hedges both and ships **UALink-over-Ethernet** (§8.2) as the bridge until native UALink switches arrive. The contest is unresolved — purpose-built performance versus reuse-what-exists economics — the same trade that has run under every fabric in this book.
+**ESUN is a substrate, not a competitor.** It standardizes the Ethernet L2/L3 lower layers for scale-up *precisely so that a vendor protocol — UALink included — can ride over commodity Ethernet switches*. **SUE-T** (Scale-Up Ethernet Transport, AMD's contribution) is one transport that rides ESUN; UALink's protocol is another thing that can. So UALink runs **two ways** — over its own thin link layer and dedicated **UALink switches**, or carried over **Ethernet** on the ESUN substrate and commodity switches:
+
+```
+   UALink protocol (load / store / atomic) — carried two ways:
+
+                native UALink                          over Ethernet
+   +----------------------------------+   +----------------------------------+
+   | UALink link (flits, CRC, replay) |   | ESUN Ethernet L2/L3 (or SUE-T)   |
+   +----------------------------------+   +----------------------------------+
+   | Ethernet PHY  (IEEE 802.3dj)     |   | Ethernet PHY  (IEEE 802.3dj)     |
+   +----------------------------------+   +----------------------------------+
+         dedicated UALink switch               commodity Ethernet switch
+```
+
+<p align="center"><em>One memory-semantic protocol, two ways to carry it — the fork is the switch, not the fabric.</em></p>
+
+Both paths converge on the same 802.3 PHY; the fork is **the switch** — and here the story turns commercial. A native UALink switch is the thin, low-latency ideal (small die, low overhead — why AMD pitches it on TCO), but almost nobody is building one. **Broadcom** — the volume merchant-switch vendor and a UALink *founding* board member — **backtracked**: it left the UALink board for ESUN [[29]](#ref-29), betting that dedicated UALink switches never reach volume and scale-up simply collapses onto the Ethernet it already sells. That left the native path to smaller, later silicon (Astera Labs and others, **late-2026**). So AMD, needing **Helios** to ship in 2026, does the one thing it can: it runs **UALink-over-Ethernet** on Broadcom's Tomahawk (§8.2). The "run it either way" flexibility is genuine — but it is also AMD making a virtue of necessity, because the switch it would prefer does not yet exist at volume.
+
+So the contest is not UALink versus ESUN — they stack. It is whether a **dedicated UALink switch** ever ships in volume to challenge commodity Ethernet, a bet decided less by the specifications than by whoever chooses to build the silicon. For now the biggest switch vendor has voted with its feet — the purpose-built-versus-reuse-what-exists trade that has run under every fabric in this book.
 
 ### 9.2 The scale-out front: answering InfiniBand
 
@@ -1955,6 +1972,7 @@ AMD is the biggest backer of open interconnects, but it is not the whole open st
 37. <a id="ref-37"></a>N. P. Jouppi, G. Kurian, S. Li, et al. (Google) — *TPU v4: An Optically Reconfigurable Supercomputer for Machine Learning with Hardware Support for Embeddings.* ISCA 2023 (optical circuit switches dynamically reconfigure the inter-chip interconnect; users can select a twisted 3-D torus). arXiv:2304.01433. <https://arxiv.org/abs/2304.01433>
 38. <a id="ref-38"></a>UALink Consortium — *UALink 200G 1.0 Specification* (April 2025; switched, memory-semantic scale-up interconnect, 200 GT/s per lane, up to 1,024 accelerators per pod; members incl. AMD, Intel, Google, Microsoft, Meta, AWS, Apple). <https://ualinkconsortium.org/specification/>
 39. <a id="ref-39"></a>Ultra Ethernet Consortium — *UEC Launches Specification 1.0: Transforming Ethernet for AI and HPC at Scale* (June 2025; full-stack redesign — PHY, link, the new Ultra Ethernet Transport (UET) RDMA protocol replacing RoCE, packet spraying, packet trimming, path-aware congestion control). <https://ultraethernet.org/ultra-ethernet-consortium-uec-launches-specification-1-0-transforming-ethernet-for-ai-and-hpc-at-scale/>
+40. <a id="ref-40"></a>Synopsys — *Ethernet Standards for Scale-Up AI: An Overview of ESUN, SUE, and UALink* (ESUN, SUE-T, and UALink form a complementary stack; ESUN standardizes the Ethernet lower layers so vendor scale-up protocols such as UALink can run over commodity Ethernet, or over dedicated UALink switches). <https://www.synopsys.com/articles/ethernet-standards-scale-up-ai.html>
 
 # TODO list tracking
 
