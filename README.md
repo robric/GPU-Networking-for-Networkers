@@ -1646,15 +1646,24 @@ That closes §5, the communication layer: the collectives themselves (§5.2), ho
 
 > Goal: by the end you should have a map of the software between the model and the GPU — where CUDA sits and why it is the lock-in, how model code becomes GPU instructions, and how the training and serving stacks differ.
 
-§1–§5 were hardware and wire: the GPU, NVLink, the RDMA fabric, and the collectives running on it. On top of that sits a deep stack of software. To map it with a more familiar network switch, this is silicon up through a vendor SDK, feature and protocol libraries, a platform, and the services on top.
+§1–§5 were hardware and wire: the GPU, NVLink, the RDMA fabric, and the collectives running on it. On top of that sits a deep stack of software. To map it with a more familiar network switch, this is silicon up through a vendor SDK, feature and protocol libraries, a platform, and the services on top:
 
-| GPU software                       | the switch                 |
-|------------------------------------|----------------------------|
-| model / recipe (Llama, GPT)        | the service you deliver    |
-| framework (PyTorch, JAX)           | the platform you build on  |
-| math + comms libs (cuDNN, NCCL §5) | protocol + feature stacks  |
-| CUDA runtime + driver              | the ASIC SDK — the lock-in |
-| GPU + NVLink + NIC (§3-4)          | the ASIC + its ports       |
+```
+        the GPU software stack                   ...same shape on a switch
+
+   +=====================================+
+   |  app / recipe      (Llama, GPT)     |    <-    the service you deliver
+   +-------------------------------------+
+   |  framework         (PyTorch, JAX)   |    <-    the platform you build on
+   +-------------------------------------+
+   |  math + comms libs                  |    <-    protocol & feature stacks
+   |  (cuBLAS / cuDNN,  NCCL §5)         |
+   +-------------------------------------+
+   |  CUDA runtime + driver              |   <==    the ASIC SDK - THE LOCK-IN
+   +-------------------------------------+
+   |  GPU + NVLink + NIC     (§3-§4)     |    <-    the ASIC + its ports
+   +=====================================+
+```
 
 <p align="center"><em>The GPU software stack, and the same shape on a network switch.</em></p>
 
@@ -1668,19 +1677,79 @@ One row carries the chapter: **CUDA is NVIDIA's ASIC SDK — and the moat.** Eve
 
 Bottom to top, the software above the silicon is five thin layers.
 
-- **CUDA driver** (kernel mode) — loads compiled code onto the GPU, maps memory, and drives the PCIe/NVLink links. The counterpart of the platform driver beneath your NOS.
-- **CUDA runtime + toolkit** — the programming model: kernels (functions that run on the GPU), **streams** (ordered queues of work — the handles that let compute and communication overlap, §5.1), and device memory. This is the SDK every layer above targets.
+- **CUDA driver** — one name, two artifacts. The **kernel module** (`nvidia.ko`, plus `nvidia-uvm.ko` for unified memory) owns the hardware: memory mapping, DMA, and the PCIe/NVLink links — the counterpart of the platform driver beneath your NOS. Above it, still *inside the driver package*, sits **`libcuda.so`** — the user-space **driver API** (`cu*` calls) that `ioctl`s into the kernel module, and where the PTX JIT of §6.2 actually runs.
+- **CUDA runtime + toolkit** — **`libcudart.so`**, the **runtime API** (`cuda*` calls, the `<<< >>>` launch syntax): a convenience layer over `libcuda` carrying the programming model — kernels (functions that run on the GPU), **streams** (ordered queues of work — the handles that let compute and communication overlap, §5.1), and device memory. It ships with the **toolkit**, not the driver, which is why the two version independently (the driver just has to be new enough). This is the SDK every layer above targets.
 - **Math and comms libraries** — almost nobody writes raw kernels; you call libraries. **cuBLAS / cuDNN / CUTLASS** for the matrix math a model is mostly built from, and **NCCL** for the collectives of §5. AMD ships the mirror set (rocBLAS, MIOpen, **RCCL**); Intel has oneAPI (oneMKL, **oneCCL**).
 - **Framework** — **PyTorch**, **JAX**, or **TensorFlow**: tensors, autograd, and a dispatcher that turns each operation into the right library or kernel call. This is where the model is written.
-- **App / recipe** — the model and its training or serving loop, usually assembled from higher-level libraries: **Hugging Face**, **Megatron-LM**, **DeepSpeed**.
+- **App / recipe** — the model and its training or serving loop, usually assembled from higher-level libraries: **Hugging Face**, **Megatron-LM**, **DeepSpeed**. This includes inference: an engine like **vLLM** or **TensorRT-LLM** is the same stack with a serving loop in the top slot (§6.3) — only the *fleet* layer of §6.3 lives outside it, on the CPU/frontend side.
 
-The reason to draw it as a stack is the reason it matters to you: every layer above the driver ultimately binds to CUDA. That binding is the lock-in — why "just run it on another vendor's GPU" is hard, and why §8 and §9 exist at all.
+Zoom into those bottom layers — "driver" and "runtime" are three artifacts on disk, split by the kernel boundary:
+
+```
+        app / framework / libraries
+                 |
+   +----------------------------+   cuda* calls  (cudaMalloc, <<< >>>)
+   |  libcudart  (runtime API)  |   ships with the TOOLKIT
+   +----------------------------+
+                 |
+   +----------------------------+   cu* calls  (cuMemAlloc, cuLaunchKernel)
+   |  libcuda.so  (driver API)  |   ships with the DRIVER - user space,
+   +----------------------------+   home of the PTX JIT (§6.2)
+                 |  ioctl
+   - - - - - - - + - - - - - - -    kernel boundary
+                 |
+   +----------------------------+   owns the hardware: memory mapping,
+   |  nvidia.ko  (+ uvm, ...)   |   DMA, the PCIe / NVLink links
+   +----------------------------+
+                 |
+                GPU
+```
+
+<p align="center"><em>"Driver" and "runtime" on disk: libcudart wraps libcuda, which ioctls into the kernel module. Driver and toolkit version independently.</em></p>
+
+The reason to draw it as a stack is the reason it matters to you: whatever the entry point — app, framework, or library — every road down to the silicon passes through one gate:
+
+```
+   +--------------+     +-------------+     +-------------+
+   |  app/recipe  |     |  framework  |     |  libraries  |
+   +------+-------+     +------+------+     +------+------+
+          |                    |                   |
+          +--------------------+-------------------+
+                               |
+                               v      every layer binds HERE
+                       +===============+
+                       |     CUDA      |   <- the moat
+                       +===============+
+                               |
+                               v
+                      driver  ->  silicon
+```
+
+<p align="center"><em>One gate to the silicon: everything above ultimately binds to CUDA.</em></p>
+
+That binding is the lock-in — why "just run it on another vendor's GPU" is hard, and why §8 and §9 exist at all.
 
 ### 6.2 How code becomes GPU instructions
 
 Two questions hide in that CUDA layer: *when* the kernels run, and *how* they are built.
 
-**Eager versus compiled.** By default a framework runs **eagerly** — it dispatches each operation and launches a kernel the moment Python reaches it. Flexible for debugging, but the CPU is in the loop launching every kernel, the way a router crawls if it punts every packet to the route processor. The fix is to **compile**: capture the whole graph of operations, **fuse** it into far fewer kernels, and cut both launch overhead and memory traffic. `torch.compile` does this for PyTorch — it traces the graph, then generates fused kernels, often in **Triton** (OpenAI's Python kernel language, not the similarly-named inference server); **XLA** does it for JAX and TensorFlow; **TensorRT** does it ahead of inference.
+**Eager versus compiled.** By default a framework runs **eagerly** — it dispatches each operation and launches a kernel the moment Python reaches it. Flexible for debugging, but the CPU is in the loop launching every kernel, the way a router crawls if it punts every packet to the route processor. The fix is to **compile**: capture the whole graph of operations, **fuse** it into far fewer kernels, and cut both launch overhead and memory traffic:
+
+```
+   EAGER  (default)                        COMPILED  (torch.compile / XLA / TensorRT)
+
+   Python:  op1   op2   op3   op4          capture the graph:  (op1-op2-op3-op4)
+             |     |     |     |                                       |
+   CPU       v     v     v     v                              fuse     v
+   launches [k1]  [k2]  [k3]  [k4]         GPU:           [ one fused kernel ]
+             ^ launch tax on every kernel                  ^ launched once
+
+   = punting every packet to the RP        = the hardware fast path
+```
+
+<p align="center"><em>Eager keeps the CPU in the loop for every kernel; compiled fuses the graph and launches once.</em></p>
+
+`torch.compile` does this for PyTorch — it traces the graph, then generates fused kernels, often in **Triton** (OpenAI's Python kernel language, not the similarly-named inference server); **XLA** does it for JAX and TensorFlow; **TensorRT** does it ahead of inference.
 
 **Source to machine code.** Whichever front end compiles a kernel, every road converges on one virtual ISA (i.e. **PTX** — Parallel Thread Execution) and one per-GPU final step. Two front ends are in common use — NVIDIA's **`nvcc`** (NVIDIA CUDA Compiler, the default) and **Clang**'s native CUDA mode — and they differ only until they reach PTX:
 
@@ -1707,7 +1776,7 @@ Two questions hide in that CUDA layer: *when* the kernels run, and *how* they ar
    |      virtual ISA - portable "GPU bytecode"       |
    +==================================================+
                              |
-       ptxas (AOT)   or   driver JIT (load, per GPU)
+     ptxas (AOT, build)  and/or  driver JIT (load, per GPU)
                              v
    +====================== SASS ======================+
    |          machine code for the exact GPU          |
@@ -1722,7 +1791,20 @@ Reading the two lanes:
 - **The convergence.** Both roads emit **PTX** — **Parallel Thread Execution**, a *virtual* **ISA** (instruction set architecture) — portable "GPU bytecode" [[21]](#ref-21).
 - **To the metal (identical).** PTX becomes **SASS** — the low-level GPU machine code (NVIDIA doesn't officially expand the name) — either **ahead-of-time** (**AOT**) by **`ptxas`**, the PTX assembler, at build, or **just-in-time** (**JIT**) by the driver at load, for the exact GPU in the box.
 
-The middle stage is the one to remember: PTX is that virtual ISA, and the driver JIT-compiles it to SASS at load time — which is why a binary built today can run on a GPU architecture that ships years later: the PTX is forward-portable, recompiled per box, like any bytecode. (**Triton** from the compiled path above is a third front end that also lowers to PTX, so it rides the same tail.) **CUDA graphs** add a second trick — capture a whole launch sequence once and replay it as a unit, erasing per-launch overhead in the tight loops where it hurts most (the decode loop of §5.4).
+The middle stage is the one to remember: PTX is that virtual ISA, and the driver JIT-compiles it to SASS at load time — which is why a binary built today can run on a GPU architecture that ships years later:
+
+```
+   build once, today                             run years later, on a new GPU
+   ------------------                            -----------------------------
+   foo.cu --> PTX  (shipped in the binary)  -->  driver JIT --> fresh SASS
+               portable "GPU bytecode"           recompiled in the box, per GPU
+```
+
+<p align="center"><em>PTX is forward-portable, like any bytecode: the driver recompiles it for whatever GPU it lands on.</em></p>
+
+Two fine-print caveats a networker would want on the datasheet: the JIT trick only works **if the PTX is actually shipped in the fat binary** — `nvcc` embeds it per `-gencode` settings, while Clang always builds SASS and makes PTX inclusion opt-in (`--cuda-include-ptx`) [[23]](#ref-23); and the *architecture-specific* targets (the `a` suffix — `sm_90a`, `sm_100a`, used to reach some Hopper/Blackwell-only features) trade that portability away — they are **not** forward-compatible.
+
+(**Triton** from the compiled path above is a third front end that also lowers to PTX, so it rides the same tail.) **CUDA graphs** add a second trick — capture a whole launch sequence once and replay it as a unit, erasing per-launch overhead in the tight loops where it hurts most (the decode loop of §5.4).
 
 ### 6.3 Two software worlds: training and serving
 
@@ -1750,7 +1832,36 @@ The same silicon runs two different software stacks, tuned for opposite goals.
 
 <p align="center"><em>The training stack: model down to fabric — mostly open; the lock-in is below, in CUDA.</em></p>
 
-**Serving** optimizes **latency**, and it stacks in *two* layers. First the **inference engine** — **vLLM**, **TensorRT-LLM**, **SGLang** — which runs the model on one instance (one or a few GPUs) with the tricks §5.4 named: continuous batching, a **paged KV cache** (vLLM's PagedAttention [[22]](#ref-22)), quantization. Then a **distributed serving layer** — the **control plane for the fleet**, working at the *request* level, not the tensor level. It is a cache-aware router and scheduler sitting above the engines (think an L7 load balancer plus a service mesh), and it does four jobs: **disaggregated prefill/decode** (run the two phases on separate GPU pools and ship the KV cache between them), **KV-cache-aware routing** (steer a request to the instance that already holds its prefix), autoscaling, and a request gateway — the fleet §5.4 described. The collectives of §5 stay *inside* each engine instance; this layer works one level up, moving **requests and KV caches**, not tensors.
+**Serving** optimizes **latency**, and it stacks in *two* layers. First the **inference engine** — **vLLM**, **TensorRT-LLM**, **SGLang** — which runs the model on one instance (one or a few GPUs) with the tricks §5.4 named: continuous batching, a **paged KV cache** (vLLM's PagedAttention [[22]](#ref-22)), quantization. Then a **distributed serving layer** — the **control plane for the fleet**, working at the *request* level, not the tensor level: a cache-aware router and scheduler sitting above the engines — think an L7 load balancer plus a service mesh:
+
+```
+                       user requests   (N-S, frontend §1.4)
+                                      |
+                                      v
+   +============= distributed serving layer  (the fleet) =============+
+   |   gateway  ->  KV-cache-aware router  ->  scheduler/autoscaler   |
+   |   request level: moves REQUESTS and KV CACHES - never tensors    |
+   +================+=================================+===============+
+                    |                                 |
+                    v                                 v
+        ~~~~~ PREFILL pool ~~~~~          ~~~~~~~ DECODE pool ~~~~~~~
+      +---------+   +---------+         +---------+   +---------+
+      | engine  |   | engine  |  ====>  | engine  |   | engine  | ...
+      +---------+   +---------+   KV    +---------+   +---------+
+       vLLM / TensorRT-LLM / SGLang, one instance = 1-few GPUs;
+       the collectives of §5 stay INSIDE each instance
+```
+
+<p align="center"><em>Serving in two layers: engines run the model; the fleet layer routes requests and ships KV caches between pools.</em></p>
+
+The fleet layer does four jobs — this is the fleet §5.4 described:
+
+- **Disaggregated prefill/decode** — run the two phases on separate GPU pools and ship the KV cache between them.
+- **KV-cache-aware routing** — steer a request to the instance that already holds its prefix.
+- **Autoscaling** — grow and shrink the pools with the load.
+- **Request gateway** — the front door the north-south traffic of §1.4 lands on.
+
+The collectives of §5 stay *inside* each engine instance; this layer works one level up, moving **requests and KV caches**, not tensors.
 
 Two stacks compete at that fleet layer, and — unlike the engine layer — **both are open source**, so it is not a clean open-vs-closed fight. NVIDIA's **Dynamo** [[20]](#ref-20) is the wider one: an *engine-agnostic* platform (it drives vLLM, SGLang, or TensorRT-LLM underneath) with its own KV-cache manager and the **NIXL** transfer library [[26]](#ref-26) that shuttles KV tensors over NVLink/IB — powerful, and tuned for NVIDIA's fabric. The community's **llm-d** [[45]](#ref-45) is narrower and **Kubernetes-native**, built around vLLM and the CNCF gateway/scheduling ecosystem — disaggregation as a first-class K8s project rather than a vendor's platform. They are not a like-for-like (Dynamo is the broader system), and they even share plumbing: llm-d reuses Dynamo's NIXL. So the real split is less open-vs-closed than **integrated NVIDIA platform vs portable Kubernetes assembly**:
 
@@ -1767,9 +1878,10 @@ Two stacks compete at that fleet layer, and — unlike the engine layer — **bo
    +------------------------------+   +------------------------------+
 ```
 
-<p align="center"><em>Serving in two flavors: NVIDIA's integrated platform vs a portable Kubernetes assembly.</em></p>
+<p align="center"><em>Serving in two flavors: NVIDIA's integrated platform vs a portable Kubernetes assembly. (Canonical pairings — Dynamo itself is engine-agnostic.)</em></p>
 
 The one place the split *is* cleanly open-vs-proprietary is the **engine**: **TensorRT-LLM** is the fastest path but NVIDIA-only, while **vLLM** runs across NVIDIA, AMD, Intel, and TPU. Same trade as the silicon underneath — peak performance on one vendor's stack, or portability across everyone's. That is the software map; §7 turns to the networks around this stack we have so far ignored: storage, management, and the frontend.
+
 
 ## 7. The other planes: frontend, storage, and management
 
