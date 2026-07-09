@@ -23,6 +23,8 @@ The golden rule for the whole document: **whenever something looks like magic, w
   - [1.3 Host vs device](#13-host-vs-device)
   - [1.4 The two network paths: host vs GPU](#14-the-two-network-paths-host-vs-gpu)
   - [1.5 The two workloads: training vs inference](#15-the-two-workloads-training-vs-inference)
+    - [1.5.1 Two traffic shapes](#151-two-traffic-shapes)
+    - [1.5.2 The other axis: how much CPU per GPU](#152-the-other-axis-how-much-cpu-per-gpu)
   - [1.6 The picture so far](#16-the-picture-so-far)
 - [2. GPU Networking, the big picture: two fundamentally different problems](#2-gpu-networking-the-big-picture-two-fundamentally-different-problems)
   - [2.1 Scale-up vs scale-out](#21-scale-up-vs-scale-out)
@@ -183,8 +185,9 @@ A GPU is not a standalone computer. It lives inside a server, attached to a CPU:
 - The **CPU is the "host"**; each **GPU is a "device."**
 - **Real boxes are dual-socket.** A reference 8-GPU server (NVIDIA HGX/DGX-class) has **two CPU sockets**, with the GPUs partitioned across them — typically GPU0–3 under CPU0 and GPU4–7 under CPU1 (often through PCIe switches). This is **not failover redundancy** — if a CPU dies its GPUs don't migrate. It's there for **PCIe lanes** (8 GPUs + ~8 NICs + NVMe need more lanes than one socket has) and **NUMA balance**. Note that this already makes the node a **NUMA machine** *before* NVLink enters — crossing from a CPU0-GPU to a CPU1-GPU traverses the inter-socket link (UPI / Infinity Fabric).
 - Software enumerates the GPUs in a node as `cuda:0`, `cuda:1`, `cuda:2`, … — just an index per device, like interface IDs (`eth0`, `eth1`) on a box. This is what people mean by "N distinct GPUs": even when the GPUs are fully wired together, you still address `cuda:0 … cuda:7` individually. (Hold onto this — it's why "8 GPUs acting as one" is an abstraction, not a hardware fact.)
+- **The fabric unifies devices, not hosts.** Wiring GPUs together (NVLink, §3) can make many act as one pool of memory — but it never fuses the *machines*. A GPU rack stays a **cluster of separate servers**, each with its own OS. A GB200 NVL72's 72 GPUs form a single NVLink domain (§3.4.1), yet its CPUs are **18 independent hosts** — an `lscpu` on one shows that tray's ~144 cores, never all 2,592 [[44]](#ref-44). The memory fabric unifies; the operating systems do not.
 - **PCIe** is the general-purpose bus connecting CPU and GPUs (and NICs). It's fine for loading data and control, but it is **far too slow** to be the path GPUs use to share memory with each other at HBM speeds. Hold that thought — it's the exact gap NVLink exists to fill, in §3.
-- *Aside:* "superchip" designs (Grace-Hopper, GB200) change this CPU↔GPU relationship — the CPU attaches to the GPU over a fast **NVLink-C2C** link instead of PCIe, at a different ratio (GB200 = 1 Grace CPU for 2 Blackwell GPUs). More in §3.6.
+- *Aside:* "superchip" designs (Grace-Hopper, GB200) change this CPU↔GPU relationship — the CPU attaches to the GPU over a fast, **cache-coherent NVLink-C2C** link (~900 GB/s, ~7× a PCIe-5 link) instead of PCIe, at a higher ratio (GB200 = 1 Grace CPU per 2 Blackwell GPUs). How that ratio is chosen — and why it has drifted over the years — is §1.5.2; the naming is §3.6.
 
 ### 1.4 The two network paths: host vs GPU
 
@@ -242,6 +245,8 @@ The takeaway that frames the whole doc: **the frontend is your existing skill se
 
 Everything so far — sharded tensors, GPUs collaborating mid-computation — has quietly assumed *one* kind of work. But a GPU data center runs **two very different jobs**, and they stress the network in opposite ways. You already have the perfect pair of analogies for them: **training is a batch / bulk-sync job; inference is a latency-sensitive request-response service.** Which one you're wiring for changes what the network has to be good at.
 
+#### 1.5.1 Two traffic shapes
+
 ```
    TRAINING  — backend only, all GPUs in lockstep
       G === G === G === G
@@ -279,6 +284,34 @@ For the models driving all this — **autoregressive LLMs**, which generate thei
 | Looks like…   | HPC batch / bulk sync | a web request-response tier     |
 
 The takeaway for the rest of the doc: **§3 and §4 are mostly the *training* story** — the synchronized backend collectives that push the fabric hardest. Inference adds the familiar **frontend** dimension (→ §6) plus a lighter backend. But "lighter" is changing fast: modern serving is starting to **disaggregate** — running prefill and decode on separate GPU pools and shipping the intermediate state (the KV cache) between them over the backend fabric — which turns inference into its own demanding network problem. We flag it here and come back to it later; for now, just hold the split: **training stresses the backend; inference spans both planes.**
+
+#### 1.5.2 The other axis: how much CPU per GPU
+
+The two workloads differ on a second axis besides network traffic: **how hard each leans on the host CPU**. It is tempting to say inference pushed the **CPU:GPU ratio** up — but the history is messier than that, and worth seeing before drawing the lesson [[42]](#ref-42).
+
+| Node (announced)   | GPUs            | CPU (total cores)    | cores/GPU | CPU-GPU link           |
+|--------------------|-----------------|----------------------|-----------|------------------------|
+| DGX-1 (2016-17)    | 8x Pascal/Volta | 2x Xeon (40)         | 5         | PCIe 3 (~32 GB/s)      |
+| DGX-2 (2018)       | 16x Volta       | 2x Xeon (48)         | 3         | PCIe 3 (~32 GB/s)      |
+| DGX A100 (2020)    | 8x Ampere       | 2x EPYC (128)        | 16        | PCIe 4 (~64 GB/s)      |
+| DGX H100 (2022)    | 8x Hopper       | 2x Xeon (112)        | 14        | PCIe 5 (~128 GB/s)     |
+| DGX B200 (2024)    | 8x Blackwell    | 2x Xeon (112)        | 14        | PCIe 5 (~128 GB/s)     |
+| GB200 (2024)       | Grace-Blackwell | 1 Grace (72) : 2 GPU | 36        | NVLink-C2C (900 GB/s)  |
+| Vera Rubin* (2025) | Vera Rubin      | 1 Vera (88) : 2 GPU  | 44        | NVLink-C2C (1800 GB/s) |
+
+<p align="center"><em>CPU cores per GPU across the generations — noisy, and not an inference trend.</em></p>
+
+*How to read it: **cores/GPU = node CPU cores ÷ GPUs** — except the superchips (GB200, Vera Rubin), which aren't 8-GPU nodes but fix the ratio at 1 CPU : 2 GPUs, the same at any rack size.*
+
+\**Vera Rubin is announced, not shipping (production 2026); its figures are preliminary [[43]](#ref-43). Years are announcement dates — H100 shipped in volume in 2023, GB200 in 2025.*
+
+Read down the *cores/GPU* column and there is no clean upward march — **5 → 3 → 16 → 14 → 14 → 36 → 44** — and the moves that matter are not about inference:
+
+- **The big jump is DGX A100 (2020)**, from 3 to 16 cores/GPU — and it came from switching to **AMD EPYC** (64 cores per socket) plus PCIe 4, *before* ChatGPT and the inference boom. A CPU-supply jump, not a workload one.
+- **Packing GPUs pushes the ratio down** — DGX-2 put 16 GPUs on two sockets and *fell* to 3 cores/GPU.
+- **The recent move is architectural.** GB200's 36 cores/GPU arrives with the **Grace** superchip, whose real change is not the core count but the **coupling**: the CPU reaches the GPU over **cache-coherent NVLink-C2C at ~900 GB/s** — roughly 7× a PCIe-5 link — sharing one address space (§1.3). The CPU is bound *tighter*, not just made *bigger* — and Vera Rubin\* (production 2026) pushes the same lever again: 44 cores/GPU and a **1.8 TB/s** C2C link, double GB200's.
+
+So the *ratio* is a design variable set by CPU core-density, GPU packing, and architecture — not a clean inference signal. What *is* an inference story lives one level up, in **software**. Training's host job is light: feed batches, launch kernels, checkpoint. Serving runs a **per-request control plane on the CPU** — tokenize, schedule (continuous batching), sample, manage the KV cache, route prefill and decode (§5.4). And **agentic** workloads (agent-to-agent, tool use) add more: the orchestration *between* model calls — planning, tool invocation, retrieval — is CPU work that scales with the number of agent steps, not model FLOPs. So the host matters more for serving than for training even where the node BOM looks identical; the frontend that carries that work is §7.1.
 
 ### 1.6 The picture so far
 
@@ -553,7 +586,7 @@ You've climbed this ladder before. In networking, when a **single pizza-box swit
 
 #### 3.4.1 NVL72: one rack, one switch tier
 
-The on-board NVSwitch handles 8 GPUs. To go bigger, NVIDIA lifts the same switch chips *out* of the server and into dedicated **NVLink Switch trays** wired across a whole rack. That's what a **GB200 NVL72** is: 72 Blackwell GPUs (18 compute trays) + **9 NVLink Switch trays** (two NVSwitch chips each — 18 in all), all stitched into **one single NVLink domain** where any of the 72 GPUs can load/store any other's HBM at full speed [[1]](#ref-1)[[14]](#ref-14). *This* is where "72 GPUs act as one giant GPU" (the abstraction from §1.1) stops being marketing and becomes a wiring diagram — it's a non-blocking NVLink fabric, just scaled from 8 ports to 72.
+The on-board NVSwitch handles 8 GPUs. To go bigger, NVIDIA lifts the same switch chips *out* of the server and into dedicated **NVLink Switch trays** wired across a whole rack. That's what a **GB200 NVL72** is: 72 Blackwell GPUs (18 compute trays) + **9 NVLink Switch trays** (two NVSwitch chips each — 18 in all), all stitched into **one single NVLink domain** where any of the 72 GPUs can load/store any other's HBM at full speed [[1]](#ref-1)[[14]](#ref-14)[[41]](#ref-41). *This* is where "72 GPUs act as one giant GPU" (the abstraction from §1.1) stops being marketing and becomes a wiring diagram — it's a non-blocking NVLink fabric, just scaled from 8 ports to 72.
 
 Physically, this is where the switch **leaves the baseboard**. The pizza-box collapses into a true chassis: compute trays and **NVLink Switch trays** become separate units in the rack, joined by the **NVLink spine** — a copper-cable backplane down the back. Now the chassis-router comparison is no longer an analogy — it's the literal build: **compute trays = line cards, switch trays = fabric cards, the spine = the backplane. The rack *is* the chassis.**
 
@@ -633,6 +666,8 @@ Two things change from NVL72:
 - **The media splits by distance:** still **copper inside each rack** (the spine backplane from above), but **optical between racks** — copper can't span 8 racks, so the inter-rack links move to optics. (The very copper-reach limit we just hit, now solved with light instead of refused.)
 
 **The Clos / leaf-spine fabric you know from IP networking shows up *first inside scale-up*.** NVL576 is a folded Clos — but it carries **memory load/stores over NVLink**, not packets. Scale-out (§4) will be *another* Clos, carrying **packets over Ethernet/InfiniBand**. Same topology shape; different fabric, different payload.
+
+**The catch is the cost, and it is brutal.** That second tier has to be optical, and optics are where the economics break. NVIDIA first showed a Blackwell **GB200 NVL576** and then left it on paper: crossing racks needs roughly **9 × 1.6T optical modules per GPU**, at ~$1,500 apiece — about **$14K of optics per GPU, nearly half the price of the GPU itself** [[41]](#ref-41). The single-tier, all-copper **NVL72** sidesteps every one of them, on the order of **6× cheaper** interconnect and **~20 kW less per rack**. That is why the volume Blackwell product is NVL72, and why the 576-GPU domain slipped a generation to **Rubin Ultra**: a two-tier NVLink Clos only pays once the optics get cheaper — which is exactly the co-packaged-optics move below.
 
 **And the ladder keeps climbing.** The generation after Rubin pushes further still: **Feynman's NVL1152** (~2028) links **8 next-gen "Kyber" racks into one 1,152-GPU NVLink domain**, and to reach that far the NVLink switches move to **co-packaged optics (CPO)** — light fused right into the switch package. Notice the through-line: every rung needs a *longer, faster* interconnect just to keep "remote HBM ≈ local HBM" —
 
@@ -1500,7 +1535,7 @@ What the table flattens:
 - **Real jobs stack the cuts.** A frontier run does DP × TP × PP, often × MoE, at once — "3D/4D parallelism" — so the fabric carries every one of these patterns simultaneously, each pinned to the layer that suits it.
 - **Scale-across is the next tier out.** Same rule, one step further: the *least chatty* dimension goes on the slowest link. When a job outgrows one building and spills into a second datacenter (§4.6.5), only traffic that communicates *rarely* can tolerate that long, high-latency hop — so it's **data parallelism**, which syncs gradients just once per step. Even that cost gets hidden two ways: **overlap** the sync with the backward pass (average the last layer's gradients while the earlier layers are still computing), or **desynchronize** it — let each site train on its own for tens of steps and only average the models now and then, the local-SGD / DiLoCo [[18]](#ref-18) trick that cuts cross-site traffic by hundreds of times. TP and MoE never leave the building: they talk *every layer*, thousands of times a step, so even a few kilometers of added delay is fatal.
 
-One variant to log now, because it reshapes the traffic: **sharded** data parallelism (ZeRO / FSDP [[19]](#ref-19)) keeps DP's split batch but shards the weights and optimizer state across the replicas too. So instead of a single gradient all-reduce it does an **all-gather** to rebuild each layer's weights before use and a **reduce-scatter** to spread the gradients after — the same arithmetic as an all-reduce, unrolled into the two halves we take apart in §5.3.
+One variant to log now, because it reshapes the traffic: **sharded** data parallelism (ZeRO / **FSDP**, *Fully Sharded Data Parallel* [[19]](#ref-19)) keeps DP's split batch but shards the weights and optimizer state across the replicas too. So instead of a single gradient all-reduce it does an **all-gather** to rebuild each layer's weights before use and a **reduce-scatter** to spread the gradients after — the same arithmetic as an all-reduce, unrolled into the two halves we take apart in §5.3.
 
 ### 5.2 The catalog: what each collective does to a tensor
 
@@ -1693,11 +1728,48 @@ The middle stage is the one to remember: PTX is that virtual ISA, and the driver
 
 The same silicon runs two different software stacks, tuned for opposite goals.
 
-**Training** optimizes **throughput**. A framework (PyTorch, JAX) plus a parallelism engine — **DDP / FSDP**, **DeepSpeed**, **Megatron-LM** — shards the model across GPUs and emits the collectives of §5, wrapped around autograd, an optimizer, and periodic checkpointing. One long job, every GPU on the barrier.
+**Training** optimizes **throughput**. A framework (**PyTorch**, **JAX**) plus a parallelism engine — **DDP** (*Distributed Data Parallel*) **/ FSDP** (*Fully Sharded Data Parallel*), **DeepSpeed**, **Megatron-LM** — shards the model across GPUs and emits the collectives of §5, wrapped around autograd, an optimizer, and periodic checkpointing. One long job, every GPU on the barrier. This layer is largely **open** already — PyTorch and JAX own it, and NVIDIA's lock-in sits *beneath* the framework, in CUDA and the kernels (§6.1).
 
-**Serving** optimizes **latency**. A single-node **inference engine** — **vLLM**, **TensorRT-LLM**, or **SGLang** — runs the model with the tricks §5.4 named: continuous batching, a **paged KV cache** (vLLM's PagedAttention [[22]](#ref-22)), and quantization. Above the engines, **NVIDIA Dynamo** [[20]](#ref-20) orchestrates a whole fleet — disaggregated prefill/decode, KV-aware routing, KV-cache offload to cheaper memory tiers — the distributed serving layer §5.4 described.
+```
+   TRAINING stack
 
-The split even replays the CUDA moat: **TensorRT-LLM** is the fastest path but NVIDIA-only, while **vLLM** deliberately runs across NVIDIA, AMD, Intel, and TPU — the same portability fight §8 and §9 take up. That is the software map. §7 turns to the networks around this stack that we have so far ignored: storage, management, and the frontend.
+   +------------------------------------------------------+
+   | training loop   (your model)                         |
+   +------------------------------------------------------+
+   | framework:      PyTorch / JAX                        |
+   +------------------------------------------------------+
+   | parallelism:    DDP / FSDP / DeepSpeed / Megatron-LM |
+   +------------------------------------------------------+
+   | collectives:    NCCL / RCCL   (§5)                   |
+   +------------------------------------------------------+
+   | CUDA / ROCm + kernels   (§6.1)                       |
+   +------------------------------------------------------+
+   | GPUs + NVLink / RDMA fabric   (§3-4)                 |
+   +------------------------------------------------------+
+```
+
+<p align="center"><em>The training stack: model down to fabric — mostly open; the lock-in is below, in CUDA.</em></p>
+
+**Serving** optimizes **latency**, and it stacks in *two* layers. First the **inference engine** — **vLLM**, **TensorRT-LLM**, **SGLang** — which runs the model on one instance (one or a few GPUs) with the tricks §5.4 named: continuous batching, a **paged KV cache** (vLLM's PagedAttention [[22]](#ref-22)), quantization. Then a **distributed serving layer** — the **control plane for the fleet**, working at the *request* level, not the tensor level. It is a cache-aware router and scheduler sitting above the engines (think an L7 load balancer plus a service mesh), and it does four jobs: **disaggregated prefill/decode** (run the two phases on separate GPU pools and ship the KV cache between them), **KV-cache-aware routing** (steer a request to the instance that already holds its prefix), autoscaling, and a request gateway — the fleet §5.4 described. The collectives of §5 stay *inside* each engine instance; this layer works one level up, moving **requests and KV caches**, not tensors.
+
+Two stacks compete at that fleet layer, and — unlike the engine layer — **both are open source**, so it is not a clean open-vs-closed fight. NVIDIA's **Dynamo** [[20]](#ref-20) is the wider one: an *engine-agnostic* platform (it drives vLLM, SGLang, or TensorRT-LLM underneath) with its own KV-cache manager and the **NIXL** transfer library [[26]](#ref-26) that shuttles KV tensors over NVLink/IB — powerful, and tuned for NVIDIA's fabric. The community's **llm-d** [[45]](#ref-45) is narrower and **Kubernetes-native**, built around vLLM and the CNCF gateway/scheduling ecosystem — disaggregation as a first-class K8s project rather than a vendor's platform. They are not a like-for-like (Dynamo is the broader system), and they even share plumbing: llm-d reuses Dynamo's NIXL. So the real split is less open-vs-closed than **integrated NVIDIA platform vs portable Kubernetes assembly**:
+
+```
+   SERVING stack - two flavors
+
+        open / portable (CNCF)                  NVIDIA stack
+   +------------------------------+   +------------------------------+
+   | fleet:   llm-d  (CNCF, K8s)  |   | fleet:   Dynamo  (platform)  |
+   +------------------------------+   +------------------------------+
+   | engine:  vLLM / SGLang       |   | engine:  TensorRT-LLM        |
+   +------------------------------+   +------------------------------+
+   | GPUs:    any vendor          |   | GPUs:    NVIDIA only         |
+   +------------------------------+   +------------------------------+
+```
+
+<p align="center"><em>Serving in two flavors: NVIDIA's integrated platform vs a portable Kubernetes assembly.</em></p>
+
+The one place the split *is* cleanly open-vs-proprietary is the **engine**: **TensorRT-LLM** is the fastest path but NVIDIA-only, while **vLLM** runs across NVIDIA, AMD, Intel, and TPU. Same trade as the silicon underneath — peak performance on one vendor's stack, or portability across everyone's. That is the software map; §7 turns to the networks around this stack we have so far ignored: storage, management, and the frontend.
 
 ## 7. The other planes: frontend, storage, and management
 
@@ -1717,7 +1789,7 @@ The frontend is not one network but a handful, and every one is **conventional E
 
 - **Serving / inference** — user requests reaching model endpoints, **north-south**, behind the usual **L4/L7 load balancers**. This is the *inference* workload of §1.5 seen from the front: a request-response tier no different in shape from any other API service. The cluster behind it is exotic; the load balancing, TLS termination, and health checks are not.
 - **Tenant / VPC** — often not a network concern at all. If you're serving a model, tenants can be separated at the load-balancer level; but if you rent out the GPUs themselves, isolation moves into the fabric — dedicated L2/L3 domains (e.g. **VXLAN / EVPN, per-tenant VPCs**).
-- **Orchestration / control** — the schedulers that place work on GPUs, from opposite worlds. **Slurm** is an **HPC batch scheduler**: jobs wait in a queue, and it reserves *all* the GPUs a job needs **at once** (**gang scheduling**: launch only some ranks of a synchronous run and they block waiting for the rest, holding those GPUs idle — so it reserves the whole set or none), launches them across nodes, runs to completion, then frees them. **Kubernetes** keeps long-running containers alive and elastic — self-healing, autoscaling, rolling updates — what a serving endpoint needs; its scheduler places pods independently, so gang-scheduled training on K8s leans on add-ons (Volcano, Kueue). So the usual split is **training → Slurm, serving → Kubernetes** — a convention, not a rule.
+- **Orchestration / control** — the schedulers that place work on GPUs, from opposite worlds. **Slurm** is an **HPC batch scheduler**: jobs wait in a queue, and it reserves *all* the GPUs a job needs **at once** (**gang scheduling**: launch only some ranks of a synchronous run and they block waiting for the rest, holding those GPUs idle — so it reserves the whole set or none), launches them across nodes, runs to completion, then frees them. **Kubernetes** keeps long-running containers alive and elastic — self-healing, autoscaling, rolling updates — what a serving endpoint needs; its scheduler places pods independently, so gang-scheduled training on K8s leans on add-ons (Volcano, Kueue). So the usual split is **training → Slurm, serving → Kubernetes** — a convention, not a rule. (The serving *software* that rides that Kubernetes — the vLLM / llm-d stack — is §6.3.)
 
 None of this is GPU-specific the way NVLink or RDMA are — it is standard datacenter networking, pointed at an unusually expensive set of servers. What it still owes the cluster is to stay out of the way: a serving tier that stalls, or a scheduler that mis-places a job onto the wrong rail, idles GPUs just as effectively as a slow collective does.
 
@@ -1922,7 +1994,7 @@ The heart of it is a new transport, **UET (Ultra Ethernet Transport)** — a mod
 
 The pitch is InfiniBand's benefits — RDMA, low latency, scale — on open, multi-vendor Ethernet, without RoCE's fabric-tuning burden. A parallel open effort, **MRC** (§4.7 [[16]](#ref-16)), attacks the same ground from the multipath-transport side. Between them, the mechanisms NVIDIA sells inside Spectrum-X become line items in a public spec.
 
-### 9.3 Where it leaves the networker
+### 9.3 Where it leaves the networker (??? probably need rework since this is not the last section)
 
 Line the backers up and the pattern is plain: **UALink, ESUN, and Ultra Ethernet are supported by essentially everyone except NVIDIA** — AMD, Intel, Broadcom, Cisco, Arista, and every hyperscaler. NVIDIA holds the one complete proprietary stack (NVLink, NVSwitch, Quantum InfiniBand, Spectrum-X); the rest of the industry is converging on open standards to break the dependence — and NVIDIA has itself joined some of them (it is a UEC and ESUN member) while keeping its own fabrics intact.
 
@@ -1973,6 +2045,11 @@ AMD is the biggest backer of open interconnects, but it is not the whole open st
 38. <a id="ref-38"></a>UALink Consortium — *UALink 200G 1.0 Specification* (April 2025; switched, memory-semantic scale-up interconnect, 200 GT/s per lane, up to 1,024 accelerators per pod; members incl. AMD, Intel, Google, Microsoft, Meta, AWS, Apple). <https://ualinkconsortium.org/specification/>
 39. <a id="ref-39"></a>Ultra Ethernet Consortium — *UEC Launches Specification 1.0: Transforming Ethernet for AI and HPC at Scale* (June 2025; full-stack redesign — PHY, link, the new Ultra Ethernet Transport (UET) RDMA protocol replacing RoCE, packet spraying, packet trimming, path-aware congestion control). <https://ultraethernet.org/ultra-ethernet-consortium-uec-launches-specification-1-0-transforming-ethernet-for-ai-and-hpc-at-scale/>
 40. <a id="ref-40"></a>Synopsys — *Ethernet Standards for Scale-Up AI: An Overview of ESUN, SUE, and UALink* (ESUN, SUE-T, and UALink form a complementary stack; ESUN standardizes the Ethernet lower layers so vendor scale-up protocols such as UALink can run over commodity Ethernet, or over dedicated UALink switches). <https://www.synopsys.com/articles/ethernet-standards-scale-up-ai.html>
+41. <a id="ref-41"></a>SemiAnalysis — *GB200 Hardware Architecture — Component Supply Chain & BOM* (GB200 NVL72 build: Bianca boards of 2 Blackwell GPUs + 1 Grace CPU, compute trays, NVLink switch trays and copper spine, ConnectX-7 / BlueField-3). <https://newsletter.semianalysis.com/p/gb200-hardware-architecture-and-component>
+42. <a id="ref-42"></a>Wikipedia — *Nvidia DGX* (host-CPU specifications across the DGX line: DGX-1 dual Xeon E5-2698 v4, DGX-2 dual Xeon Platinum 8168, DGX A100 dual EPYC 7742, DGX H100/B200 dual Xeon, GB200 Grace). <https://en.wikipedia.org/wiki/Nvidia_DGX>
+43. <a id="ref-43"></a>NVIDIA — *Vera CPU* (Grace successor: 88 custom Arm "Olympus" cores, 176 threads, NVLink-C2C at 1.8 TB/s; Vera Rubin superchip pairs 1 Vera CPU with 2 Rubin GPUs; production 2026). <https://www.nvidia.com/en-us/data-center/vera-cpu/>
+44. <a id="ref-44"></a>NVIDIA — *GB200 NVL Multi-Node Tuning Guide: Understanding Your Grace-Blackwell Systems* (an NVL72 is 18 compute trays, each an independent OS node with 2 Grace CPUs / 144 cores; trays coordinate over a separate "os-net" management network — not a single system image). <https://docs.nvidia.com/multi-node-nvlink-systems/multi-node-tuning-guide/system.html>
+45. <a id="ref-45"></a>llm-d — *llm-d: Kubernetes-native distributed LLM inference* (open, vLLM-based distributed serving: disaggregated prefill/decode, KV-cache-aware routing, Inference Gateway; uses Envoy and KServe; backed by Red Hat, Google, IBM, NVIDIA, AMD, Intel, and others). <https://github.com/llm-d/llm-d>
 
 # TODO list tracking
 
