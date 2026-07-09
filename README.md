@@ -1646,9 +1646,9 @@ That closes §5, the communication layer: the collectives themselves (§5.2), ho
 
 > Goal: by the end you should have a map of the software between the model and the GPU — where CUDA sits and why it is the lock-in, how model code becomes GPU instructions, and how the training and serving stacks differ.
 
-§1–§5 were hardware and wire: the GPU, NVLink, the RDMA fabric, and the collectives running on it. On top of all that sits a deep stack of software — but a networker needs a map, not a manual, so this chapter stays a map. And the map has a shape you already run: your switches carry the same kind of stack — silicon, a vendor SDK you program it through, feature and protocol libraries, a platform, and the services on top.
+§1–§5 were hardware and wire: the GPU, NVLink, the RDMA fabric, and the collectives running on it. On top of that sits a deep stack of software. To map it with a more familiar network switch, this is silicon up through a vendor SDK, feature and protocol libraries, a platform, and the services on top.
 
-| GPU software                       | the box you already run    |
+| GPU software                       | the switch                 |
 |------------------------------------|----------------------------|
 | model / recipe (Llama, GPT)        | the service you deliver    |
 | framework (PyTorch, JAX)           | the platform you build on  |
@@ -1656,7 +1656,7 @@ That closes §5, the communication layer: the collectives themselves (§5.2), ho
 | CUDA runtime + driver              | the ASIC SDK — the lock-in |
 | GPU + NVLink + NIC (§3-4)          | the ASIC + its ports       |
 
-<p align="center"><em>The GPU software stack, and the same shape on the switch you already run.</em></p>
+<p align="center"><em>The GPU software stack, and the same shape on a network switch.</em></p>
 
 One row carries the chapter: **CUDA is NVIDIA's ASIC SDK — and the moat.** Every layer above is written against it, which is why there is a whole vendor chapter (§8: AMD's ROCm/HIP, Intel's oneAPI) and a standards chapter (§9) devoted to prying it open. The rest of §6 reads the map three ways:
 
@@ -1666,7 +1666,7 @@ One row carries the chapter: **CUDA is NVIDIA's ASIC SDK — and the moat.** Eve
 
 ### 6.1 The stack, from driver to app
 
-Bottom to top, the software above the silicon is five thin layers — and you spend your time in the top two.
+Bottom to top, the software above the silicon is five thin layers.
 
 - **CUDA driver** (kernel mode) — loads compiled code onto the GPU, maps memory, and drives the PCIe/NVLink links. The counterpart of the platform driver beneath your NOS.
 - **CUDA runtime + toolkit** — the programming model: kernels (functions that run on the GPU), **streams** (ordered queues of work — the handles that let compute and communication overlap, §5.1), and device memory. This is the SDK every layer above targets.
