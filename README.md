@@ -2178,6 +2178,25 @@ Now put the ~10–20 ms a closer site can buy against the actual budgets:
 
 So when a pitch says "ultra-low latency AI at the edge", the useful question is *which line of the table is this for?* For anything paced by a human — chat, streaming, voice — inference time dwarfs propagation, and inference keeps getting faster on dedicated silicon; no site move required. Where proximity genuinely pays is machine-timescale work — per-frame budgets, control loops. The vendors increasingly draw the same line themselves: marketing now targets *"real-time, token-intensive"* workloads specifically [[46]](#ref-46), and Akamai's own launch notes that centralized factories keep the best economics for everything else [[49]](#ref-49).
 
+Placement, then. The telco network already has a geography — core DCs, regional/metro sites, aggregation COs and PoPs, cell sites, and beyond them the customer's premises and devices. The **AI edge** — the outermost tier where inference runs — is a cursor along that line, not a fixed place:
+
+```
+   <---------------------------- the telco network ---------------------------->   off-network
+
+   CORE              REGIONAL            EDGE               FAR EDGE           ON-PREM / DEVICE
+   National DC
+   AI factory,       metro               aggregation        cell site,         factory floor,
+   partner DC        DC                  site, CO, PoP      street cabinet     vehicle, handset
+
+                                           < 1 msec            100s usec
+   [==== today's sweet spot  ====]
+   [    for AI Edge deployment   ]
+   [       < 5-10 msec           ] 
+
+```
+
+<p align="center"><em>The AI edge as a cursor along the telco network; the rightmost column is off the network — inference the grid doesn't serve, only trains and updates.</em></p>
+
 This is why the practical sweet spot for positioning the AI edge today is the **regional/national tier**, not the telco edge or far edge — less a latency verdict than an economic one, because the regional site wins on several axes at once:
 
 - **It meets the demand that actually exists.** ~5–10 ms covers every human-timescale row of the table above — today's volume.
@@ -2186,39 +2205,9 @@ This is why the practical sweet spot for positioning the AI edge today is the **
 
 None of this makes the deeper edge wrong — it makes it *demand-driven*. Where a workload genuinely needs it — the machine-timescale row of the table, backhaul-heavy sensor fleets, a factory floor — the business case justifies the site, and the grid's point is precisely to allow both (§10.2). The default just shouldn't be "everywhere": it should be "as central as the workload allows."
 
-### 10.2 The shape of the grid: positioning the AI edge in the telco network
+### 10.2 The shape of the grid: one platform, unequal sites [DRAFT]
 
-Strip the branding and the definition is simple: geographically distributed AI infrastructure, interconnected and operated as a single platform, with each workload placed where it runs best given latency, cost, and policy [[46]](#ref-46).
-
-One term needs pinning before the picture: **the AI edge is not the telco edge.** The telco network already has a geography — core DCs, regional/metro sites, aggregation COs and PoPs, cell sites — and "edge" there names the outer tiers. The **AI edge** is something else: the outermost tier where inference *runs*. It is a cursor the operator positions along that geography, not a fixed place — and the whole §10.1 analysis compresses into one question: **how far out do you push the cursor?**
-
-```
-   <---------------------------------- the telco network ---------------------------------->   off-network
-
-   CORE                REGIONAL             EDGE                 FAR EDGE            ON-PREM / DEVICE
-   AI factory,         national / metro     aggregation site,    cell site,          factory floor,
-   partner DC          DC (10-30 MW)        CO, PoP              street cabinet      vehicle, handset
-
-   frontier serving    multi-tenant         real-time agents,    AI-RAN,             industrial vision,
-   (+ training,        inference, RAG,      sovereign-edge       physical-AI         AGV / robots, AR/VR,
-   out of scope)       fine-tuning          inference            control loops       on-device assistant
-
-   ~10-40 ms           ~5-10 ms             ~1-5 ms              <1 ms               0 (local)
-                      [== today's sweet ==]
-                      [==     spot      ==]
-
-                push the AI-edge cursor outward only as demand justifies -->
-```
-
-<p align="center"><em>The AI edge as a cursor along the telco network — parked today at the regional tier, pushed outward by demand.</em></p>
-
-Reading it left to right:
-
-- **Today the cursor sits at the regional/national tier** — the §10.1.2 sweet spot: the latency covers the business that exists, and the site still has the power, space, operations, and security of a real DC.
-- **The outer tiers are demand-driven, not default.** A CO earns its GPUs when real-time or sovereign-edge workloads show up; a cell site earns them when the RAN itself becomes the tenant (AI-RAN — later in this chapter) or a physical-AI loop needs single-digit milliseconds.
-- **The rightmost column is off the network entirely.** On-prem, on-device, automotive: workloads that need effectively zero latency or must survive disconnection don't get *served from* the grid at all — they bound it. The grid can still train, update, and orchestrate those models; it just doesn't run their inference.
-
-The sites along the cursor's track are *not* uniform — the iron shrinks as it moves out:
+Strip the branding and the definition is simple: geographically distributed AI infrastructure, interconnected and operated as a single platform, with each workload placed where it runs best given latency, cost, and policy [[46]](#ref-46). The sites are *not* uniform — that heterogeneity is the whole point:
 
 ```
         AI FACTORY               REGIONAL SITE             GRID / EDGE SITE
