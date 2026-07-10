@@ -2114,6 +2114,174 @@ Whether the open stack wins is the genuine open question of the field, and this 
 
 AMD is the biggest backer of open interconnects, but it is not the whole open story: the standards themselves — UALink, Ultra Ethernet, SUE — are consortia, and they get their own chapter (§9). Next, §8.3 takes the openness argument to its limit: a chip that drops the special-purpose fabric altogether and runs *both* scales on nothing but Ethernet.
 
+## 10. The AI grid: serving from GSLB to the GPU [DRAFT]
+
+> Goal: by the end you should know what an "AI grid" actually is once the marketing is peeled off — which parts are a real architecture (a request path from GSLB all the way down to the GPU), which claims deserve skepticism (most of the latency ones), and who builds which layer.
+
+Everything so far happened *inside* one site: a scale-up island (§3), a cluster fabric (§4), collectives on it (§5), a software stack (§6), and one fleet layer above the engines (§6.3). The **AI grid** is what the industry calls the next floor up: many such sites — from gigawatt "AI factories" down to a couple of GPUs in a central office — operated as **one logical serving platform**, with a control plane deciding *where* each model runs and *where* each request lands. The term is NVIDIA's, launched at GTC 2026 as a reference design aimed at telcos and distributed-cloud providers [[46]](#ref-46)[[48]](#ref-48); Akamai shipped the first large implementation on its CDN footprint weeks later [[49]](#ref-49). The name carries the pitch: AI factories "generate" tokens the way plants generate power, and the grid "distributes" them.
+
+A networker should feel at home and suspicious at once. At home, because the building blocks are literally ours — GSLB, anycast, L7 routing, health checks, capacity planning; this is the first chapter where the vocabulary needs no translation. Suspicious, because the marketing leans almost entirely on **latency**, and for most AI workloads latency is the *weakest* of the real reasons to distribute. Scope and drivers first — why inference distributes at all, fine print included; then the sites it lands on; then the request path, top to bottom; then the ecosystem.
+
+### 10.1 Inference distributes by necessity, not by choice
+
+**First, the scope: the grid is mostly an *inference* story.** Training concentrates in the factory — it wants the §3–§4 backend (NVLink islands, lossless RDMA, synchronized collectives), machinery that neither crosses a WAN (§10.3) nor fits in a central office. What spreads is **serving**, plus training-adjacent work light enough to follow it (fine-tuning, RAG indexing/embedding) at the larger regional sites. One line to keep: **training concentrates; inference spreads.** Concretely, what a grid moves between sites is requests and model weights — and potentially KV caches, where the serving stack supports shipping them — while the heavy §3–§5 machinery stays inside each site.
+
+**Second, the drivers.** Vendor marketing leads with latency — "AI closer to your users." The stronger reasons run the other way: inference is **pulled** outward by four constraints — three physical, one legal — and proximity-to-user is the *weakest* of them for today's dominant workloads. In rank order of how much they actually explain:
+
+- **Power.** Datacenter capacity is grid-constrained in the major metros: new gigawatt-scale interconnections are blocked or wait years in the queue, and the megawatts that *are* available sit dispersed across many smaller sites. You build compute where power is, and increasingly that is not one place. The telco version — operators already own ~100,000 distributed network sites with room, over time, for 100+ GW of new load [[48]](#ref-48) — is real as an asset inventory; treat "over time" as load-bearing. One academic framing worth keeping: electricity relocates at a *cost* constraint, compute relocates at a *latency* constraint — the grid exists to arbitrage between the two [[56]](#ref-56).
+- **Land and permitting.** Even where the electric grid has headroom, a permitted, powered metro site within reach of a substation is scarce. The geography of usable real estate pushes compute onto footprints that already exist — telco central offices, CDN PoPs, colo halls — because nobody is permitting new ones fast enough. This driver, not speed, is what makes telcos and CDNs the protagonists of this chapter: they are not closer to the user by cleverness, they are *already built and powered* there.
+- **Sovereignty.** The legal driver, and it is sharper than "data must stay in-region." One side: the EU AI Act, GDPR, and sectoral residency rules require some workloads to be processed in-jurisdiction. The other: the US CLOUD Act and FISA 702 make US-headquartered providers compellable to disclose data **regardless of where the server physically sits** — so a US hyperscaler's "sovereign region" answers the *residency* requirement but not the *jurisdiction* one. That gap is a placement constraint no network design removes, and it is much of why operator-owned infrastructure is in this story at all.
+- **Latency and bandwidth — for the right workloads only.** The genuinely latency-bound cases are real; the fine print below sorts them. The bandwidth half is the underrated one: **upstream-heavy** traffic — cameras, lidar, sensors, a 30 MB/s video feed — overwhelms backhaul if every byte must reach a central site, so the inference moves to the data. A bandwidth-economics argument that usually gets dressed up as a latency one.
+
+Those four are the *constraints*. The operator's *objective* inside them is a different number: **cost per token at a latency target** — Akamai's word is "tokenomics" [[49]](#ref-49), and buzzword aside it is the right unit of account. It is also what pooling scarce, unevenly idle GPUs across sites buys (the marketplace layer of §10.4).
+
+**The latency fine print.** Physics first. Light in fiber does ~5 µs/km one-way (~200,000 km/s) — but fiber does not run geodesic. It follows roads, rails, and ducts, and detours through aggregation sites, so inflate the straight-line distance by a factor **β ≈ 2** for a national network — the networker's route-miles-versus-air-miles correction. That gives a simple working rule:
+
+```
+   Latency  ≈  geodesic km × β / 200,000 km/s   ≈   1 ms per 100 km   (β = 2)
+```
+
+Checked against real endpoints (author's measurements, French eyeball network → AWS EU regions) - measurements displays RTT ≈ 2 * Latency -:
+
+```
+   region       geodesic     RTT est (β=2)    RTT measured (ICMP)
+   Paris          345 km        6.9 ms            9.0 ms
+   Frankfurt      880 km       17.6 ms           15.3 ms
+   Zurich         980 km       19.6 ms           17.3 ms
+   Milan        1,275 km       25.5 ms           27.0 ms
+   Stockholm    1,855 km       37.1 ms           37.7 ms
+   London         450 km        9.0 ms           14.7 ms   <- subsea detour
+   Ireland        760 km       15.2 ms           25.0 ms   <- subsea detour
+```
+
+<p align="center"><em>The β=2 rule holds within a few ms wherever the fiber stays on land; subsea paths need a bigger β.</em></p>
+
+The conclusion compresses well: **a few well-chosen national or regional sites put users within ~5–10 ms — and that is where most of the current AI business sits.** A country with a ~1,000 km span reaches every user in ~20 ms RTT from *one* well-placed site; continental scale needs a few more (Dallas→Houston ~7 ms RTT, →Atlanta 23 ms, →NYC 44 ms). The practical sweet spot for distributed inference is the **regional/metro tier**, not the cell site (§10.2).
+
+Now put the ~10–20 ms a closer site can buy against the actual budgets:
+
+| Workload            | Where the time goes                                       | Verdict on ~10–20 ms of RTT                                                            |
+|---------------------|-----------------------------------------------------------|----------------------------------------------------------------------------------------|
+| Chat / copilot      | TTFT 0.2–2 s (prefill + queueing), then seconds of generation | **Noise.**                                                                          |
+| Streaming tokens    | Paced by the GPU, ~20–60 ms per token                     | **Noise** — the network delays the stream exactly once.                                 |
+| Voice agents        | Whole turn ~300–500 ms (ASR + LLM + TTS)                  | **Noise** — a transatlantic phone call (~80 ms RTT) bothers nobody.                     |
+| Video / AR / robots | Per-frame budget 10–33 ms                                 | **Decisive** — the wire alone can blow the budget; inference must be local (and a robot's control loop shouldn't hang off a WAN at all). |
+| Agent loops         | N tool round-trips per task                               | **Multiplied** — the loop pays RTT × N; keep it near its tools and data (a data-gravity argument, not a CDN one). |
+
+<p align="center"><em>The latency claim, audited: decisive on machine timescales, noise on human ones.</em></p>
+
+So when a vendor says "ultra-low latency AI at the edge", the networker's question is *which line of that table are you selling?* For anything paced by a human — chat, streaming, voice — inference time dwarfs propagation, and the inference side keeps improving on its own as dedicated silicon shaves the compute share; no site move required. The CDN-style "closer is faster" pitch is muscle memory from a business where the payload was static. Where the claim holds is machine-timescale work — per-frame budgets, control loops — and agent loops that pay the RTT N times over. The grid vendors know the segmentation too: the honest ones market *"real-time, token-intensive"* workloads specifically [[46]](#ref-46), and even Akamai's launch concedes that centralized factories keep the best economics for everything else [[49]](#ref-49).
+
+### 10.2 The shape of the grid: one platform, unequal sites [DRAFT — to rework: core→edge continuum]
+
+Strip the branding and the definition is simple: geographically distributed AI infrastructure, interconnected and operated as a single platform, with each workload placed where it runs best given latency, cost, and policy [[46]](#ref-46). The sites are *not* uniform — that heterogeneity is the whole point:
+
+```
+        AI FACTORY               REGIONAL SITE             GRID / EDGE SITE
+    (GW-scale campus)          (metro DC, 10-30 MW)      (CO, PoP, cell site)
+   +------------------+       +------------------+      +------------------+
+   | GB300 NVL72 racks|       | HGX / MGX boxes  |      | RTX PRO 6000     |
+   | NVLink + RDMA    |       | smaller fabrics  |      | PCIe only - no   |
+   | (§3-§4)          |       |                  |      | scale-up island  |
+   | train + frontier |       | mid-size serving |      | small / quantized|
+   | serving          |       |                  |      | models           |
+   +--------+---------+       +--------+---------+      +--------+---------+
+            |                          |                         |
+            +==========================+=========================+
+                                       |
+                       one logical platform - "the grid"
+                 placement by policy: latency, cost per token,
+                          sovereignty, available power
+```
+
+<p align="center"><em>An AI grid: heterogeneous sites, from AI factory to cell site, run as one platform.</em></p>
+
+Note what the rightmost column quietly concedes: grid sites run **RTX PRO 6000**-class PCIe servers [[46]](#ref-46)[[49]](#ref-49) — no NVLink fabric, no §3 island — so frontier-size models physically cannot serve there. The edge serves **small or quantized models**; the real trade the grid makes is *latency versus model quality*, and no datasheet shows that axis.
+
+### 10.3 The request path: GSLB to the GPU
+
+Like any network, the grid splits into a slow **placement plane** (which models run where — deployments, capacity, policy) and a fast **request plane** (where each query lands). NVIDIA's reference design names four moving parts — orchestrator, GSLB, LLM router, and Dynamo [[47]](#ref-47) — which stack into a path a networker can read at sight:
+
+```
+        user / device / agent
+                 |
+                 v   step 1: pick a SITE   (DNS-based or anycast)
+   +=========================================================+
+   |  GSLB                                                   |
+   |  ranks sites on health, queue depth, and capacity, fed  |
+   |  by the orchestrator - NOT just on proximity            |
+   +===========================+=============================+
+                               |
+                               v   step 2: inside the chosen site
+   +---------------------------------------------------------+
+   |  AI GATEWAY / LLM ROUTER        (L7, content-aware)     |
+   |  authn + quotas; routes on the PROMPT (cheap model vs   |
+   |  reasoning model); semantic cache: repeat question ->   |
+   |  cached answer, no GPU touched                          |
+   +---------------------------+-----------------------------+
+                               |
+                               v   step 3: pick the GPUs
+   +---------------------------------------------------------+
+   |  FLEET LAYER                (Dynamo / llm-d, §6.3)      |
+   |  KV-cache-aware routing, prefill/decode pools,          |
+   |  autoscaling                                            |
+   +---------------------------+-----------------------------+
+                               |
+                               v   step 4: run it
+   +---------------------------------------------------------+
+   |  ENGINE -> CUDA -> GPU      (§6.3 -> §6.1)              |
+   |  collectives (§5) stay inside; NVLink/RDMA (§3-§4)      |
+   |  below - none of it ever crosses the WAN                |
+   +---------------------------------------------------------+
+
+   placement plane (slow path, offline):
+   GRID ORCHESTRATOR (Kubernetes-based) decides WHICH models run
+   WHERE; intent + policy engines translate SLAs into placement;
+   an SDN controller stitches the sites; heartbeats trigger
+   re-provisioning when a node dies
+```
+
+<p align="center"><em>The AI grid request path: GSLB picks the site, the LLM router picks the model, the fleet layer picks the GPUs.</em></p>
+
+Reading it as a networker:
+
+- **GSLB is GSLB.** DNS-based or anycast (Gcore literally fronts its inference with anycast endpoints and "smart routing" over its CDN PoPs [[50]](#ref-50)) — the only novelty is that the ranking must be **capacity- and queue-aware**, fed by the orchestrator: *nearest* is the wrong answer when nearest has a queue, and with GPUs it usually does. Queueing beats proximity; §10.1 already told you why.
+- **The LLM router is content-based L7 routing** where the "header" is the prompt itself: classify the request, send small talk to a small model on a cheap node and hard reasoning to the big cluster, and serve repeats from a **semantic cache** without touching a GPU [[47]](#ref-47). A CDN with a classifier bolted on the front.
+- **The fleet layer is §6.3, unchanged.** Dynamo or llm-d, doing KV-aware routing and prefill/decode disaggregation inside the site. The grid is one tier *above* it, not a replacement for it.
+- **The whole request plane is N-S traffic** (§1.4, §7.1), riding the frontend network on CPUs. What crosses *between* sites is requests, model weights, container images, telemetry, and increasingly KV caches — bulk transfers over ordinary WAN. **Collectives never cross the WAN**; the §3-§5 machinery stays entirely inside each site.
+- **The orchestrator is the NMS/controller** — inventory, health, placement, policy. Sovereignty shows up here as a routing constraint ("this tenant's requests may only land on EU sites"), which is to say: policy routing, enforced at request time [[47]](#ref-47).
+
+### 10.4 The ecosystem: who builds which layer
+
+The grid is a stack of businesses as much as a stack of software:
+
+```
+   +--------------------------------------------------------------+
+   |  marketplace / aggregation:   NVIDIA DGX Cloud Lepton -      |
+   |  one API and billing layer over many providers' capacity     |
+   +--------------------------------------------------------------+
+   |  grid control plane:   NVIDIA AI grid reference design;      |
+   |  Akamai's orchestrator; Gcore Smart Routing                  |
+   +--------------------------------------------------------------+
+   |  cloudification software:   Rafay GPU PaaS (tenants,         |
+   |  quotas, billing); Gcore AI Cloud Stack (sold to telcos)     |
+   +--------------------------------------------------------------+
+   |  sites & iron:   neoclouds (Nscale, CoreWeave, ...);         |
+   |  telco COs; CDN PoPs (Akamai, Gcore); far edge (Armada)      |
+   +--------------------------------------------------------------+
+   |  power & land:   where the megawatts actually are            |
+   +--------------------------------------------------------------+
+```
+
+<p align="center"><em>The AI grid as a stack of businesses: power at the bottom, a marketplace at the top.</em></p>
+
+- **NVIDIA** sells the map and the toll booth: the reference design [[46]](#ref-46)[[47]](#ref-47), the two-tier hardware story (NVL72 factories, RTX PRO grid sites), Dynamo — and **DGX Cloud Lepton**, a marketplace that aggregates neocloud capacity (CoreWeave, Lambda, Nebius, Nscale, even AWS and Azure) behind one API, with region pinning for sovereignty [[51]](#ref-51). The honest note: Lepton puts NVIDIA *between* you and the provider — a broker with a curated partner list and its own margin, run by the company that also sells those partners their hardware. Useful, and worth pricing against going direct.
+- **The CDN players are the closest thing to an operating AI grid**, because they already own the request plane. **Akamai** is the first NVIDIA AI grid implementation: RTX PRO 6000 fleets across its ~4,400-location footprint, with an orchestrator brokering each request across edge, regional, and core on cost and latency [[49]](#ref-49). **Gcore** runs the same play (Everywhere Inference: anycast + smart routing over 180+ locations [[50]](#ref-50)) and additionally *sells the software* — its AI Cloud Stack turns a telco's raw GPU clusters into a sellable cloud. Their pitch is the CDN playbook re-run on GPUs; every latency claim in it should be read against the §10.1 table.
+- **The neoclouds are the iron.** **Nscale** is the exemplar of the vertically integrated kind — it owns the land, power, datacenter, cluster, and stack ("ground to cloud"), much of it on Nordic hydro [[54]](#ref-54), and it is contracted for roughly 200,000 GB300s for Microsoft across the UK, Norway, Portugal, and Texas [[55]](#ref-55). Read that deal plainly: a hyperscaler renting capacity it cannot build fast enough. The neocloud business is a **power-and-shell play** first; most neoclouds then plug into someone else's grid as big regional nodes (many are Lepton partners) rather than running a request plane of their own.
+- **The software providers fill the layers the iron people don't have.** **Rafay** is the GPU PaaS: multi-tenancy, quotas, self-service, token-metered billing, a white-label portal — the BSS/OSS that turns a cluster into a cloud; NVIDIA-validated and running under Yotta, Cassava, and Firmus [[52]](#ref-52). **Armada** is the far edge: Galleon containerized datacenters from suitcase-size to the megawatt-scale Leviathan, managed by its Atlas control plane, with Starlink as backhaul [[53]](#ref-53) — the end of the spectrum where "edge" is not a latency argument at all but a **connectivity** one: the data physically cannot reach a region, so the compute goes to the data.
+
+Where this leaves the networker: the grid is real as an architecture and young as a market — the reference design itself warns its components will keep moving [[47]](#ref-47). But its request plane is built from parts we have run for twenty years, and the two questions that cut through every deck are ours to ask: *which latency, exactly* — and *who is paying for the idle GPUs when the routing is wrong?*
+
 
 ## References
 
@@ -2162,6 +2330,17 @@ AMD is the biggest backer of open interconnects, but it is not the whole open st
 43. <a id="ref-43"></a>NVIDIA — *Vera CPU* (Grace successor: 88 custom Arm "Olympus" cores, 176 threads, NVLink-C2C at 1.8 TB/s; Vera Rubin superchip pairs 1 Vera CPU with 2 Rubin GPUs; production 2026). <https://www.nvidia.com/en-us/data-center/vera-cpu/>
 44. <a id="ref-44"></a>NVIDIA — *GB200 NVL Multi-Node Tuning Guide: Understanding Your Grace-Blackwell Systems* (an NVL72 is 18 compute trays, each an independent OS node with 2 Grace CPUs / 144 cores; trays coordinate over a separate "os-net" management network — not a single system image). <https://docs.nvidia.com/multi-node-nvlink-systems/multi-node-tuning-guide/system.html>
 45. <a id="ref-45"></a>llm-d — *llm-d: Kubernetes-native distributed LLM inference* (open, vLLM-based distributed serving: disaggregated prefill/decode, KV-cache-aware routing, Inference Gateway; uses Envoy and KServe; backed by Red Hat, Google, IBM, NVIDIA, AMD, Intel, and others). <https://github.com/llm-d/llm-d>
+46. <a id="ref-46"></a>NVIDIA — *What Is an AI Grid?* (glossary: geographically distributed, interconnected AI infrastructure operated as one platform; nodes from AI factories to regional PoPs, central offices, and cell sites; RTX PRO 6000 at grid sites). <https://www.nvidia.com/en-us/glossary/ai-grid/>
+47. <a id="ref-47"></a>NVIDIA — *AI Grid Reference Design: Control Plane Design* (the four components: Kubernetes-based grid orchestrator with intent/policy engines and SDN controller, GSLB, prompt-aware LLM routers with semantic caching, Dynamo; SLA- and KV-cache-aware routing; sovereignty enforced as a routing constraint). <https://docs.nvidia.com/ai-grid/whitepapers/ai-grid-reference-design/control_plane_design.html>
+48. <a id="ref-48"></a>NVIDIA — *Telecom Leaders Build AI Grids* (GTC 2026 launch; ~100,000 distributed network datacenters worldwide with claimed room for 100+ GW of AI capacity over time; AT&T/Cisco AI grid for IoT; AI-RAN as a grid workload). <https://blogs.nvidia.com/blog/telecom-ai-grids-inference/>
+49. <a id="ref-49"></a>Akamai — *Akamai Launches AI Grid* (first global-scale implementation of the NVIDIA AI Grid reference design: RTX PRO 6000 fleets across ~4,400 edge locations; an orchestrator brokering requests across edge/regional/core on cost per token, TTFT, and latency; concedes centralized factories keep the best economics for training and frontier serving). <https://www.akamai.com/newsroom/press-release/akamai-launches-ai-grid-intelligent-orchestration-for-distributed-inference-across-4400-edge-locations>
+50. <a id="ref-50"></a>Gcore — *Everywhere Inference documentation* (edge inference across 180+ locations; anycast endpoints with Smart Routing selecting the closest region through a single endpoint). <https://gcore.com/docs/edge-ai/everywhere-inference>
+51. <a id="ref-51"></a>NVIDIA — *DGX Cloud Lepton* (compute marketplace aggregating GPU capacity from NVIDIA Cloud Partners — CoreWeave, Crusoe, Lambda, Nebius, Nscale, and others, plus AWS and Azure — behind one platform; region pinning for sovereignty and latency). <https://www.nvidia.com/en-us/data-center/dgx-cloud-lepton/>
+52. <a id="ref-52"></a>Rafay — *GPU PaaS for Neoclouds* (turns raw GPU clusters into multi-tenant clouds: self-service consumption, SKU automation, billing APIs, white-label portal, token-metered services; NVIDIA AI Cloud-Ready validated; runs Yotta, Cassava, Firmus). <https://rafay.co/solutions/gpu-paas-for-neoclouds>
+53. <a id="ref-53"></a>Armada — *Armada Edge Platform* (Galleon ruggedized containerized datacenters from suitcase-size Beacon to megawatt-scale Leviathan; Atlas fleet control plane; Starlink backhaul for disconnected sites). <https://www.armada.ai/>
+54. <a id="ref-54"></a>strategy+business — *How neocloud Nscale is navigating the AI infrastructure boom* (vertically integrated "ground to cloud" model: ownership of datacenters, power, cooling, networking, hardware, and software, versus neoclouds renting colocation; sovereignty as the differentiator). <https://www.strategy-business.com/article/How-neocloud-Nscale-is-navigating-the-AI-infrastructure-boom>
+55. <a id="ref-55"></a>Introl — *Microsoft's $60B Neocloud Bet* (Microsoft's ~$23B commitment to Nscale for roughly 200,000 GB300 GPUs across the UK, Norway, Portugal, and Texas, within $60B+ of neocloud capacity deals driven by Azure's capacity shortfall). <https://introl.com/blog/microsoft-60-billion-neocloud-spending-capacity-crunch-december-2025>
+56. <a id="ref-56"></a>arXiv — *AI Inference as Relocatable Electricity Demand* (the structural asymmetry: electricity transmission is cost-constrained while compute relocation is latency-constrained, implying a hierarchical geography of inference infrastructure). <https://arxiv.org/pdf/2604.27855>
 
 # TODO list tracking
 
