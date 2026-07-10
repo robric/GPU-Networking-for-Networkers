@@ -1642,7 +1642,7 @@ That KV-cache hand-off is a **bulk point-to-point** flow — one worker to one, 
 
 That closes §5, the communication layer: the collectives themselves (§5.2), how they ride the wire (§5.3), and how the traffic reshapes from training to serving (§5.4). What *drives* these collectives — the CUDA / NCCL software stack — is §6.
 
-## 6. The software stack: from the model to the silicon [DRAFT]
+## 6. The software stack: from the model to the silicon
 
 > Goal: by the end you should have a map of the software between the model and the GPU — where CUDA sits and why it is the lock-in, how model code becomes GPU instructions, and how the training and serving stacks differ.
 
@@ -2137,7 +2137,9 @@ Vendor marketing leads with latency — "AI closer to your users." The stronger 
 
 Those four are the *constraints*. The operator's *objective* inside them is a different number: **cost per token at a latency target** — Akamai's word is "tokenomics" [[49]](#ref-49), and buzzword aside it is the right unit of account. It is also what pooling scarce, unevenly idle GPUs across sites buys (the marketplace layer of §10.4).
 
-#### 10.1.2 The latency claim, audited
+#### 10.1.2 How far out? Latency and the placement of the AI edge
+
+Latency gets its own section because it is so often positioned as *the* driver of the AI grid — the headline of nearly every edge pitch — while §10.1.1 ranked it last. This is the audit behind that ranking: what distance actually costs, and which workloads care.
 
 Physics first. Light in fiber does ~5 µs/km one-way (~200,000 km/s) — but fiber does not run geodesic. It follows roads, rails, and ducts, and detours through aggregation sites, so inflate the straight-line distance by a factor **β ≈ 2** for a national network — the networker's route-miles-versus-air-miles correction. That gives a simple working rule:
 
@@ -2174,7 +2176,7 @@ Now put the ~10–20 ms a closer site can buy against the actual budgets:
 
 <p align="center"><em>Decisive on machine timescales, noise on human ones.</em></p>
 
-So when a vendor says "ultra-low latency AI at the edge", the networker's question is *which line of that table are you selling?* For anything paced by a human — chat, streaming, voice — inference time dwarfs propagation, and the inference side keeps improving on its own as dedicated silicon shaves the compute share; no site move required. The CDN-style "closer is faster" pitch is muscle memory from a business where the payload was static. Where the claim holds is machine-timescale work — per-frame budgets, control loops — and agent loops that pay the RTT N times over. The grid vendors know the segmentation too: the honest ones market *"real-time, token-intensive"* workloads specifically [[46]](#ref-46), and even Akamai's launch concedes that centralized factories keep the best economics for everything else [[49]](#ref-49).
+So when a pitch says "ultra-low latency AI at the edge", the useful question is *which line of the table is this for?* For anything paced by a human — chat, streaming, voice — inference time dwarfs propagation, and inference keeps getting faster on dedicated silicon; no site move required. Where proximity genuinely pays is machine-timescale work — per-frame budgets, control loops. The vendors increasingly draw the same line themselves: marketing now targets *"real-time, token-intensive"* workloads specifically [[46]](#ref-46), and Akamai's own launch notes that centralized factories keep the best economics for everything else [[49]](#ref-49).
 
 This is why the practical sweet spot for positioning the AI edge today is the **regional/national tier**, not the telco edge or far edge — less a latency verdict than an economic one, because the regional site wins on several axes at once:
 
@@ -2182,11 +2184,41 @@ This is why the practical sweet spot for positioning the AI edge today is the **
 - **It keeps the practicalities of a large site.** Power and cooling headroom (GPU racks run 40–120 kW), rack space, on-site operations and spares, established security and compliance procedures, rich fiber and peering — none of which a street cabinet or cell site offers.
 - **It pools demand.** Fewer, larger sites aggregate a whole region's requests, so the same GPUs run hotter and cost per token drops. A GPU at a cell site serves a neighborhood and idles; a regional pool gets back the statistical multiplexing that §4.4 said a single training job loses — inference at scale recovers it, but only where requests concentrate.
 
-None of this makes the deeper edge wrong — it makes it *demand-driven*. Where a workload genuinely needs it — the machine-timescale rows, backhaul-heavy sensor fleets, a factory floor — the business case justifies the site, and the grid's point is precisely to allow both (§10.2). The default just shouldn't be "everywhere": it should be "as central as the workload allows."
+None of this makes the deeper edge wrong — it makes it *demand-driven*. Where a workload genuinely needs it — the machine-timescale row of the table, backhaul-heavy sensor fleets, a factory floor — the business case justifies the site, and the grid's point is precisely to allow both (§10.2). The default just shouldn't be "everywhere": it should be "as central as the workload allows."
 
-### 10.2 The shape of the grid: one platform, unequal sites [DRAFT — to rework: core→edge continuum]
+### 10.2 The shape of the grid: positioning the AI edge in the telco network
 
-Strip the branding and the definition is simple: geographically distributed AI infrastructure, interconnected and operated as a single platform, with each workload placed where it runs best given latency, cost, and policy [[46]](#ref-46). The sites are *not* uniform — that heterogeneity is the whole point:
+Strip the branding and the definition is simple: geographically distributed AI infrastructure, interconnected and operated as a single platform, with each workload placed where it runs best given latency, cost, and policy [[46]](#ref-46).
+
+One term needs pinning before the picture: **the AI edge is not the telco edge.** The telco network already has a geography — core DCs, regional/metro sites, aggregation COs and PoPs, cell sites — and "edge" there names the outer tiers. The **AI edge** is something else: the outermost tier where inference *runs*. It is a cursor the operator positions along that geography, not a fixed place — and the whole §10.1 analysis compresses into one question: **how far out do you push the cursor?**
+
+```
+   <---------------------------------- the telco network ---------------------------------->   off-network
+
+   CORE                REGIONAL             EDGE                 FAR EDGE            ON-PREM / DEVICE
+   AI factory,         national / metro     aggregation site,    cell site,          factory floor,
+   partner DC          DC (10-30 MW)        CO, PoP              street cabinet      vehicle, handset
+
+   frontier serving    multi-tenant         real-time agents,    AI-RAN,             industrial vision,
+   (+ training,        inference, RAG,      sovereign-edge       physical-AI         AGV / robots, AR/VR,
+   out of scope)       fine-tuning          inference            control loops       on-device assistant
+
+   ~10-40 ms           ~5-10 ms             ~1-5 ms              <1 ms               0 (local)
+                      [== today's sweet ==]
+                      [==     spot      ==]
+
+                push the AI-edge cursor outward only as demand justifies -->
+```
+
+<p align="center"><em>The AI edge as a cursor along the telco network — parked today at the regional tier, pushed outward by demand.</em></p>
+
+Reading it left to right:
+
+- **Today the cursor sits at the regional/national tier** — the §10.1.2 sweet spot: the latency covers the business that exists, and the site still has the power, space, operations, and security of a real DC.
+- **The outer tiers are demand-driven, not default.** A CO earns its GPUs when real-time or sovereign-edge workloads show up; a cell site earns them when the RAN itself becomes the tenant (AI-RAN — later in this chapter) or a physical-AI loop needs single-digit milliseconds.
+- **The rightmost column is off the network entirely.** On-prem, on-device, automotive: workloads that need effectively zero latency or must survive disconnection don't get *served from* the grid at all — they bound it. The grid can still train, update, and orchestrate those models; it just doesn't run their inference.
+
+The sites along the cursor's track are *not* uniform — the iron shrinks as it moves out:
 
 ```
         AI FACTORY               REGIONAL SITE             GRID / EDGE SITE
@@ -2208,9 +2240,9 @@ Strip the branding and the definition is simple: geographically distributed AI i
 
 <p align="center"><em>An AI grid: heterogeneous sites, from AI factory to cell site, run as one platform.</em></p>
 
-Note what the rightmost column quietly concedes: grid sites run **RTX PRO 6000**-class PCIe servers [[46]](#ref-46)[[49]](#ref-49) — no NVLink fabric, no §3 island — so frontier-size models physically cannot serve there. The edge serves **small or quantized models**; the real trade the grid makes is *latency versus model quality*, and no datasheet shows that axis.
+Note what the edge-site column quietly concedes: grid sites run **RTX PRO 6000**-class PCIe servers [[46]](#ref-46)[[49]](#ref-49) — no NVLink fabric, no §3 island — so frontier-size models physically cannot serve there. The edge serves **small or quantized models**; the real trade the grid makes is *latency versus model quality*, and no datasheet shows that axis.
 
-### 10.3 The request path: GSLB to the GPU
+### 10.3 The request path: GSLB to the GPU [DRAFT]
 
 Like any network, the grid splits into a slow **placement plane** (which models run where — deployments, capacity, policy) and a fast **request plane** (where each query lands). NVIDIA's reference design names four moving parts — orchestrator, GSLB, LLM router, and Dynamo [[47]](#ref-47) — which stack into a path a networker can read at sight:
 
