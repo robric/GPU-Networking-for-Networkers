@@ -27,9 +27,8 @@ The golden rule for the whole document: **whenever something looks like magic, w
     - [1.5.2 The other axis: how much CPU per GPU](#152-the-other-axis-how-much-cpu-per-gpu)
   - [1.6 The picture so far](#16-the-picture-so-far)
 - [2. GPU Networking, the big picture: two fundamentally different problems](#2-gpu-networking-the-big-picture-two-fundamentally-different-problems)
-  - [2.1 Scale-up vs scale-out](#21-scale-up-vs-scale-out)
-  - [2.2 A picture to anchor everything](#22-a-picture-to-anchor-everything)
-  - [2.3 Why two layers at all? (the networking intuition)](#23-why-two-layers-at-all-the-networking-intuition)
+  - [2.1 The three scales: up, out, and across](#21-the-three-scales-up-out-and-across)
+  - [2.2 Why two layers at all? (the networking intuition)](#22-why-two-layers-at-all-the-networking-intuition)
 - [3. Scale-up: the NVLink fabric](#3-scale-up-the-nvlink-fabric)
   - [3.1 The problem NVLink solves](#31-the-problem-nvlink-solves)
   - [3.2 NVLink as a link: lanes, sublinks, and how to read a spec sheet](#32-nvlink-as-a-link-lanes-sublinks-and-how-to-read-a-spec-sheet)
@@ -58,7 +57,7 @@ The golden rule for the whole document: **whenever something looks like magic, w
   - [5.2 The catalog: what each collective does to a tensor](#52-the-catalog-what-each-collective-does-to-a-tensor)
   - [5.3 On the wire: ring, tree, and letting the switch do the math](#53-on-the-wire-ring-tree-and-letting-the-switch-do-the-math)
   - [5.4 Two workloads, two traffic shapes: training vs inference](#54-two-workloads-two-traffic-shapes-training-vs-inference)
-- [6. The software stack: from the model to the silicon](#6-the-software-stack-from-the-model-to-the-silicon-draft)
+- [6. The software stack: from the model to the silicon](#6-the-software-stack-from-the-model-to-the-silicon)
   - [6.1 The stack, from driver to app](#61-the-stack-from-driver-to-app)
   - [6.2 How code becomes GPU instructions](#62-how-code-becomes-gpu-instructions)
   - [6.3 Two software worlds: training and serving](#63-two-software-worlds-training-and-serving)
@@ -81,7 +80,18 @@ The golden rule for the whole document: **whenever something looks like magic, w
 
 ## 1. The landscape: the GPU and the networks around it
 
-Before we can talk about how GPUs *network*, we need two things: the bare minimum about what a GPU *is* (1.1–1.3), then the wider map — the **several different networks** an AI data center actually runs (1.4), the **workloads** that drive their traffic (1.5), and a **one-paragraph recap** (1.6). The GPU bits are the *just enough* version — no warps, no occupancy, no kernel tuning. If you already know what an SM, HBM and `cuda:0` are, jump to 1.4.
+> Goal: by the end you should have just enough GPU vocabulary — SM, HBM, host vs device — to read the rest without stumbling, plus the map of the networks around it and the workloads that drive them.
+
+Before we can talk about how GPUs *network*, we need two things: the bare minimum about what a GPU *is*, then the wider map of the networks around it. The GPU bits are the *just enough* version — no warps, no occupancy, no kernel tuning. If you already know what an SM, HBM and `cuda:0` are, jump to §1.4.
+
+The landscape, in six steps:
+
+- **§1.1** — why GPUs run the show, and what the CPU still does.
+- **§1.2** — what a GPU looks like, and the words for its parts.
+- **§1.3** — host vs device: the GPU inside a server.
+- **§1.4** — the several networks an AI data center runs, in two categories.
+- **§1.5** — the two workloads that drive their traffic.
+- **§1.6** — a one-paragraph recap.
 
 ### 1.1 Why GPUs run the show (and what the CPU still does)
 
@@ -321,15 +331,16 @@ So the *ratio* is a design variable set by CPU core-density, GPU packing, and ar
 
 ## 2. GPU Networking, the big picture: two fundamentally different problems
 
+> Goal: by the end you should be able to tell **scale-up**, **scale-out**, and **scale-across** apart — what each is for, why the first two are different problems and not one fabric at two sizes, and why the third is only the second pulled long.
+
 When we say "GPU networking", we are actually talking about **two different interconnects** solving **two different problems** — plus a **third scale** (**scale-across**) that appears once a single cluster outgrows one building. Almost every confusion in this space comes from mixing the first two up, so before anything else we separate them cleanly.
 
-We do it in three steps:
+We do it in two steps:
 
-- **§2.1** — scale-up vs scale-out, side by side.
-- **§2.2** — one picture to anchor the whole document.
-- **§2.3** — why two layers at all, in networking terms.
+- **§2.1** — the three scales, and one picture to anchor them.
+- **§2.2** — why two layers at all, in networking terms.
 
-### 2.1 Scale-up vs scale-out
+### 2.1 The three scales: up, out, and across
 
 - **Scale-up** = bind a *small number* of GPUs (8, 72, …) into a single **tightly-coupled shared-memory domain** — one global address space, memory-speed sharing — so they can cooperate on one problem *as if* they were one giant GPU. Note the *as if*: software still sees N distinct GPUs (the `cuda:0…` from §1.3), each with its own memory and scheduler; the fabric just makes "pretending" cheap. This is **NVLink / NVSwitch** territory.
 - **Scale-out** = connect a *large number* of those domains together into a *cluster* of thousands or tens of thousands of GPUs, using a packet-switched network. This is **InfiniBand / RoCE-over-Ethernet** territory, and it is the part that looks most like the networking you already know.
@@ -341,7 +352,7 @@ A useful mental model from the networking world:
 
 Inside a chassis, line cards talk over a backplane that is fast, short, lossless and dumb-simple to reason about. Between chassis, you build a Clos fabric with cables, optics, switches, congestion control and routing. GPUs have exactly the same two layers.
 
-### 2.2 A picture to anchor everything
+One picture anchors all three, and the whole document hangs off it:
 
 ```
                         ---  SCALE-OUT  ---
@@ -384,7 +395,7 @@ Inside a chassis, line cards talk over a backplane that is fast, short, lossless
 
 Two interconnects, two units even (GB/s vs Gb/s — note the capital B vs little b, we'll come back to that). Keep them separate in your head and 80% of the confusion disappears.
 
-### 2.3 Why two layers at all? (the networking intuition)
+### 2.2 Why two layers at all? (the networking intuition)
 
 Because the two problems have opposite requirements:
 
@@ -400,6 +411,8 @@ Because the two problems have opposite requirements:
 | Looks like…         | NUMA / shared-memory           |                                   |
 |                     | multiprocessor                 | A Clos data-center network        |
 
+Scale-across has no column of its own because it would mostly copy the second one: same messages, same RDMA, same Clos. What stretches is distance and latency — tens to thousands of km, milliseconds not microseconds — which is enough to change *which traffic* you dare put on it, and nothing else. That's §4.6.5.
+
 You *cannot* build a 100,000-GPU machine entirely out of scale-up — the physics (distance, power, radix) won't let you. And you *don't want* to run tightly-coupled memory traffic over a routed packet network if you can avoid it — it's too slow. So you use the fast, dumb, short fabric where you can (scale-up), and the smart, routed, long fabric where you must (scale-out).
 
 This document tackles **scale-up first** (NVLink), then scale-out later.
@@ -410,7 +423,7 @@ This document tackles **scale-up first** (NVLink), then scale-out later.
 
 ## 3. Scale-up: the NVLink fabric
 
-> Goal of this section: by the end you should be able to explain, to another networking person, what NVLink *is*, what problem it solves, and why it is **not** just "a faster PCIe" and **not** quite "an Ethernet for GPUs" either.
+> Goal: by the end you should be able to explain, to another networking person, what NVLink *is*, what problem it solves, and why it is **not** just "a faster PCIe" and **not** quite "an Ethernet for GPUs" either.
 
 NVLink, in seven steps:
 
@@ -443,7 +456,7 @@ Here's the whole motivation in one table — one GPU's view of its three options
 | **Peer GPU over NVLink**           | ~900–1,800 GB/s    | ~¼ – ½             |
 | **Peer GPU over PCIe Gen5**        | ~128 GB/s (aggr.)  | ~1/30 – 1/60       |
 
-That middle row is the entire point of NVLink: it drags "another GPU's memory" from *60× slower than local* up to *2–4× slower than local* — close enough that treating the whole group as one big pool of memory actually works. (Note the units callback from §2.2: HBM and NVLink are quoted in **GB/s**, the scale-out network later will be in **Gb/s** — a factor-of-8 trap waiting for the unwary.)
+That middle row is the entire point of NVLink: it drags "another GPU's memory" from *60× slower than local* up to *2–4× slower than local* — close enough that treating the whole group as one big pool of memory actually works. (Note the units callback from §2.1: HBM and NVLink are quoted in **GB/s**, the scale-out network later will be in **Gb/s** — a factor-of-8 trap waiting for the unwary.)
 
 > **One-line version:** PCIe is a slow tree to the CPU; NVLink is a fast mesh between GPUs. Scale-up is the art of making "remote HBM" almost as cheap as "local HBM."
 
@@ -498,7 +511,7 @@ Map this to networking and it's familiar territory:
 **How to read the spec sheet without getting fooled.** NVIDIA quotes NVLink bandwidth as what it calls **"bidirectional"** — every link, both directions (TX + RX), summed. Heads-up: that is *not* how a networker uses the word. To us "bidirectional / full-duplex" is a property of the link, and we quote bandwidth **per direction**; the TX+RX sum we'd call **aggregate** or **total**. NVIDIA's "bidirectional" = your "aggregate." This naming gap is the source of 90% of the confusion when comparing NVLink to a NIC:
 
 - **"Bidirectional" (NVIDIA) = aggregate TX+RX, not per-direction.** "900 GB/s" on an H100 is the TX+RX sum — i.e. **450 GB/s per direction**. A NIC quoted as "400G" is already **per-direction** (400 Gbit/s each way). So normalize first: H100 NVLink is ~3,600 Gbit/s *per direction* vs a 400G NIC's 400 — about **9× per direction**, not the ~18× the raw headlines imply.
-- **GB/s, not Gb/s.** NVLink is **bytes**, NICs are **bits** — a factor of 8 (the §2.2 trap). 900 GB/s = 7,200 Gb/s.
+- **GB/s, not Gb/s.** NVLink is **bytes**, NICs are **bits** — a factor of 8 (the §2.1 trap). 900 GB/s = 7,200 Gb/s.
 - **Per-link vs per-GPU.** A spec might say "50 GB/s per link" *or* "900 GB/s per GPU." Same chip — just multiply by the 18 links.
 
 †*Pairs-per-sub-link is well-documented as 8 for 1.0/2.0 and 4 from 3.0 on; the exact lane signaling rate of the newest gens varies by source, so treat that detail as approximate. The per-link and per-GPU totals are the solid, NVIDIA-published numbers.*
@@ -1501,7 +1514,7 @@ That completes the scale-out *transport* story: how bytes cross the cluster with
 
 ## 5. Collectives: the traffic the fabric carries
 
-> Goal of this section: by the end you should be able to name the handful of group operations every training and inference job is built from, say what each one does to a tensor, and picture how it lands on the wire — ring versus tree, and when the switch itself does the math.
+> Goal: by the end you should be able to name the handful of group operations every training and inference job is built from, say what each one does to a tensor, and picture how it lands on the wire — ring versus tree, and when the switch itself does the math.
 
 §3 and §4 built the roads — a memory fabric inside the island, a packet fabric between islands. This section is the traffic on them, and the traffic is not arbitrary. Most of it is a **small, fixed vocabulary of group operations** called **collectives**; the rest is plain **point-to-point** send/receive — one rank to one rank, the ordinary transfer you already know (a pipeline-stage handoff, or an inference KV-cache transfer). Learn the handful of collectives plus that one exception and you know essentially every byte the fabric carries.
 
@@ -1934,9 +1947,18 @@ That completes the §1.4 map — frontend (§7.1), storage (§7.2), and this man
 
 ## 8. The vendor landscape: AMD, Intel, and the hyperscalers
 
+> Goal: by the end you should be able to map AMD, Intel, and the hyperscalers onto the same architecture §3–§7 built on NVIDIA — and see that what separates them is not the shape but how open each one bets.
+
 Almost every concrete *product* in this document — NVLink, NVSwitch, NCCL, CUDA, Spectrum-X, GPUDirect — has been NVIDIA's. That was deliberate: NVIDIA is the **worked example**, the one vendor whose stack is complete and documented end to end. But the *architecture* is universal — scale-up domains, a scale-out fabric, collectives over both — and everyone else builds the same shape from different parts. What really separates them is a **philosophy about how open to be**, and that is the axis this chapter runs along:
 
 > **NVIDIA** — vertically integrated, proprietary top to bottom. **→ AMD** — its own silicon, but betting on *open* interconnect standards. **→ Intel Gaudi** — commodity Ethernet, all the way down.
+
+The vendor landscape, in four steps:
+
+- **§8.1** — the same shape, different names: NVIDIA and AMD, layer for layer.
+- **§8.2** — AMD: no switch silicon, and why that forces the open bet.
+- **§8.3** — Intel Gaudi: one Ethernet fabric for both scales.
+- **§8.4** — the hyperscalers: custom silicon, off the openness axis.
 
 ### 8.1 The same shape, different names
 
@@ -2057,6 +2079,8 @@ Which sets up the last question of the chapter. Several of these same hyperscale
 
 ## 9. Open standards: the fabric without the vendor
 
+> Goal: by the end you should know what the open answer to each of NVIDIA's two fabrics actually is, how far along it is, and what is still undecided.
+
 Every fabric in this document has carried a brand — NVLink, NVSwitch, InfiniBand, Spectrum-X, Quantum, CUDA. §8 showed that the *architecture* outlives the brand: AMD, Intel, and the hyperscalers all build the same scale-up-domain-plus-scale-out-fabric shape from their own parts. This last chapter is about the other way out of the lock-in — not a rival vendor's stack, but an **open standard** that any vendor's accelerators can share, the way Ethernet and IP ended the proprietary-networking era decades ago.
 
 There are two fronts, one open answer to each of NVIDIA's two proprietary interconnects:
@@ -2067,6 +2091,12 @@ There are two fronts, one open answer to each of NVIDIA's two proprietary interc
 | Scale-out   | InfiniBand (Quantum)         | **Ultra Ethernet** (UEC / UET)                           |
 
 This is the chapter with the most familiar shape for a networker: it is the industry doing to the AI fabric what it once did to the enterprise network — replacing single-vendor interconnects with multi-vendor standards, betting that open economics win in the end.
+
+Open standards, in three steps:
+
+- **§9.1** — the scale-up front: UALink, ESUN, and the switch nobody is building.
+- **§9.2** — the scale-out front: Ultra Ethernet and the UET transport.
+- **§9.3** — where it leaves the networker.
 
 ### 9.1 The scale-up front: answering NVLink
 
@@ -2106,6 +2136,7 @@ The heart of it is a new transport, **UET (Ultra Ethernet Transport)** — a mod
 
 The pitch is InfiniBand's benefits — RDMA, low latency, scale — on open, multi-vendor Ethernet, without RoCE's fabric-tuning burden. A parallel open effort, **MRC** (§4.7 [[16]](#ref-16)), attacks the same ground from the multipath-transport side. Between them, the mechanisms NVIDIA sells inside Spectrum-X become line items in a public spec.
 
+<a id="93-where-it-leaves-the-networker"></a>
 ### 9.3 Where it leaves the networker (??? probably need rework since this is not the last section)
 
 Line the backers up and the pattern is plain: **UALink, ESUN, and Ultra Ethernet are supported by essentially everyone except NVIDIA** — AMD, Intel, Broadcom, Cisco, Arista, and every hyperscaler. NVIDIA holds the one complete proprietary stack (NVLink, NVSwitch, Quantum InfiniBand, Spectrum-X); the rest of the industry is converging on open standards to break the dependence — and NVIDIA has itself joined some of them (it is a UEC and ESUN member) while keeping its own fabrics intact.
