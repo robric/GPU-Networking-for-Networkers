@@ -206,7 +206,7 @@ Zoom out from the chip to the data hall, network-engineer hat on. A GPU node sit
 ```
    +============================ FRONTEND ============================+
    |                                                                  |   
-   |  host / CPU path  ·  conventional Ethernet / IP / TCP   (-> §6)  |
+   |  host / CPU path  ·  conventional Ethernet / IP / TCP   (-> §7)  |
    |                                                                  |
    |    inference / serving      users -> model endpoints (N-S)       |
    |    tenant / VPC             multi-tenant isolation, overlays     |
@@ -241,7 +241,7 @@ Zoom out from the chip to the data hall, network-engineer hat on. A GPU node sit
 
 <p align="center"><em>Two paths off a node: the CPU frontend, the GPU/RDMA backend.</em></p>
 
-- **Frontend — the host / CPU / socket path** (top of the diagram). Not one network but several, all conventional **Ethernet / IP / TCP** you already run: **inference / serving** (user requests to model endpoints, north-south, load-balanced), **tenant / VPC** (multi-tenant isolation), **orchestration** (k8s / Slurm scheduling), and **management / OOB** (BMC, provisioning). From a GPU's point of view it's all "stuff the host does for me" — and all of it is **your existing skill set** (→ §6).
+- **Frontend — the host / CPU / socket path** (top of the diagram). Not one network but several, all conventional **Ethernet / IP / TCP** you already run: **inference / serving** (user requests to model endpoints, north-south, load-balanced), **tenant / VPC** (multi-tenant isolation), **orchestration** (k8s / Slurm scheduling), and **management / OOB** (BMC, provisioning). From a GPU's point of view it's all "stuff the host does for me" — and all of it is **your existing skill set** (→ §7).
 - **Backend — the GPU / RDMA / memory path** (bottom). Kernel-bypass, no sockets, and itself **two fabrics**: a **compute fabric** carrying GPU↔GPU collective traffic — **scale-up** (NVLink, in-rack — §3) and **scale-out** (IB / RoCE RDMA, cluster-wide — §4); plus a **storage fabric** for **GPU↔high-performance storage** via **GPUDirect Storage** (NVMe / parallel-FS DMA'd straight into HBM). This is the new, hard part — the rest of the document.
 
 Two things refuse to sit neatly on one side — which is exactly the tell that the split is about **path, not function**:
@@ -249,7 +249,7 @@ Two things refuse to sit neatly on one side — which is exactly the tell that t
 - **Storage shows up on both.** Bulk data-loading through the host CPU is *frontend*; the high-performance GPUDirect-Storage path is *backend*. Same data — different processor carrying it.
 - **OOB management** is technically its own *out-of-band* wire (to the BMCs), but it's a host/management concern, so it rides with the frontend.
 
-The takeaway that frames the whole doc: **the frontend is your existing skill set** (Ethernet, IP, BGP, load-balancing — back in §6); **the backend is the genuinely new thing** — the GPU datapath, in two fabrics (§3 scale-up, §4 scale-out). Everything hard lives on the path that skips the CPU.
+The takeaway that frames the whole doc: **the frontend is your existing skill set** (Ethernet, IP, BGP, load-balancing — §7); **the backend is the genuinely new thing** — the GPU datapath, in two fabrics (§3 scale-up, §4 scale-out). Everything hard lives on the path that skips the CPU.
 
 ### 1.5 The two workloads: training vs inference
 
@@ -293,7 +293,7 @@ For the models driving all this — **autoregressive LLMs**, which generate thei
 | Bound by      | throughput            | latency (especially decode)     |
 | Looks like…   | HPC batch / bulk sync | a web request-response tier     |
 
-The takeaway for the rest of the doc: **§3 and §4 are mostly the *training* story** — the synchronized backend collectives that push the fabric hardest. Inference adds the familiar **frontend** dimension (→ §6) plus a lighter backend. But "lighter" is changing fast: modern serving is starting to **disaggregate** — running prefill and decode on separate GPU pools and shipping the intermediate state (the KV cache) between them over the backend fabric — which turns inference into its own demanding network problem. We flag it here and come back to it later; for now, just hold the split: **training stresses the backend; inference spans both planes.**
+The takeaway for the rest of the doc: **§3 and §4 are mostly the *training* story** — the synchronized backend collectives that push the fabric hardest. Inference adds the familiar **frontend** dimension (→ §7) plus a lighter backend. But "lighter" is changing fast: modern serving is starting to **disaggregate** — running prefill and decode on separate GPU pools and shipping the intermediate state (the KV cache) between them over the backend fabric — which turns inference into its own demanding network problem. We flag it here and come back to it later; for now, just hold the split: **training stresses the backend; inference spans both planes.**
 
 #### 1.5.2 The other axis: how much CPU per GPU
 
@@ -418,8 +418,6 @@ You *cannot* build a 100,000-GPU machine entirely out of scale-up — the physic
 This document tackles **scale-up first** (NVLink), then scale-out later.
 
 ---
-
-
 
 ## 3. Scale-up: the NVLink fabric
 
@@ -1200,7 +1198,7 @@ This is **server-centric** homing, and it's the honest fallback when you have no
 
 The baseline spends a whole spine on rank-aligned traffic. Re-homing the NICs makes that spine unnecessary. Take one NIC per rank and change where it lands: GPU *k* of every **scale-up island** (the NVLink domain from §3.7 — 8 GPUs on an HGX box, 72 in an NVL72 rack) connects to the *same* switch — call it **rail *k***. Now rank-*k*-to-rank-*k* traffic, the bulk of a collective, stays on one switch, one hop. A rail is nothing exotic: one leaf switch with a single NIC from every island plugged into it.
 
-That covers same-rank traffic. The other case is **cross-rail** — a GPU on rail *i* needs a GPU on rail *j*. Here the scale-up fabric does the work the spine used to: hop over NVLink to the in-island GPU that already sits on rail *j*, then send normally on rail *j*. That NVLink detour is NCCL's **PXN** (PCIe x Nvlink see §3). Cross-rail traffic rides scale-up, not a second switching tier.
+That covers same-rank traffic. The other case is **cross-rail** — a GPU on rail *i* needs a GPU on rail *j*. Here the scale-up fabric does the work the spine used to: hop over NVLink to the in-island GPU that already sits on rail *j*, then send normally on rail *j*. That NVLink detour is NCCL's **PXN** — *PCI × NVLink*. Cross-rail traffic rides scale-up, not a second switching tier.
 
 So both cases are covered without a spine — same-rail on the rail switch, cross-rail over NVLink — and you can build the whole fabric with one switch per rail and nothing above it. Each island's GPUs hang off an **NVSwitch** (§3), which is what makes the cross-rail hop possible:
 
@@ -1511,6 +1509,7 @@ All three guard the same thing — the **tail** — because one slow flow, wheth
 
 That completes the scale-out *transport* story: how bytes cross the cluster without falling off the drop cliff or stretching the tail. What we have **not** described is the layer that *generates* those bytes — the **collectives** themselves (ring, tree, all-reduce, all-to-all) and how each maps onto the fabric. That's §5.
 
+---
 
 ## 5. Collectives: the traffic the fabric carries
 
@@ -1654,6 +1653,8 @@ Because the two phases want different hardware, modern serving **disaggregates**
 That KV-cache hand-off is a **bulk point-to-point** flow — one worker to one, not a collective, the only big transfer in this section that isn't — and an elephant ECMP collides with like any other (§4.4). The serving stack built around it is NVIDIA's **Dynamo** [[20]](#ref-20): a **KV-aware router** that steers each request to the decode worker already holding its cache (avoiding recompute), and **NIXL** (NVIDIA Inference Xfer Library), a point-to-point library that moves the KV blocks over whatever transport is available — NVLink inside a node; InfiniBand, RoCE, or plain TCP/IP across nodes — and across memory and storage tiers, abstracting the path beneath the hand-off [[26]](#ref-26). Scope it as §1.5 did: prefill/decode and the KV cache are **autoregressive-LLM** specifics — a classifier, embedding, or vision model is a single forward pass, no decode loop, no KV cache.
 
 That closes §5, the communication layer: the collectives themselves (§5.2), how they ride the wire (§5.3), and how the traffic reshapes from training to serving (§5.4). What *drives* these collectives — the CUDA / NCCL software stack — is §6.
+
+---
 
 ## 6. The software stack: from the model to the silicon
 
@@ -1895,6 +1896,7 @@ Two stacks compete at that fleet layer, and — unlike the engine layer — **bo
 
 The one place the split *is* cleanly open-vs-proprietary is the **engine**: **TensorRT-LLM** is the fastest path but NVIDIA-only, while **vLLM** runs across NVIDIA, AMD, Intel, and TPU. Same trade as the silicon underneath — peak performance on one vendor's stack, or portability across everyone's. That is the software map; §7 turns to the networks around this stack we have so far ignored: storage, management, and the frontend.
 
+---
 
 ## 7. The other planes: frontend, storage, and management
 
@@ -1944,6 +1946,8 @@ The last plane is **out-of-band (OOB) management** — the same separate managem
 One scope note: all of this is **health and management** telemetry — slow, and off the data path — not the fast *in-band* signaling the fabric's own control loops run on (§4.7), which rides the data links at microsecond timescales. The fabric does keep its own straggler-hunter, though: Spectrum-X's **High-Frequency Telemetry (HFT)** streams switch egress-queue depth, bandwidth, and PFC state [[15]](#ref-15), catching a slow *link* the way DCGM catches a slow *GPU*.
 
 That completes the §1.4 map — frontend (§7.1), storage (§7.2), and this management wire, on top of the §3–§4 compute fabric: every network off a GPU node accounted for. All of it, though, has been NVIDIA's world; §8 steps outside it.
+
+---
 
 ## 8. The vendor landscape: AMD, Intel, and the hyperscalers
 
@@ -2077,6 +2081,8 @@ One exception is already cracking that captive model: **TPU.** Google has begun 
 
 Which sets up the last question of the chapter. Several of these same hyperscalers, unwilling to depend on any one vendor's fabric, are among the main backers of the **open standards** — UALink, Ultra Ethernet, ESUN — that would let anyone's accelerators talk over a common wire. §9 is that story.
 
+---
+
 ## 9. Open standards: the fabric without the vendor
 
 > Goal: by the end you should know what the open answer to each of NVIDIA's two fabrics actually is, how far along it is, and what is still undecided.
@@ -2144,6 +2150,8 @@ Line the backers up and the pattern is plain: **UALink, ESUN, and Ultra Ethernet
 Whether the open stack wins is the genuine open question of the field, and this document will not pretend to settle it. But the direction is a comfortable one to a networker: toward RDMA over standard Ethernet, multi-vendor switches, packet spray and adaptive routing as published mechanisms rather than trade secrets — the AI fabric slowly becoming the kind of open, interoperable network the rest of the datacenter already is.
 
 AMD is the biggest backer of open interconnects, but it is not the whole open story: the standards themselves — UALink, Ultra Ethernet, SUE — are consortia, and they get their own chapter (§9). Next, §8.3 takes the openness argument to its limit: a chip that drops the special-purpose fabric altogether and runs *both* scales on nothing but Ethernet.
+
+---
 
 ## 10. The AI grid: serving from GSLB to the GPU [DRAFT]
 
