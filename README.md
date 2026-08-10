@@ -6,7 +6,7 @@
 
 If you have spent your career thinking in terms of routers, MPLS labels, routing tables, BGP and the occasional `tcpdump`, the world of "GPU networking" can feel like it was designed by aliens. People throw around words like *NVLink*, *NVSwitch*, *collective*, *all-reduce*, *RDMA*, *RoCE* and *rail-optimized fabric* as if they were obvious. They are not.
 
-This document is two things at once, the same way I did the [k8s service & LB testing notes](https://github.com/robric/k8s-svc-and-lb-testing) were:
+This document is two things at once, the same way my [k8s service & LB testing notes](https://github.com/robric/k8s-svc-and-lb-testing) were:
 - a **personal cheat sheet** so I (and maybe you) can stop re-clauding/googling "how does this NVLink thing connect GPUs to each other ?" every six months.
 - an **educational source** to explain how GPU interconnects actually work, starting from networking intuition you already have.
 
@@ -47,7 +47,7 @@ The golden rule for the whole document: **whenever something looks like magic, w
   - [4.5 Keeping it lossless: PFC, ECN, and DCQCN](#45-keeping-it-lossless-pfc-ecn-and-dcqcn)
   - [4.6 Shaping the fabric: leaves, spines, and how GPUs hang off them](#46-shaping-the-fabric-leaves-spines-and-how-gpus-hang-off-them)
     - [4.6.1 The baseline: a node homed to its leaf](#461-the-baseline-a-node-homed-to-its-leaf)
-    - [4.6.2 Rail-only: dropping the spine](#462-rail-only-dropping-the-spine)
+    - [4.6.2 Rails: homing the NICs by rank](#462-rails-homing-the-nics-by-rank)
     - [4.6.3 Scaling past one pod: a spine over the rails](#463-scaling-past-one-pod-a-spine-over-the-rails)
     - [4.6.4 Multi-plane: splitting the NIC across fabrics](#464-multi-plane-splitting-the-nic-across-fabrics)
     - [4.6.5 Scaling across datacenters](#465-scaling-across-datacenters)
@@ -125,7 +125,7 @@ Before the glossary, one picture. At the highest level a GPU is **a big grid of 
         v                              v
      host CPU                       NIC (ConnectX / BlueField)
                                        |
-                                       | 800G  InfiniBand / RoCE
+                                       | 400/800G  InfiniBand / RoCE
                                        v
                                  scale-out fabric
 ```
@@ -138,7 +138,18 @@ The three edges leaving the box map exactly onto the two-interconnect story comi
 - **PCIe → host CPU** — the general-purpose link for control and loading data.
 - **PCIe → NIC** (ConnectX / BlueField) — the on-ramp to the *scale-out* network (§4).
 
-That last edge, the NIC, matters more than it looks. With **GPUDirect RDMA** the NIC reads and writes GPU HBM *directly* over PCIe, without bouncing through CPU memory — so GPU-to-GPU traffic across nodes never touches the host's RAM. On the newest Grace-Blackwell boards this gets tighter still (**Data Direct** / DirectNIC): instead of GPUs and NICs hanging off **discrete PCIe switch chips** (the older layout, BlueField-3 NICs, ~200 Gb/s per GPU), the **ConnectX-8 SuperNIC itself acts as the PCIe switch**, sitting directly in the GPU's PCIe path (~400 Gb/s per GPU) — fewer hops, no detour up to the CPU. But it's still PCIe (Gen6) electrically — *not* a new non-PCIe link, and *not* NVLink — just a more integrated PCIe topology.
+**Which NIC, though?** Several NVIDIA names circulate. What separates them is how much general-purpose compute rides on the card:
+
+| Adapter                  | Speed | Onboard Arm | Typical plane                           |
+|--------------------------|-------|-------------|-----------------------------------------|
+| **ConnectX-7**           | 400G  | —           | backend compute fabric                  |
+| **ConnectX-8 SuperNIC**  | 800G  | —           | backend compute fabric                  |
+| **BlueField-3 SuperNIC** | 400G  | 8 cores     | backend compute fabric                  |
+| **BlueField-3 DPU**      | 400G  | 16 cores    | frontend - storage, management, tenancy |
+
+The real line is the **DPU**: enough onboard Arm compute to *run* infrastructure services — storage, security, multi-tenancy — on the host's behalf, which is why it sits on the frontend. Everything above it is an adapter whose job is simply to move GPU traffic, and that split is §1.4's frontend/backend line. **"SuperNIC" is a badge, not a boundary** — NVIDIA introduced it with Spectrum-X for adapters aimed at the AI east-west fabric, but ConnectX-7 had been doing that job for years before the term existed. Read it as "NIC tuned for the backend," not as a separate class of hardware.
+
+That last edge, the NIC, matters more than it looks. With **GPUDirect RDMA** the NIC reads and writes GPU HBM *directly* over PCIe, without bouncing through CPU memory — so GPU-to-GPU traffic across nodes never touches the host's RAM. On the newest Grace-Blackwell boards this gets tighter still. On **GB200** the NIC hangs off the **Grace CPU's PCIe**, so a **ConnectX-7** (400 Gb/s per GPU) reaches HBM by transiting Grace's fabric over **NVLink-C2C** (chip-to-chip). That is a *routing* hop, not a processing one — the data still lands straight in HBM and no CPU cycle touches it, the way a packet transits a router's forwarding plane without being punted to the route processor. But it is still a hop, and it shares Grace's C2C bandwidth. **GB300** removes it: the **ConnectX-8 SuperNIC** integrates the PCIe Gen6 switch and attaches directly to the GPU as well as to Grace, giving **800 Gb/s per GPU** [[58]](#ref-58). Still PCIe electrically — *not* a new non-PCIe link, and *not* NVLink — just a more integrated PCIe topology.
 
 Zoom into **one SM** — this is where the actual math happens:
 
@@ -399,17 +410,17 @@ Two interconnects, two units even (GB/s vs Gb/s — note the capital B vs little
 
 Because the two problems have opposite requirements:
 
-| Property            | Scale-up (NVLink)              | Scale-out (IB / RoCE)             |
-|---------------------|--------------------------------|-----------------------------------|
-| Goal                | Bind N GPUs into one           | Connect many nodes into a cluster |
-|                     | shared-memory domain           |                                   |
-| Distance            | Inside a box / rack            | Across racks, rows, the data hall |
-| Semantics           | Memory load/store (address)    | Messages / RDMA (packets)         |
-| Bandwidth per GPU   | ~0.9–1.8 **TB/s**              | ~0.4 **Tb/s** (400G) per NIC      |
-| Latency             | 10s–100s of **ns**             | ~1–3 **µs**                       |
-| Scale               | 8s to ~72 GPUs                 | Thousands to 100k+ GPUs           |
-| Looks like…         | NUMA / shared-memory           |                                   |
-|                     | multiprocessor                 | A Clos data-center network        |
+| Property          | Scale-up (NVLink)           | Scale-out (IB / RoCE)                |
+|-------------------|-----------------------------|--------------------------------------|
+| Goal              | Bind N GPUs into one        | Connect many nodes into a cluster    |
+|                   | shared-memory domain        |                                      |
+| Distance          | Inside a box / rack         | Across racks, rows, the data hall    |
+| Semantics         | Memory load/store (address) | Messages / RDMA (packets)            |
+| Bandwidth per GPU | ~0.9–1.8 **TB/s**           | ~0.4–0.8 **Tb/s** (400–800G) per NIC |
+| Latency           | 10s–100s of **ns**          | ~1–3 **µs**                          |
+| Scale             | 8s to ~72 GPUs              | Thousands to 100k+ GPUs              |
+| Looks like…       | NUMA / shared-memory        |                                      |
+|                   | multiprocessor              | A Clos data-center network           |
 
 Scale-across has no column of its own because it would mostly copy the second one: same messages, same RDMA, same Clos. What stretches is distance and latency — tens to thousands of km, milliseconds not microseconds — which is enough to change *which traffic* you dare put on it, and nothing else. That's §4.6.5.
 
@@ -598,6 +609,9 @@ You've climbed this ladder before. In networking, when a **single pizza-box swit
 #### 3.4.1 NVL72: one rack, one switch tier
 
 The on-board NVSwitch handles 8 GPUs. To go bigger, NVIDIA lifts the same switch chips *out* of the server and into dedicated **NVLink Switch trays** wired across a whole rack. That's what a **GB200 NVL72** is: 72 Blackwell GPUs (18 compute trays) + **9 NVLink Switch trays** (two NVSwitch chips each — 18 in all), all stitched into **one single NVLink domain** where any of the 72 GPUs can load/store any other's HBM at full speed [[1]](#ref-1)[[14]](#ref-14)[[41]](#ref-41). *This* is where "72 GPUs act as one giant GPU" (the abstraction from §1.1) stops being marketing and becomes a wiring diagram — it's a non-blocking NVLink fabric, just scaled from 8 ports to 72.
+
+??? add diagram of the DGX rack here
+??? should't we say it is a DGX system
 
 Physically, this is where the switch **leaves the baseboard**. The pizza-box collapses into a true chassis: compute trays and **NVLink Switch trays** become separate units in the rack, joined by the **NVLink spine** — a copper-cable backplane down the back. Now the chassis-router comparison is no longer an analogy — it's the literal build: **compute trays = line cards, switch trays = fabric cards, the spine = the backplane. The rack *is* the chassis.**
 
@@ -1171,7 +1185,16 @@ This is exactly why the **F bit was IB-only** back in §4.3: IB does forward-mar
 
 §4.5 ended with the placement problem: two elephant flows can hash onto the same link, and rate control alone won't pull them apart. Fixing that takes two steps. First you **shape** the fabric — decide where the switches and links go, which fixes where the paths are. Then you **steer** traffic across those paths (§4.7). This section is about shape.
 
-The scale-out fabric uses the same leaf and spine switches you already build a **Clos / fat-tree** from, sized closer to non-blocking than an enterprise fabric because AI traffic doesn't statistically multiplex (§4.4). What's AI-specific is set by the **scale-up fabric** an ordinary data center doesn't have: which leaf each GPU's NIC lands on, and whether the leaves need a spine at all (§4.6.2 - rail-only -).
+The scale-out fabric uses the same leaf and spine switches you already build a **Clos / fat-tree** from, sized closer to non-blocking than an enterprise fabric because AI traffic doesn't statistically multiplex (§4.4). What's AI-specific is set by the **scale-up fabric** an ordinary data center doesn't have: which leaf each GPU's NIC lands on, and whether the leaves need a spine at all (§4.6.2 — rails).
+
+**One number to pin down before the arithmetic: ports per GPU.** Everything below counts *switch ports*, so it turns on which NIC the GPUs carry — and two generations are in the field at once:
+
+| System                 | NIC            | Per GPU | GPUs per 800G switch port |
+|------------------------|----------------|---------|---------------------------|
+| DGX B200 · GB200 NVL72 | **ConnectX-7** | 400G    | **2** — via breakout      |
+| DGX B300 · GB300 NVL72 | **ConnectX-8** | 800G    | **1**                     |
+
+The topology is identical either way; only density changes. The 400G generation packs twice as many GPUs onto the same switch, because two 400G NICs share one 800G port through a breakout cable. Where the difference matters, both numbers are given.
 
 #### 4.6.1 The baseline: a node homed to its leaf
 
@@ -1194,15 +1217,101 @@ Start from the design you already build. A server's NICs land on its top-of-rack
 
 This is **server-centric** homing, and it's the honest fallback when you have no strong scale-up fabric to exploit. It works for any workload and needs no special cabling rule. Its one weakness is where it puts the heavy traffic. A collective has GPU *k* of one node trading with GPU *k* of every other node — the traffic is **rank-aligned** (§5) — and here those rank-*k* NICs sit on different leaves, so it always climbs the spine. Rail-optimized homing (§4.6.2) is the one change that fixes exactly that.
 
-#### 4.6.2 Rail-only: dropping the spine
+#### 4.6.2 Rails: homing the NICs by rank
 
-The baseline spends a whole spine on rank-aligned traffic. Re-homing the NICs makes that spine unnecessary. Take one NIC per rank and change where it lands: GPU *k* of every **scale-up island** (the NVLink domain from §3.7 — 8 GPUs on an HGX box, 72 in an NVL72 rack) connects to the *same* switch — call it **rail *k***. Now rank-*k*-to-rank-*k* traffic, the bulk of a collective, stays on one switch, one hop. A rail is nothing exotic: one leaf switch with a single NIC from every island plugged into it.
+The baseline spends a whole spine on rank-aligned traffic. Re-homing the NICs makes that spine unnecessary — and the re-homing rule is worth stating in general before pinning it to a machine.
 
-That covers same-rank traffic. The other case is **cross-rail** — a GPU on rail *i* needs a GPU on rail *j*. Here the scale-up fabric does the work the spine used to: hop over NVLink to the in-island GPU that already sits on rail *j*, then send normally on rail *j*. That NVLink detour is NCCL's **PXN** — *PCI × NVLink*. Cross-rail traffic rides scale-up, not a second switching tier.
+**A rail is a track between scale-up islands** — the NVLink domains of §3.7. Every NIC takes the rank of the GPU it serves: GPU *k*'s NIC is NIC *k*, and the heavy traffic runs between NICs of the same rank (§4.6.1).
+
+**The simple form is one NIC per rail.** Cable NIC *k* of every island onto the same switch, and that switch is **rail *k***. An **8-GPU B200 node** (§3.3) — eight GPUs on one HGX baseboard, one NIC each — is an island of eight NICs, so it gives eight rails, one switch apiece, and rank-*k* traffic crosses **one switch, one hop, no spine**.
+
+```
+     SIMPLE FORM  -  Example HGX B200 with 1:1 NIC per rail mapping
+
+         island A                                          island B
+         HGX B200                                          HGX B200
+     +==============+                                  +==============+
+     |  GPU0--NIC0  |--------[   RAIL 0   ]------------|  NIC0--GPU0  |
+     |  GPU1--NIC1  |--------[   RAIL 1   ]------------|  NIC1--GPU1  |
+     |  GPU2--NIC2  |--------[   RAIL 2   ]------------|  NIC2--GPU2  |
+     |      :       |             :                    |      :       |
+     |  GPU7--NIC7  |--------[   RAIL 7   ]------------|  NIC7--GPU7  |
+     +==============+                                  +==============+
+
+     rail k joins NIC k of every island  -  8 NICs per island, 8 rails
+     nothing joins rail i to rail j      -  the tracks run parallel
+```
+
+<p align="center"><em>Rail k joins NIC k of every island; the tracks run parallel and never meet.</em></p>
+
+**The general form groups them.** Nothing requires a rail to be one NIC wide. Split each island's NICs into *n* groups by rank, cable group *k* of every island together, and that group is rail *k*. A **GB200 NVL72** island carries 72 NICs: group them eighteen at a time, one group per position in a compute tray, and you get four rails rather than seventy-two (4 rails × 18 NICs = 72). The simple form is only this with *n* set to the NIC count, every group a single NIC.
+
+```
+    GENERAL FORM  - Example DGX GB200 NVL 72 with 18:1 NICs per rail mapping
+
+         island A                                            island B
+     GB200 NVL72 rack                                    GB200 NVL72 rack
+    +==================+                                +==================+
+    | +-- tray 0 ----+ |                                | +---- tray 0 --+ |
+    | |   GPU0-NIC0  +-+---+-------[ RAIL 0 ]-------+---+-+  NIC0-GPU0   | |
+    | |   GPU1-NIC1  +-+---|-+-----[ RAIL 1 ]-----+-|---+-+  NIC1-GPU1   | |
+    | |   GPU2-NIC2  +-+---|-|-+---[ RAIL 2 ]---+-|-|---+-+  NIC2-GPU2   | |
+    | |   GPU3-NIC3  +-+---|-|-|-+-[ RAIL 3 ]-+-|-|-|---+-+  NIC3-GPU3   | |
+    | +--------------+ |   | | | |            | | | |   | +--------------+ |
+    |        :         |   | | | |            | | | |   |        :         |
+    |        :         |   | | | |            | | | |   |        :         |
+    |        :         |   | | | |            | | | |   |        :         |
+    | +-- tray 17 ---+ |   | | | |            | | | |   | +--- tray 17 --+ |
+    | |  GPU68-NIC0  +-+---+ | | |            | | | +---+-+  NIC0-GPU68  | |
+    | |  GPU69-NIC1  +-+-----+ | |            | | +-----+-+  NIC1-GPU69  | |
+    | |  GPU70-NIC2  +-+-------+ |            | +-------+-+  NIC2-GPU70  | |
+    | |  GPU71-NIC3  +-+---------+            +---------+-+  NIC3-GPU71  | |
+    | +--------------+ |                                | +--------------+ |
+    +==================+                                +==================+
+
+     every tray wires its 4 NICs to the same 4 rails  -  18 trays per island
+     so each rail carries 18 NICs from island A and 18 from island B
+```
+
+<p align="center"><em>Every tray sends its four NICs to the same four rails, in every island.</em></p>
+
+Either way the shape is the same: the islands are the stations, the rails are the tracks, and every NIC belongs to exactly one rail.
+
+**In practice, a rail is a switch.** The NICs of group *k* all plug into one box, and that box is rail *k* — an ordinary switch, the same part you would buy for any Clos. Nothing inside it knows about rails: no GPU, NIC, or switch carries a "rail" register. What makes it a rail is only which cables you ran into it, the same move as homing port *k* of every rack to one aggregation device so a known traffic pattern stays local. What the switch does fix is the rail's size, since a rail reaches no further than its ports.
+
+```
+     A RAIL IS A SWITCH  -  one switch per rail, every island's NIC k plugged in
+
+        island A                                              island B
+        HGX B200            +======================+          HGX B200
+     +==============+   +---|    rail 0 switch     |---+   +==============+
+     |  GPU0--NIC0  |---+   +======================+   +---|  NIC0--GPU0  |
+     |  GPU1--NIC1  |---+                              +---|  NIC1--GPU1  |
+     |      :       |   |   +======================+   |   |      :       |
+     |  GPU7--NIC7  |   +---|    rail 1 switch     |---+   |  NIC7--GPU7  |
+     +==============+       +======================+       +==============+
+                                     
+                                     [...]
+
+                            +======================+ 
+                            |    rail 7 switch     |       
+                            +======================+ 
+                            
+     ... island C, D and rails 2-7 are wired exactly the same way 
+
+```
+<p align="center"><em>Each rail is one switch, with NIC k of every island plugged into it.</em></p>
+
+**The tracks never meet.** Rail *i* and rail *j* are different switches with no port in common: along the rails, a GPU on rail 0 has no route to a GPU on rail 1.
+
+Rails are counted in **NICs, not switch ports**. On the ConnectX-7 generation two same-index NICs from *different* islands share one 800G switch port through a breakout (the table above); that doubles the GPUs sitting on a rail and leaves the number of rails at eight.
+
+That covers same-rank traffic. The other case is **cross-rail** — a GPU on rail *i* needs a GPU on rail *j*, and the rails do not meet. Changing rails means leaving them: you change tracks the way you change trains, at the station rather than on the track, and the station is the island. Here the scale-up fabric does the work the spine used to: hop over NVLink to the in-island GPU that already sits on rail *j*, then send normally on rail *j*. That NVLink detour is NCCL's **PXN** — *PCI × NVLink* [[57]](#ref-57). Cross-rail traffic rides scale-up, not a second switching tier.
 
 So both cases are covered without a spine — same-rail on the rail switch, cross-rail over NVLink — and you can build the whole fabric with one switch per rail and nothing above it. Each island's GPUs hang off an **NVSwitch** (§3), which is what makes the cross-rail hop possible:
 
 ```
+
                                               +===============+
             +-----island A GPU0 -PCIe- NIC0---|               |
             |     island B GPU0 -PCIe- NIC0---| Rail 0 switch |
@@ -1220,6 +1329,7 @@ So both cases are covered without a spine — same-rail on the rail switch, cros
                   island B GPU2 -PCIe- NIC2---| Rail 2 switch |
                   island C GPU2 -PCIe- NIC2---|               |
                                               +===============+
+            ...
 
   cross-rail: A's GPU0 --NVLink--> A's GPU2 --NIC2--> Rail 2 switch  (no spine)
   ...  rails 3-7 same;  NVSwitch shown for island A only
@@ -1227,22 +1337,26 @@ So both cases are covered without a spine — same-rail on the rail switch, cros
 
 <p align="center"><em>Every scale-up island has an NVSwitch (one shown); it lets a cross-rail hop (GPU0→GPU2) ride NVLink, not the spine.</em></p>
 
-This is **rail-only**, and it's deliberately **not a Clos**: each rail is a single switch — a bare **crossbar** — and with no spine there's no second stage to make it one. The rails are stitched into a fabric by the scale-up layer (PXN), not by a switching tier. That's the trade. You've swapped a whole spine layer for NVLink hops, which means rail-only stands or falls on scale-up:
+Call this design **spine-less rail-only**. It is deliberately **not a Clos**: each rail is a single switch — a bare **crossbar** — and with no spine there is no second stage to make it one. The rails are stitched into a fabric by the scale-up layer (PXN), not by a switching tier. (§4.6.4 keeps the name "rail-only" for a different design — isolated per-rail *planes*, which do have spines. Where the two could be confused, "spine-less" is the word that separates them.)
+
+That's the trade. You've swapped a whole spine layer for NVLink hops, which means spine-less rail-only stands or falls on scale-up:
 
 - **Strong scale-up** (large NVLink domains) → cross-rail rides NVLink and the spine is genuinely optional.
 - **Weak or no scale-up** → cross-rail has nowhere to go, so you keep the baseline's spine.
 
 That coupling is why rail-only is most at home on NVIDIA — but it's about the *size and speed* of the scale-up domain, not NVIDIA being the only one with one. AMD and Intel both ship scale-up today; they just bring less of it:
 
-| Vendor | Scale-up fabric              | Domain  | Per-GPU BW |
-|--------|------------------------------|---------|------------|
-| NVIDIA | NVLink 5 + NVSwitch          | 8 or 72 | 1.8 TB/s   |
-| AMD    | Infinity Fabric, direct mesh | 8       | ~1 TB/s    |
-| Intel  | on-die RoCE (Ethernet)       | 8       | 21x200GbE  |
+| Vendor | Scale-up fabric              | Domain  | Per-GPU BW           |
+|--------|------------------------------|---------|----------------------|
+| NVIDIA | NVLink 5 + NVSwitch          | 8 or 72 | 1.8 TB/s             |
+| AMD    | Infinity Fabric, direct mesh | 8       | ~1 TB/s              |
+| Intel  | on-die RoCE (Ethernet)       | 8       | ~1 TB/s  (21x200GbE) |
 
 <p align="center"><em>AMD and Intel have scale-up, but smaller and slower — AMD's Infinity Fabric is ~NVLink-4-class, Intel's is Ethernet-based.</em></p>
 
 Two gaps matter for rail-only. **Size:** AMD and Intel top out at 8 accelerators where NVIDIA reaches 72, so far more of the collective stays on-fabric before it touches a NIC. **Speed:** AMD's ~1 TB/s is about half of Blackwell's NVLink 5, and Intel's Ethernet scale-up is lower still — a small, slower domain can't soak up cross-rail the way a big NVLink domain does, so the spine stays. (Fuller vendor treatment in §8.)
+
+**One thing the 8-GPU node hides.** There the island is also a single **host** — one OS image (§1.3) — so grouping the NICs one apiece is the only grouping anyone would draw, and *n* never looks like a choice at all. A **GB200 NVL72** pulls that apart: **one** 72-GPU island but **eighteen** hosts, four GPUs to a compute tray. Four rails, seventy-two, or anything between that divides evenly is buildable, so the rail count stops being a property of the hardware and becomes a number you pick — and what you pick sizes the pod. That choice, and the scalable unit it defines, is §4.6.3.
 
 This rail-only block is NVIDIA's **scalable unit (SU)** design — a set of islands with one rail leaf per GPU in the island (8 rails for an 8-GPU node, 72 for an NVL72 rack). One caveat on the name: "scalable" means *replicable*, and replicating SUs means wiring them together through a spine, which needs uplink ports. So a real SU splits each leaf's ports in half — half down to the islands, half up to the spine:
 
@@ -1372,20 +1486,18 @@ The spine is not the only way between rails. The scale-up fabric — NVLink/NVSw
 
 The trade is cost against generality. The MIT/Meta *rail-only* study [[5]](#ref-5) actually put numbers on it: 38–77% less network cost and 37–75% less power for the same training performance, at an 8.2–11.2% completion-time overhead on MoE all-to-all traffic. The bet is that cross-rail traffic stays light enough to live on scale-up.
 
-Here is the maximum cluster size each design reaches on 128-port spines for DGX B200 (8 GPU node)
+Here is the maximum cluster size each design reaches on 128-port spines for DGX B200 (8 GPU node):
 
 | Design                    | GPUs per SU | Max SUs (2-tier) | Max GPUs (2-tier) |
 |---------------------------|-------------|------------------|-------------------|
 | DGX B200, shared spine    | 512         | 16               | 8,192             |
 | DGX B200, rail-only       | 512         | 128              | 65,536            |
 
-Next, NVL 72 is a bit different since a single SU can have up to 4608 GPUs over (72 rails !), with plans for 2 tier scale up domains NVL 576, 1152 and beyond which blurs the performance line with scale-out SUs. 
+**NVL72 changes the arithmetic.** Because the scale-up domain is now the whole rack, one SU spans **72 rails** and reaches **4,608 GPUs** — nine times a B200 SU. And the roadmap pushes further: two-tier scale-up domains (**NVL576**, **NVL1152**, §3.4.2) keep growing the island, which blurs the line between a scale-up domain and a scale-out pod.
 
 | Design                    | GPUs per SU | Max SUs (2-tier) | Max GPUs (2-tier) |
 |---------------------------|-------------|------------------|-------------------|
 | GB200 NVL72, shared spine | 4,608       | 1                | 4,608             |
-
-<p align="center"><em>Same SU size either way; a shared spine caps B200 at 16 SUs, dedicated per-rail planes reach 128.</em></p>
 
 An NVL72 SU spans 72 leaves against the 128 a spine can reach, so a second full SU won't fit in two tiers — which is why the documented 9,216-GPU NVL72 pods need a third tier.
 
@@ -1930,7 +2042,7 @@ Storage is the one frontend plane with a real backend half. As §1.4 noted, the 
 A few things to file away:
 
 - **Checkpoints are the write burst.** Training periodically saves model + optimizer state (terabytes, for a large model) for fault recovery — every rank writing its shard at once, stalling the job until storage drains it. Synchronized, bursty, write-heavy, on the critical path; the one storage pattern unique to GPU training (async checkpointing exists to hide it).
-- **Inference uses it too, more lightly** — loading the model weights into HBM at startup or scale-up (a burst read; GPuDirect Storage shortens a cold start), plus the KV-cache offload of §5.4.
+- **Inference uses it too, more lightly** — loading the model weights into HBM at startup or scale-up (a burst read; GPUDirect Storage shortens a cold start), plus the KV-cache offload of §5.4.
 - **The fast tier is a *parallel* filesystem** — storage striped across **many** nodes that act as one filesystem, so bandwidth scales with the node count instead of bottlenecking on a single file server (i.e. many boxes as one). In practice that's a parallel filesystem — **Lustre** is the open HPC standard, and for AI storage it's a competitive field (**WEKA, VAST, DDN**) with no single default.
 
 Last comes the plane that never carries a tensor at all: management and out-of-band (§7.3).
@@ -2413,6 +2525,8 @@ Where this leaves the networker: the grid is real as an architecture and young a
 54. <a id="ref-54"></a>strategy+business — *How neocloud Nscale is navigating the AI infrastructure boom* (vertically integrated "ground to cloud" model: ownership of datacenters, power, cooling, networking, hardware, and software, versus neoclouds renting colocation; sovereignty as the differentiator). <https://www.strategy-business.com/article/How-neocloud-Nscale-is-navigating-the-AI-infrastructure-boom>
 55. <a id="ref-55"></a>Introl — *Microsoft's $60B Neocloud Bet* (Microsoft's ~$23B commitment to Nscale for roughly 200,000 GB300 GPUs across the UK, Norway, Portugal, and Texas, within $60B+ of neocloud capacity deals driven by Azure's capacity shortfall). <https://introl.com/blog/microsoft-60-billion-neocloud-spending-capacity-crunch-december-2025>
 56. <a id="ref-56"></a>arXiv — *AI Inference as Relocatable Electricity Demand* (the structural asymmetry: electricity transmission is cost-constrained while compute relocation is latency-constrained, implying a hierarchical geography of inference infrastructure). <https://arxiv.org/pdf/2604.27855>
+57. <a id="ref-57"></a>NVIDIA — *Doubling all2all Performance with NVIDIA Collective Communication Library 2.12* (introduces **PXN**, "PCI × NVLink": rather than sending from its own memory, a GPU writes over NVLink into a buffer on the intermediate GPU that owns the right NIC, which then sends out over PCI — keeping cross-rail traffic on the scale-up fabric in rail-optimized topologies). <https://developer.nvidia.com/blog/doubling-all2all-performance-with-nvidia-collective-communication-library-2-12/>
+58. <a id="ref-58"></a>NVIDIA — *ConnectX-8 SuperNICs Advance AI Platform Architecture with PCIe Gen6 Connectivity* (the first SuperNIC to integrate a PCIe Gen6 switch with 800G networking in one device: 48 lanes of PCIe Gen6 and a direct Gen6 x16 link to the B300 GPU, eliminating the discrete PCIe switch chips of earlier boards; GB300 NVL72 and HGX B300 are the first deployments). <https://developer.nvidia.com/blog/nvidia-connectx-8-supernics-advance-ai-platform-architecture-with-pcie-gen6-connectivity>
 
 # TODO list tracking
 
@@ -2422,4 +2536,5 @@ Where this leaves the networker: the grid is real as an architecture and young a
 - structure of section is  not consistent 
 - dual dimenstion in split inference (P/D A/F), KV cache  
 - dynamo deep dive ?
+- Bianca board (1 Grace + 2 Blackwell) = the NVL72 building block -> 3.4.1 : compute tray = 2 Bianca, explains the 4-GPU tray and the 1:2 ratio of 1.5.2
 - check here scale accross https://nvidianews.nvidia.com/news/nvidia-introduces-spectrum-xgs-ethernet-to-connect-distributed-data-centers-into-giga-scale-ai-super-factories
