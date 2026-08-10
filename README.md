@@ -1219,8 +1219,6 @@ This is **server-centric** homing, and it's the honest fallback when you have no
 
 #### 4.6.2 Rail-optimized homing: a pod without a spine
 
-##### 4.6.2.1 Rails: homing the NICs by rank
-
 The baseline spends a whole spine on rank-aligned traffic. Re-homing the NICs makes that spine unnecessary.
 
 **A rail is a track between scale-up islands** — the NVLink domains of §3.7. Every NIC takes the rank of the GPU it serves: GPU *k*'s NIC is NIC *k*, and the heavy traffic runs between NICs of the same rank (§4.6.1).
@@ -1342,6 +1340,13 @@ Example Cross Rail: GPU0 Island A to GPU1 Island B
 
 Call this design **spine-less rail-only**. It is deliberately **not a Clos**: each rail is a single switch — a bare **crossbar** — and with no spine there is no second stage to make it one. The rails are stitched into a fabric by the scale-up layer (PXN), not by a switching tier. (§4.6.3 keeps the name "rail-only" for a different design — isolated per-rail *planes*, which do have spines. Where the two could be confused, "spine-less" is the word that separates them.)
 
+That's the trade: you have swapped a whole spine layer for NVLink hops, so spine-less rail-only stands or falls on scale-up.
+
+- **Strong scale-up** (large NVLink domains) → cross-rail rides NVLink and the spine is genuinely optional.
+- **Weak or no scale-up** → cross-rail has nowhere to go, so you keep the baseline's spine.
+
+That coupling is why rail-only is most at home on NVIDIA. It is about the *size and speed* of the domain, not NVIDIA being the only one with one — AMD and Intel both ship scale-up, but top out at 8 accelerators against NVIDIA's 72, at roughly half the per-GPU bandwidth, which is not enough to soak up cross-rail (§8).
+
 Before the arithmetic, one counting rule: rails are counted in **NICs, not switch ports**. On the ConnectX-7 generation two NICs on the same rail share one 800G switch port through a breakout (§4.6's table); that doubles the GPUs sitting on a rail without changing how many rails there are.
 
 **So how far does this scale?** There is nothing above the rail switches to spend ports on, so every port goes down to an island. The ceiling is **rails × switch radix × GPUs per port**, and what you build is however many *whole* islands fit under it. Today's 128×800G parts (Broadcom **Tomahawk 6**, NVIDIA **Spectrum-6 SN6810**, both 102.4T) cap a rail at 128 ports. A 512-port **SN6800** chassis would push that to 512, but it is still roadmap (2H 2026\*), not shipping today:
@@ -1351,7 +1356,9 @@ Before the arithmetic, one counting rule: rails are counted in **NICs, not switc
 | DGX B200 node     | ConnectX-7 400G (2)      | 8     | 2,048 (256 nodes)          | 8,192 (1,024 nodes) |
 | DGX B300 node     | ConnectX-8 800G (1)      | 8     | 1,024 (128 nodes)          | 4,096 (512 nodes)   |
 | GB200 NVL72 rack  | ConnectX-7 400G (2)      | 4     | 1,008 (14 racks)           | 4,032 (56 racks)    |
+| GB200 NVL72 rack  | ConnectX-7 400G (2)      | 8     | 2,016 (28 racks)           | 8,136 (113 racks)   |
 | GB300 NVL72 rack  | ConnectX-8 800G (1)      | 4     | 504 (7 racks)              | 2,016 (28 racks)    |
+| GB300 NVL72 rack  | ConnectX-8 800G (1)      | 8     | 1,008 (14 racks)           | 4,032 (56 racks)    |
 
 <p align="center"><em>What one rail switch can absorb, times the rails: the 400G generation doubles the density.</em></p>
 
@@ -1365,20 +1372,18 @@ The rails column is a **choice**, not a spec. An NVL72 has 72 NICs and grouping 
 |----------------|-----------------------------|----------------|-------|----------|
 | **4** (NVIDIA) | 18                          | 7              | 504   | 4        |
 | **8**          | 9                           | 14             | 1,008 | 8        |
-| **18**         | 4                           | 32             | 2,304 | 18       |
-| **72**         | 1                           | 128            | 9,216 | 72       |
 
 <p align="center"><em>More rails buys pod size and spends per-rail width — the product barely moves.</em></p>
 
-Nothing is created by adding rails. **GPUs × NICs-per-rail stays at island size × switch radix** (72 × 128 ≈ 9,200), so you are sliding along a fixed curve, trading width for reach — and since a rail is a switch, the first column is also the bill.
+Nothing is created by adding rails. **GPUs × NICs-per-rail stays at island size × switch radix**, so you are sliding along a fixed curve, trading width for reach — and since a rail is a switch, the last column is also the bill.
 
-That makes the extremes unattractive. At 72 rails a rack puts a single NIC on each rail: aggregate egress is unchanged, but a hot destination has one 800G path to it, and losing that NIC cuts the rack off from that rail with no second way there. You also buy 72 switches whatever the cluster size, and the 9,216 only pays off at 128 racks — a scale where nobody builds spine-less anyway. **Four to eight rails is the usable band.** (That 9,216 is a coincidence worth flagging: NVIDIA's documented 9,216-GPU GB200 SuperPOD is a *three-tier* design at four rails, arrived at a completely different way.)
+Push it far enough and the design eats itself. At the extreme every rail holds a single NIC per rack: aggregate egress is unchanged, but a hot destination has one 800G path to it, losing that NIC cuts the rack off from that rail with no second way there, and you are buying a switch per NIC. **Four to eight rails is the usable band**, and NVIDIA ships four.
 
-And that is the ceiling. Every port faces an island, so there is nothing left to attach a second pod to — this is the whole cluster and the end of the line.
+That's the whole rail-only block — same-rail one hop, cross-rail rail-local over PXN, no spine. It is also terminal: every port faces an island, so there is nothing left to attach a second pod to. To go beyond these numbers you reserve some of those ports as uplinks and hang a spine above them — which is what §4.6.3 does.
 
-##### 4.6.2.2 The scalable unit
+#### 4.6.3 Scaling past one pod: a spine over the rails
 
-To get past that ceiling, the block needs a way to attach to something above it. Reserve half of each rail switch's ports as **uplinks** — a north-facing interface — and the block becomes replicable: that is NVIDIA's **scalable unit (SU)**. "Scalable" means *replicable*, and replicating SUs means wiring them together through a spine, which is what those uplinks are for. So a real SU splits each switch's ports in half — half down to the islands, half up to the spine:
+Keep §4.6.2's design exactly as it is — same rails, same homing, same cross-rail over NVLink — and change one thing: stop spending every port on islands. Reserve some of each rail switch's ports facing **north**, as **uplinks** for a spine layer, and the block stops being terminal. It becomes replicable, and that is NVIDIA's **scalable unit (SU)**: "scalable" means *replicable*, and replicating SUs means wiring them together through a spine, which is what those uplinks are for. Split each switch's ports in half — half down to the islands, half up to the spine:
 
 ```
 
@@ -1398,7 +1403,7 @@ To get past that ceiling, the block needs a way to attach to something above it.
            Downlinks to attach Islands (NVL domains) 
                                                                
       +-------------------------------------------------+
-      |     64 islands  -  each an 8-GPU B200 node      |
+      |     64 islands  -  each an 8-GPU B300 node      |
       +-------------------------------------------------+
 
     One SU = 8 leaves x (64 up + 64 down) = 64 islands = 512 GPU
@@ -1407,34 +1412,28 @@ To get past that ceiling, the block needs a way to attach to something above it.
 
 <p align="center"><em> SU design: each 128-port rail leaf splits 64 up to the spine, 64 down to the islands.</em></p>
 
-That's the whole rail-only block — same-rail one hop, cross-rail rail-local over PXN, no spine.
+Halving the downlinks halves the block. Run the same four systems through it:
 
-##### 4.6.2.3 How much scale-up it takes
+| Island            | NIC (GPUs per 800G port) | Rails | SU on 128-port<br>64 down / 64 up |
+|-------------------|--------------------------|-------|-----------------------------------|
+| DGX B200 node     | ConnectX-7 400G (2)      | 8     | 1,024 (128 nodes)                 |
+| DGX B300 node     | ConnectX-8 800G (1)      | 8     | 512 (64 nodes)                    |
+| GB200 NVL72 rack  | ConnectX-7 400G (2)      | 4     | 504 (7 racks)                     |
+| GB200 NVL72 rack  | ConnectX-7 400G (2)      | 8     | 1,008 (14 racks)                  |
+| GB300 NVL72 rack  | ConnectX-8 800G (1)      | 4     | 216 (3 racks)                     |
+| GB300 NVL72 rack  | ConnectX-8 800G (1)      | 8     | 504 (7 racks)                     |
 
-That's the trade. You've swapped a whole spine layer for NVLink hops, which means spine-less rail-only stands or falls on scale-up:
+<p align="center"><em>An SU is half a spine-less pod — the other half of every port faces the spine.</em></p>
 
-- **Strong scale-up** (large NVLink domains) → cross-rail rides NVLink and the spine is genuinely optional.
-- **Weak or no scale-up** → cross-rail has nowhere to go, so you keep the baseline's spine.
+The uplinks are the point. Each rail switch offers 64 of them, so an 8-rail SU presents **512 ports** upward and a 4-rail SU presents **256**; that budget is what the spine has to work with.
 
-That coupling is why rail-only is most at home on NVIDIA — but it's about the *size and speed* of the scale-up domain, not NVIDIA being the only one with one. AMD and Intel both ship scale-up today; they just bring less of it:
+One row is much worse than the others. A **GB300 NVL72 SU on 128-port switches holds three racks** — 64 downlinks against 18 NICs per rack fits 3, not 3.5, wasting 16% of the downlink budget where every other row wastes 2% or nothing. Shrinking the downlink half sharpens the divisibility problem from §4.6.2: the smaller the budget, the more a chunk of 18 costs you.
 
-| Vendor | Scale-up fabric              | Domain  | Per-GPU BW           |
-|--------|------------------------------|---------|----------------------|
-| NVIDIA | NVLink 5 + NVSwitch          | 8 or 72 | 1.8 TB/s             |
-| AMD    | Infinity Fabric, direct mesh | 8       | ~1 TB/s              |
-| Intel  | on-die RoCE (Ethernet)       | 8       | ~1 TB/s  (21x200GbE) |
+The 50/50 split is itself a choice — it makes the SU non-blocking toward the spine. Spend fewer ports upward (96 down, 32 up) and the SU grows by half again, at 3:1 oversubscription on everything leaving it.
 
-<p align="center"><em>AMD and Intel have scale-up, but smaller and slower — AMD's Infinity Fabric is ~NVLink-4-class, Intel's is Ethernet-based.</em></p>
+Those uplinks now have to land somewhere. Fan them into a tier of **spine** switches and every rail switch can reach every other — in its own SU or any other. A set of SUs joined this way is a **SuperPOD**. You scale the number of SUs by adding more spines, and each leaf can run one or more links to each spine. (NVIDIA's DGX SuperPOD reference designs: B200 [[3]](#ref-3), GB200 NVL72 [[4]](#ref-4).)
 
-Two gaps matter for rail-only. **Size:** AMD and Intel top out at 8 accelerators where NVIDIA reaches 72, so far more of the collective stays on-fabric before it touches a NIC. **Speed:** AMD's ~1 TB/s is about half of Blackwell's NVLink 5, and Intel's Ethernet scale-up is lower still — a small, slower domain can't soak up cross-rail the way a big NVLink domain does, so the spine stays. (Fuller vendor treatment in §8.)
-
-To get *more than one* SU — to make it actually replicable — you reserve part of each leaf for uplinks and add a spine; the result is a **SuperPOD**, and that spine, plus how far it scales, is §4.6.3. (NVIDIA's DGX SuperPOD reference designs: B200 [[3]](#ref-3), GB200 NVL72 [[4]](#ref-4).)
-
-#### 4.6.3 Scaling past one pod: a spine over the rails
-
-§4.6.2 introduced the Scalable Unit — a design built to be replicated for scale. On a 128-port TH6 / Spectrum-6 leaf, the ports split 64 down to the islands and 64 up. Those upward ports fan to a tier of spine switches, and every rail leaf can then reach every other — in its own SU or any other. A set of SUs joined this way is a **SuperPOD**. You scale the number of SUs by adding more spines, and each leaf can run one or more links to each spine. In this configuration, each SU has 8 rail leaves × 64 downlinks = 512 GPUs (one GPU per port).
-
-The example below shows a SuperPOD of 16 SUs, the two-tier maximum with 16 × 512 = 8,192 GPUs.
+The example below takes the simplest case — a **DGX B300** node (8 GPUs nodes). It shows a SuperPOD of 16 SUs, the two-tier maximum, with 16 × 512 = 8,192 GPUs.
 
 ```
               +----------+  +----------+            +----------+
@@ -1454,7 +1453,7 @@ The example below shows a SuperPOD of 16 SUs, the two-tier maximum with 16 × 51
   |      +--------+---------+     |        |      +--------+---------+     |
   |               |               |        |               |               | 
   |      +-----------------+      |        |      +-----------------+      |
-  |      | 8-GPU B200 node |  x64 |        |      | 8-GPU B200 node |  x64 |
+  |      | 8-GPU B300 node |  x64 |        |      | 8-GPU B300 node |  x64 |
   |      +-----------------+      |        |      +-----------------+      |
   +-------------------------------+        +-------------------------------+
                 SU 0                 [...]               SU 15
@@ -1470,7 +1469,7 @@ The example below shows a SuperPOD of 16 SUs, the two-tier maximum with 16 × 51
 The spine is not the only way between rails. The scale-up fabric — NVLink/NVSwitch — also carries cross-rail traffic, and how you wire the spine planes splits the design in two:
 
 - **Shared spine.** The planes are shared across rails, so any leaf reaches any other leaf. Cross-rail traffic between SUs climbs the spine, leaf to leaf, like any same-rail flow; NVLink still handles cross-rail *within* an SU, where it is faster. This is the DGX SuperPOD reference — and the source of the 16-SU / 8,192-GPU ceiling above.
-- **Rail-only at scale.** The planes are isolated, one per rail, so a leaf only reaches leaves on its own rail. Every rail change rides NVLink (PXN); the spine never carries cross-rail traffic. This is §4.6.2's design scaled across SUs, and since no spine port is spent on cross-rail, it scales past that ceiling.
+- **Rail-only at scale.** The planes are isolated, one per rail, so a leaf only reaches leaves on its own rail. Every rail change rides NVLink (PXN); the spine never carries cross-rail traffic. This is §4.6.2's design scaled across SUs, and since no spine port is spent on cross-rail, it scales past that ceiling. Note what it keeps: each rail is still a two-tier fabric of its own. What "rail-only" drops is the connection *between* rails, not the second tier — §4.6.2's single-switch rail is the degenerate case, not the general one.
 
 ```
   SHARED SPINE  -  one tier; every rail lands on it
@@ -1514,22 +1513,26 @@ The spine is not the only way between rails. The scale-up fabric — NVLink/NVSw
 
 <p align="center"><em>Shared spine vs rail-only: the same 512-GPU SU attaches to one shared tier (16 SUs) or to isolated per-rail planes (128 SUs).</em></p>
 
-The trade is cost against generality. The MIT/Meta *rail-only* study [[5]](#ref-5) actually put numbers on it: 38–77% less network cost and 37–75% less power for the same training performance, at an 8.2–11.2% completion-time overhead on MoE all-to-all traffic. The bet is that cross-rail traffic stays light enough to live on scale-up.
+Here is the maximum each design reaches in two tiers, on 128-port spines:
 
-Here is the maximum cluster size each design reaches on 128-port spines for DGX B200 (8 GPU node):
+| System           | Rails | GPUs per SU | Shared spine    | Rail-only at scale |
+|------------------|-------|-------------|-----------------|--------------------|
+| DGX B200 node    | 8     | 1,024       | 16 SUs → 16,384 | 128 SUs → 131,072  |
+| DGX B300 node    | 8     | 512         | 16 SUs → 8,192  | 128 SUs → 65,536   |
+| GB200 NVL72 rack | 4     | 504         | 32 SUs → 16,128 | 128 SUs → 64,512   |
+| GB200 NVL72 rack | 8     | 1,008       | 16 SUs → 16,128 | 128 SUs → 129,024  |
+| GB300 NVL72 rack | 4     | 216         | 32 SUs → 6,912  | 128 SUs → 27,648   |
+| GB300 NVL72 rack | 8     | 504         | 16 SUs → 8,064  | 128 SUs → 64,512   |
 
-| Design                    | GPUs per SU | Max SUs (2-tier) | Max GPUs (2-tier) |
-|---------------------------|-------------|------------------|-------------------|
-| DGX B200, shared spine    | 512         | 16               | 8,192             |
-| DGX B200, rail-only       | 512         | 128              | 65,536            |
+<p align="center"><em>A shared spine caps at the same total whatever the rail count; rail-only scales with it.</em></p>
 
-**NVL72 changes the arithmetic.** Because the scale-up domain is now the whole rack, one SU spans **72 rails** and reaches **4,608 GPUs** — nine times a B200 SU. And the roadmap pushes further: two-tier scale-up domains (**NVL576**, **NVL1152**, §3.4.2) keep growing the island, which blurs the line between a scale-up domain and a scale-out pod.
+Two rules sit behind the columns. A **shared spine** reaches 128 leaves in total and an SU owns one per rail, so **max SUs = 128 ÷ rails** — and since a bigger SU costs proportionally fewer of them, the two-tier ceiling comes out at 128 × 64 × GPUs-per-port whatever the rail count. Look down the shared column: the NVL72 rows land on the same total at 4 rails and at 8. **Rail-only** gives each rail its own plane, whose spine reaches 128 leaves, one per SU — **128 SUs regardless of rail count** — so there the rail count does multiply, and doubling rails doubles the cluster.
 
-| Design                    | GPUs per SU | Max SUs (2-tier) | Max GPUs (2-tier) |
-|---------------------------|-------------|------------------|-------------------|
-| GB200 NVL72, shared spine | 4,608       | 1                | 4,608             |
+**NVL72 doesn't change the arithmetic the way you'd expect.** The bigger scale-up domain buys a *smaller* SU, not a larger one, because the rack spends its 72 NICs on four rails instead of eight. And the roadmap pushes further: two-tier scale-up domains (**NVL576**, **NVL1152**, §3.4.2) keep growing the island, which blurs the line between a scale-up domain and a scale-out pod.
 
-An NVL72 SU spans 72 leaves against the 128 a spine can reach, so a second full SU won't fit in two tiers — which is why the documented 9,216-GPU NVL72 pods need a third tier.
+So which do you build? The trade is cost against generality, and the MIT/Meta *rail-only* study [[5]](#ref-5) came down hard on the cost side: for LLM training, drop the shared spine and run the isolated per-rail planes instead. Same training performance, **38–77% less network cost and 37–75% less power** — because in these workloads the traffic really is rank-aligned, and what little crosses rails fits on scale-up. It also reaches roughly eight times as many GPUs, as the table shows. The exception is where the traffic stops being rank-aligned: **MoE all-to-all pays 8.2–11.2%** in completion time. So rail-only is the better buy for dense LLM training, and a shared spine is what you pay for the patterns that break the assumption — MoE today, and whatever the next model shape turns out to be.
+
+On this model, NVIDIA's documented **9,216-GPU** GB200 SuperPOD sits well inside two tiers. It is built with three because its SU is *itself* a leaf-and-spine block — eight leaves and six spines per rail group — rather than the bare leaf layer used here. That extra tier buys modularity, SUs you add in whole units, rather than reach: tier count follows how you want to package the build, not how many GPUs you need.
 
 #### 4.6.4 Multi-plane: splitting the NIC across fabrics
 
@@ -1541,12 +1544,14 @@ The attachment is a split at the NIC, and modern GPU NICs are built for it — a
 - **Oracle Acceleron** [[8]](#ref-8) (OCI Zettascale10 [[9]](#ref-9)): the NIC's built-in **four-port switch** fans the 800G port across **four planes** (4× 200G; an 8× 100G breakout gives eight), wired with **shuffle cables** (breakout at both ends, NIC and switch). Each plane is its own full-bisection Clos — built on a smaller **64-port 800G switch** than the 128-port part the walkthrough below uses — together interconnecting **hundreds of thousands of GPUs**.
 
 ```
-                      +---------------+
-                      |   GPU + NIC   |   the NIC is a 4-port switch
-                      +---------------+
-                      /    /     \    \
-                 200G/200G/   200G\    \200G    split via shuffle cable
-                    v    v        v     v
+                   +---------------------+
+                   |         GPU         |   the NIC is a 4-port switch
+                   |          |          |
+                   |          |          |
+                   +---[     NIC      ]--+
+                        /     /   \   \
+                 200G /  200G/ 200G\    \200G    split via shuffle cable
+                    v      v        v        v
             +-------+ +-------+ +-------+ +-------+
             |plane A| |plane B| |plane C| |plane D|
             | leaf+ | | leaf+ | | leaf+ | | leaf+ |
