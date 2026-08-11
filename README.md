@@ -1304,7 +1304,7 @@ Either way the shape is the same: the islands are the stations, the rails are th
 
 With this design, any two GPUs on the same rail can talk: one switch, one hop. But **the tracks never meet** — rail *i* and rail *j* are different switches with no port in common. So how does a GPU on rail *i* reach one on rail *j*? This is the **cross-rail** case, and the answer is simple: you change tracks the way you change trains — at the station, not on the track, and the station is the island.
 
-Hop over NVLink/Nvswitch to an in-island GPU that already sits on rail *j*, and send from there. That detour is NCCL's **PXN** — *PCI × NVLink* [[57]](#ref-57). Cross-rail rides scale-up, not a second switching tier.
+Hop over NVLink/NVSwitch to an in-island GPU that already sits on rail *j*, and send from there. That detour is NCCL's **PXN** — *PCI × NVLink* [[57]](#ref-57). Cross-rail rides scale-up, not a second switching tier.
 
 So both cases are covered without a spine — same-rail on the rail switch, cross-rail over NVLink — and you can build the whole fabric with one switch per rail and nothing above it. Each island's GPUs hang off an **NVSwitch** (§3), which is what makes the cross-rail hop possible:
 
@@ -1362,7 +1362,7 @@ Before the arithmetic, one counting rule: rails are counted in **NICs, not switc
 
 <p align="center"><em>What one rail switch can absorb, times the rails: the 400G generation doubles the density.</em></p>
 
-> **Why the NVL72 rows aren't round.** An 8-GPU node lands exactly **one** NIC on each rail, so any port count divides and the pod hits its ceiling. An NVL72 rack lands **18** — one per compute tray — and 18 divides none of 128, 256, 512 or 1024. A 128-port switch at one GPU per port holds 128 NICs, so 7 whole racks fit, not 7.1: **504 GPUs** against a ceiling of 512. The lost ports are the price of a 72-GPU island whose tray count is coprime with every switch radix on the market.
+> **Why the NVL72 rows aren't round.** An 8-GPU node lands exactly **one** NIC on each rail, so any port count divides and the pod hits its ceiling. An NVL72 rack lands **18** — one per compute tray — and 18 divides none of 128, 256, 512 or 1024. A 128-port switch at one GPU per port holds 128 NICs, so 7 whole racks fit, not 7.1: **504 GPUs** against a ceiling of 512. At eight rails a rack lands **9** instead, which divides no better. The lost ports are the price of a 72-GPU island whose tray count divides no switch radix on the market evenly.
 
 > \* **Roadmap.** The 512-port figure is NVIDIA's **SN6800** chassis (4× Spectrum-6 ASICs, co-packaged optics, liquid-cooled) — announced [[2]](#ref-2), shipping 2H 2026, not yet in volume. The 128-port parts (Tomahawk 6, SN6810) ship today and also come in liquid-cooled builds, so LC isn't the dividing line — radix and CPO integration are. And the 512-port math doesn't fully close: the four ASICs are stitched by a *passive* fiber shuffle (which reroutes light but switches nothing), and it's hard to see how 4 × 102.4T of silicon would expose a full 409.6T of **non-blocking** user bandwidth if the chips must spend ports talking to each other — on the usual arithmetic a non-blocking build would land nearer ~256 ports. NVIDIA doesn't publish the backplane/blocking ratio, so there's a piece here we can't reconcile; read 512 as raw aggregate, and treat this radix as belonging in the *spine* (§4.6.3) more than a spine-less rail switch.
 
@@ -1375,7 +1375,7 @@ The rails column is a **choice**, not a spec. An NVL72 has 72 NICs and grouping 
 
 <p align="center"><em>More rails buys pod size and spends per-rail width — the product barely moves.</em></p>
 
-Nothing is created by adding rails. **GPUs × NICs-per-rail stays at island size × switch radix**, so you are sliding along a fixed curve, trading width for reach — and since a rail is a switch, the last column is also the bill.
+Nothing is created by adding rails. **GPUs × NICs-per-rail stays put** — 9,072 either way, near enough the island size times the switch radix — so you are sliding along a fixed curve, trading width for reach — and since a rail is a switch, the last column is also the bill.
 
 Push it far enough and the design eats itself. At the extreme every rail holds a single NIC per rack: aggregate egress is unchanged, but a hot destination has one 800G path to it, losing that NIC cuts the rack off from that rail with no second way there, and you are buying a switch per NIC. **Four to eight rails is the usable band**, and NVIDIA ships four.
 
@@ -1384,6 +1384,8 @@ That's the whole rail-only block — same-rail one hop, cross-rail rail-local ov
 #### 4.6.3 Scaling past one pod: a spine over the rails
 
 Keep §4.6.2's design exactly as it is — same rails, same homing, same cross-rail over NVLink — and change one thing: stop spending every port on islands. Reserve some of each rail switch's ports facing **north**, as **uplinks** for a spine layer, and the block stops being terminal. It becomes replicable, and that is NVIDIA's **scalable unit (SU)**: "scalable" means *replicable*, and replicating SUs means wiring them together through a spine, which is what those uplinks are for. Split each switch's ports in half — half down to the islands, half up to the spine:
+
+That also earns the rail switch its usual name. §4.6.2 called it a switch because there was nothing above it, and a **leaf** is only a leaf relative to a spine (§4.6.1). Now that it has uplinks it is one, and the rest of this section calls it that. One caveat the name invites: a rail is still a set of NICs, not a box. It normally gets a leaf to itself, and the arithmetic below assumes that, but nothing forces it — two rails can share one leaf by splitting its ports, and a rail can outgrow a single leaf.
 
 ```
 
@@ -1414,26 +1416,26 @@ Keep §4.6.2's design exactly as it is — same rails, same homing, same cross-r
 
 Halving the downlinks halves the block. Run the same four systems through it:
 
-| Island            | NIC (GPUs per 800G port) | Rails | SU on 128-port<br>64 down / 64 up |
-|-------------------|--------------------------|-------|-----------------------------------|
-| DGX B200 node     | ConnectX-7 400G (2)      | 8     | 1,024 (128 nodes)                 |
-| DGX B300 node     | ConnectX-8 800G (1)      | 8     | 512 (64 nodes)                    |
-| GB200 NVL72 rack  | ConnectX-7 400G (2)      | 4     | 504 (7 racks)                     |
-| GB200 NVL72 rack  | ConnectX-7 400G (2)      | 8     | 1,008 (14 racks)                  |
-| GB300 NVL72 rack  | ConnectX-8 800G (1)      | 4     | 216 (3 racks)                     |
-| GB300 NVL72 rack  | ConnectX-8 800G (1)      | 8     | 504 (7 racks)                     |
+| Island            | NIC (GPUs per 800G port) | Rails | GPUs per SU<br>128-port, 64 down |
+|-------------------|--------------------------|-------|----------------------------------|
+| DGX B200 node     | ConnectX-7 400G (2)      | 8     | 1,024 (128 nodes)                |
+| DGX B300 node     | ConnectX-8 800G (1)      | 8     | 512 (64 nodes)                   |
+| GB200 NVL72 rack  | ConnectX-7 400G (2)      | 4     | 504 (7 racks)                    |
+| GB200 NVL72 rack  | ConnectX-7 400G (2)      | 8     | 1,008 (14 racks)                 |
+| GB300 NVL72 rack  | ConnectX-8 800G (1)      | 4     | 216 (3 racks)                    |
+| GB300 NVL72 rack  | ConnectX-8 800G (1)      | 8     | 504 (7 racks)                    |
 
 <p align="center"><em>An SU is half a spine-less pod — the other half of every port faces the spine.</em></p>
 
 The uplinks are the point. Each rail switch offers 64 of them, so an 8-rail SU presents **512 ports** upward and a 4-rail SU presents **256**; that budget is what the spine has to work with.
 
-One row is much worse than the others. A **GB300 NVL72 SU on 128-port switches holds three racks** — 64 downlinks against 18 NICs per rack fits 3, not 3.5, wasting 16% of the downlink budget where every other row wastes 2% or nothing. Shrinking the downlink half sharpens the divisibility problem from §4.6.2: the smaller the budget, the more a chunk of 18 costs you.
+One row is much worse than the others. A **GB300 NVL72 SU on 128-port switches holds three racks** — 64 downlinks against 18 NICs per rack fits 3, not 3.5, wasting 16% of the downlink budget where every other row wastes 2% or nothing. Shrinking the downlink half sharpens the divisibility problem from §4.6.2: the smaller the budget, the more a chunk of 18 costs you. 
 
-The 50/50 split is itself a choice — it makes the SU non-blocking toward the spine. Spend fewer ports upward (96 down, 32 up) and the SU grows by half again, at 3:1 oversubscription on everything leaving it.
+The 50/50 split is what **non-blocking** costs, and on a training fabric it is not really negotiable. Spending fewer ports upward — 96 down, 32 up — would grow the SU by half again, but §4.4 is the reason nobody does it here: the traffic does not statistically multiplex, so a 3:1 uplink gives every collective leaving the SU a third of the bandwidth, and the barrier makes the whole step wait for it. NVIDIA's SuperPOD reference architecture specifies a fully non-blocking fat tree per SU [[4]](#ref-4). Oversubscription does appear in real builds, but higher up, joining pods whose traffic is genuinely rarer — Meta's oversubscribed tier across "AI Zones" (§4.6.4). 
 
 Those uplinks now have to land somewhere. Fan them into a tier of **spine** switches and every rail switch can reach every other — in its own SU or any other. A set of SUs joined this way is a **SuperPOD**. You scale the number of SUs by adding more spines, and each leaf can run one or more links to each spine. (NVIDIA's DGX SuperPOD reference designs: B200 [[3]](#ref-3), GB200 NVL72 [[4]](#ref-4).)
 
-The example below takes the simplest case — a **DGX B300** node (8 GPUs nodes). It shows a SuperPOD of 16 SUs, the two-tier maximum, with 16 × 512 = 8,192 GPUs.
+The example below takes the simplest case — a **DGX B300** node (8 GPUs, one per port). It shows a SuperPOD of 16 SUs, the two-tier maximum, with 16 × 512 = 8,192 GPUs.
 
 ```
               +----------+  +----------+            +----------+
@@ -1526,17 +1528,74 @@ Here is the maximum each design reaches in two tiers, on 128-port spines:
 
 <p align="center"><em>A shared spine caps at the same total whatever the rail count; rail-only scales with it.</em></p>
 
-Two rules sit behind the columns. A **shared spine** reaches 128 leaves in total and an SU owns one per rail, so **max SUs = 128 ÷ rails** — and since a bigger SU costs proportionally fewer of them, the two-tier ceiling comes out at 128 × 64 × GPUs-per-port whatever the rail count. Look down the shared column: the NVL72 rows land on the same total at 4 rails and at 8. **Rail-only** gives each rail its own plane, whose spine reaches 128 leaves, one per SU — **128 SUs regardless of rail count** — so there the rail count does multiply, and doubling rails doubles the cluster.
+Two rules sit behind the columns. A **shared spine** reaches 128 leaves in total and an SU owns one per rail, so **max SUs = 128 ÷ rails** — and since a bigger SU costs proportionally fewer of them, the two-tier ceiling comes out at 128 × 64 × GPUs-per-port whatever the rail count. Look down the shared spine column: the GB200 rows land on exactly the same total at 4 rails and at 8. The GB300 4-rail row is the one that falls short, and only because its SU rounds down hardest — three racks out of a 64-port budget, the 16% waste noted above. **Rail-only** gives each rail its own plane, whose spine reaches 128 leaves, one per SU — **128 SUs regardless of rail count** — so there the rail count does multiply, and doubling rails doubles the cluster.
 
 **NVL72 doesn't change the arithmetic the way you'd expect.** The bigger scale-up domain buys a *smaller* SU, not a larger one, because the rack spends its 72 NICs on four rails instead of eight. And the roadmap pushes further: two-tier scale-up domains (**NVL576**, **NVL1152**, §3.4.2) keep growing the island, which blurs the line between a scale-up domain and a scale-out pod.
 
 So which do you build? The trade is cost against generality, and the MIT/Meta *rail-only* study [[5]](#ref-5) came down hard on the cost side: for LLM training, drop the shared spine and run the isolated per-rail planes instead. Same training performance, **38–77% less network cost and 37–75% less power** — because in these workloads the traffic really is rank-aligned, and what little crosses rails fits on scale-up. It also reaches roughly eight times as many GPUs, as the table shows. The exception is where the traffic stops being rank-aligned: **MoE all-to-all pays 8.2–11.2%** in completion time. So rail-only is the better buy for dense LLM training, and a shared spine is what you pay for the patterns that break the assumption — MoE today, and whatever the next model shape turns out to be.
 
-On this model, NVIDIA's documented **9,216-GPU** GB200 SuperPOD sits well inside two tiers. It is built with three because its SU is *itself* a leaf-and-spine block — eight leaves and six spines per rail group — rather than the bare leaf layer used here. That extra tier buys modularity, SUs you add in whole units, rather than reach: tier count follows how you want to package the build, not how many GPUs you need.
+Everything built in this section is a **two-tier** fabric — rail leaves below, spines above — and the numbers above are what two tiers reach, either way you wire them. Past that the fabric grows the way any Clos does: you add a tier. A core layer above the spines multiplies reach by roughly the radix again, which is how builds get from tens of thousands of GPUs to hundreds of thousands. We won't work it through: a third tier is ordinary Clos design, and the choices repeat the ones just made at two. 
+
+Where the extra tier goes is a packaging choice. Put it above the spines and the SU stays a bare leaf layer, as here; put it *inside* the SU — leaf plus its own spine, replicated as one unit — and the block you order gets bigger. NVIDIA's SuperPOD takes the second route: a GB200 SU is four rail groups of eight leaves and six spines each, joined by a core tier above [[4]](#ref-4). Three tiers either way, different unit of replication:
+
+```
+SPINE OUTSIDE THE SU  -  the SU is a leaf layer
+
+  +--------------------------------------------------------+
+  |           core tier  -  joins the spine groups         |
+  +--------------------------------------------------------+
+        | |  ..   |                           | |  ..   |
+         | | ..  |                             | | ..  |
+  +--------------------+                 +--------------------+
+  |     spine tier     |                 |     spine tier     |
+  +--------------------+                 +--------------------+
+         | | .. |                               | | .. |
+  +======================+              +======================+
+  |                      |              |                      |
+  | +------+    +------+ |              | +------+    +------+ |
+  | | rail |    | rail | |              | | rail |    | rail | |
+  | | leaf | .. | leaf | |              | | leaf | .. | leaf | |
+  | +------+    +------+ |   [...]      | +------+    +------+ |
+  |    |           |     |              |    |           |     |
+  |    +-----+-----+     |              |    +-----+-----+     |
+  |          |           |              |          |           |
+  |        nodes         |              |        nodes         |
+  +======================+              +======================+
+           SU 0                                   SU n
+
+  SPINE INSIDE THE SU  -  the SU is leaf + spine
+
+  +--------------------------------------------------------+
+  |              core tier  -  joins the SUs               |
+  +--------------------------------------------------------+
+        | |  ..  |                             | |  ..  |
+         | | .. |                               | | .. |
+  +========================+              +========================+
+  |                        |              |                        |
+  | +-------+    +-------+ |              | +-------+    +-------+ |
+  | | spine | .. | spine | |              | | spine | .. | spine | |
+  | +-------+    +-------+ |              | +-------+    +-------+ |
+  |   | .. |      | .. |   |              |   | .. |      | .. |   |
+  |    |  |        |  |    |              |    |  |        |  |    |
+  |  +------+    +------+  |              |  +------+    +------+  |
+  |  | rail |    | rail |  |              |  | rail |    | rail |  |
+  |  | leaf | .. | leaf |  |     [...]    |  | leaf | .. | leaf |  |
+  |  +------+    +------+  |              |  +------+    +------+  |
+  |     |           |      |              |     |           |      |
+  |     +-----+-----+      |              |     +-----+-----+      |
+  |           |            |              |           |            |
+  |         nodes          |              |         nodes          |
+  +========================+              +========================+
+            SU 0                                     SU n
+```
+
+<p align="center"><em>Same three tiers both times — only the SU boundary moves.</em></p>
 
 #### 4.6.4 Multi-plane: splitting the NIC across fabrics
 
-Adding that third tier is one way to grow. Multi-plane is the other — not a deeper fabric but a wider one: several two-tier fabrics run in parallel. That is multi-plane, and it is the design a Fibre Channel SAN already uses: two fabrics, **SAN A** and **SAN B**, that never touch, with every host attached to both, so losing a fabric just means traffic rides the other. A multi-plane GPU backend is the same move: several independent, disjoint leaf-spine fabrics — *planes* — every GPU attached to all of them.
+A third tier makes the fabric **deeper**. Multi-plane makes it **wider** — independent axes, not alternatives: a plane can itself be two tiers or three.
+
+The wide move is one a Fibre Channel SAN already makes: two fabrics, **SAN A** and **SAN B**, that never touch, with every host attached to both, so losing a fabric costs bandwidth rather than the job. A multi-plane GPU backend is the same — several independent, disjoint leaf-spine fabrics, called *planes*, with every GPU attached to all of them.
 
 The attachment is a split at the NIC, and modern GPU NICs are built for it — a SuperNIC like NVIDIA's ConnectX-8 [[6]](#ref-6) carries its own small Ethernet switch, so one 800 Gb/s port fans out to several planes instead of homing to one. Two public designs make it concrete:
 
@@ -2391,7 +2450,7 @@ This is why the practical sweet spot for positioning the AI edge today is the **
 
 None of this makes the deeper edge wrong — it makes it *demand-driven*. Where a workload genuinely needs it — the machine-timescale row of the table, backhaul-heavy sensor fleets, a factory floor — the business case justifies the site, and the grid's point is precisely to allow both (§10.2). The default just shouldn't be "everywhere": it should be "as central as the workload allows."
 
-### 10.2 The shape of the grid: one platform, unequal sites [DRAFT]
+### 10.2 The shape of the grid: one platform, unequal sites [DRAFT - NOT FOR READING]
 
 Strip the branding and the definition is simple: geographically distributed AI infrastructure, interconnected and operated as a single platform, with each workload placed where it runs best given latency, cost, and policy [[46]](#ref-46). The sites are *not* uniform — that heterogeneity is the whole point:
 
