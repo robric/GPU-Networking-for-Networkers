@@ -260,7 +260,7 @@ Two things refuse to sit neatly on one side — which is exactly the tell that t
 - **Storage shows up on both.** Bulk data-loading through the host CPU is *frontend*; the high-performance GPUDirect-Storage path is *backend*. Same data — different processor carrying it.
 - **OOB management** is technically its own *out-of-band* wire (to the BMCs), but it's a host/management concern, so it rides with the frontend.
 
-The takeaway that frames the whole doc: **the frontend is your existing skill set** (Ethernet, IP, BGP, load-balancing — §7); **the backend is the genuinely new thing** — the GPU datapath, in two fabrics (§3 scale-up, §4 scale-out). Everything hard lives on the path that skips the CPU.
+The takeaway that frames the whole doc: **the frontend is your existing skill set** (Ethernet, IP, BGP, load-balancing — §7); **the backend is the new thing** — the GPU datapath, in two fabrics (§3 scale-up, §4 scale-out). Everything hard lives on the path that skips the CPU.
 
 ### 1.5 The two workloads: training vs inference
 
@@ -704,7 +704,7 @@ Even so, scale-up still has a ceiling. You can keep stacking NVLink tiers, but e
 
 ### 3.5 Memory semantics: load/store vs send/receive
 
-Four sections on *how the wires are arranged*. Now the part that genuinely breaks networking intuition: **what travels over those wires, and how software asks for it.** NVLink doesn't move *messages* — it moves *memory accesses*, and that one difference is what makes a pile of GPUs feel like a single machine.
+Four sections on *how the wires are arranged*. Now the part that breaks networking intuition: **what travels over those wires, and how software asks for it.** NVLink doesn't move *messages* — it moves *memory accesses*, and that one difference is what makes a pile of GPUs feel like a single machine.
 
 There are two fundamentally different ways for one chip to get at data sitting in another:
 
@@ -808,9 +808,9 @@ So there's a hard ceiling — today, hundreds to a few thousand GPUs per NVLink 
 
 Inside each island, GPUs share memory over NVLink (§3.1–3.6). Between islands, they fall back to **message passing over the NIC** — RDMA packets across an InfiniBand or RoCE Clos (§4). Two fabrics, layered: a fast *memory* fabric inside the island, a routed *packet* fabric between islands.
 
-**The punchline — the boundary is also where you cut the workload.** This isn't just physics; it dictates *how a model is partitioned.* You match each kind of parallel traffic to the fabric that suits it:
+**The boundary is also where you cut the workload.** It decides how a model is partitioned — you match each kind of parallel traffic to the fabric that suits it:
 
-- **Tensor parallelism / MoE all-to-all** — chatty, fine-grained, latency-critical (an exchange *every layer*). This **must** live **inside** the scale-up island, on NVLink.
+- **Tensor parallelism / MoE all-to-all** — chatty, fine-grained, latency-critical (an exchange *every layer*). You prefer this **inside** the scale-up island, on NVLink. It is not pinned there — a TP degree or expert group larger than the island spills onto the NIC and runs, just far slower — which is precisely why you size the island to hold it.
 - **Data & pipeline parallelism** — coarser and less frequent (gradients once per step, activations once per stage). These ride **across** the scale-out fabric, where higher latency is tolerable.
 
 And *that* is the real reason NVIDIA keeps pushing the NVLink domain bigger (8 → 72 → 576): **a larger scale-up island lets more of the chatty, hard traffic stay on the fast memory fabric**, leaving the scale-out network to carry only the coarse stuff. Grow the island, relax the network.
@@ -823,14 +823,14 @@ So scale-up ends not at a number, but at a **role boundary**: it handles the tig
 
 > Goal: by the end you should see the scale-out fabric for what it is — **a data-center network you already know how to reason about** (Clos, packets, ECMP, congestion control) — but pushed to extremes that break the usual assumptions, and speaking **RDMA** instead of TCP.
 
-This half is home turf. Where scale-up (§3) was an alien *memory* fabric, scale-out is a **packet-switched network**: NICs, leaf and spine switches, links, routing, congestion control. You have built these. The twist is *what* runs on it and *how hard* it gets pushed:
+This half is home turf. Where scale-up (§3) was an alien *memory* fabric, scale-out is a **packet-switched network**: NICs, leaf and spine switches, links, routing, congestion control. The twist is *what* runs on it and *how hard* it gets pushed:
 
 - the endpoints are **GPUs, not servers**, and they talk **RDMA**, not sockets;
 - the traffic is a handful of **enormous, synchronized flows**, not millions of small independent ones;
 - the fabric is often required to be **lossless**, which is *not* how you built your last data center;
 - and a few giant flows wreck plain **ECMP**, so the fabric needs help — either a **rail-optimized** topology or a flatter Clos with **adaptive load balancing** (adaptive routing / packet spraying).
 
-Same golden rule as §3: map each piece to networking you already know, then flag exactly where GPU clusters diverge — because the places they diverge are where all the pain (and all the interesting engineering) lives.
+Same golden rule as §3: map each piece to networking, then flag exactly where GPU clusters diverge — because the places they diverge are where all the pain (and all the interesting engineering) lives.
 
 Scale-out, in seven steps:
 
@@ -1029,7 +1029,7 @@ Both fabrics deliver the GPU the identical RDMA verbs; the choice is about what 
 
 **AI breaks every clause of that.** A training step is **one** workload, not millions of independent ones. Its flows are **few** (one or a handful per GPU pair), **huge** (gigabytes per collective, elephants not mice), **synchronized** (they start on the same clock edge and all want peak bandwidth at once), and **correlated** (no averaging-out — it's all the same job stepping in lockstep). The very first casualty is oversubscription: AI backend fabrics are built **full-bisection (non-blocking)** because you can't lean on statistical multiplexing — but as we'll see, even a non-blocking fabric still suffers the three pathologies below, because they're about *where and when* traffic lands, not average capacity.
 
-**1. Elephant flows — and why they wreck ECMP.** ECMP spreads traffic by **hashing each flow** to a path. With millions of flows that averages out beautifully. With *eight* giant flows across *sixteen* links, hashing is a dice roll — two elephants collide on one link (running it at 200%) while others sit idle. One hot link throttles the whole collective:
+**1. Elephant flows — and why they wreck ECMP.** ECMP spreads traffic by **hashing each flow** to a path. With millions of flows the imbalance averages out. With *eight* giant flows across *sixteen* links, hashing is a dice roll — two elephants collide on one link (running it at 200%) while others sit idle. One hot link throttles the whole collective:
 
 ```
    FEW ELEPHANTS — per-flow ECMP hashing can't spread so few flows:
@@ -1650,11 +1650,13 @@ Multi-plane is one bet on getting past a single Clos, and the hyperscalers don't
 
 #### 4.6.5 Scaling across datacenters
 
-Past scale-up and scale-out sits a third axis, and it is the one a networker already runs: DCI. **Scale-up** wires GPUs inside a rack — NVLink, a few meters, copper for now. **Scale-out** is everything from §4.1 to here: the RDMA fabric across a datacenter hall, pluggable optics over hundreds of meters to a few kilometers. **Scale-across** is the same idea stretched between buildings — one XPU cluster spread over several datacenters, tens to thousands of kilometers apart, carried on dedicated **DCI** (data-center-interconnect) optics rather than the public WAN [[17]](#ref-17). Oracle's Zettascale10, the hundreds-of-thousands-of-GPU build from the last section, already spans multiple sites [[9]](#ref-9).
+Past scale-up and scale-out sits a third axis, and it is the one a networker already runs: DCI. **Scale-up** wires GPUs inside a rack — NVLink, a few meters, copper for now. **Scale-out** is everything from §4.1 to here: the RDMA fabric across a datacenter hall, pluggable optics over hundreds of meters to a few kilometers. **Scale-across** is the same idea stretched between buildings — one GPU cluster, spread over several datacenters, tens to thousands of kilometers apart, carried on dedicated **DCI** (data-center-interconnect) optics rather than the public WAN [[17]](#ref-17). Oracle's Zettascale10, the hundreds-of-thousands-of-GPU build from the last section, already spans multiple sites [[9]](#ref-9).
 
-The driver is power, not networking. You cannot get the megawatts, land, and cooling to sit a million XPUs in one building, and multiple million-XPU clusters are planned for around 2027*. So the cluster spills across buildings, a campus, or a metro, and the back-end fabric follows it out onto fiber that no longer stays inside one hall.
+The driver is power, not networking. You cannot get the megawatts, land, and cooling to sit a million GPUs in one building, and multiple million-GPU clusters are planned for around 2027*. So the cluster spills across buildings, a campus, or a metro, and the back-end fabric follows it out onto fiber that no longer stays inside one hall.
 
 The limit is the barrier from §4.4. Synchronous training is one giant collective, and the slowest path sets the step time — except now a link's delay is the speed of light over distance, not queueing. That caps a tightly-coupled run at a few hundred kilometers of separation [[17]](#ref-17); past that you fall back on the latency-tolerant parallelism of §5 — pipeline stages, which can hide a long link, rather than tensor shards, which cannot. The physical layer is coherent optics over DWDM — 800G ZR/ZR+ pluggables in the backend routers today, 1.6T pluggables and hollow-core fiber* on the way — front-ended by deep-buffer DCI routers (Broadcom's Jericho class) that absorb the bandwidth-delay product a long link builds up.
+
+> \* **Announced, not yet ordinary.** The 2027 million-GPU clusters are plans, not builds. **Hollow-core fiber** guides light through air rather than glass, so propagation delay drops by roughly a third — real enough that Microsoft runs over 1,280 km of it live in Azure and is scaling manufacturing [[59]](#ref-59), but still one operator's build-out rather than standard DCI plant. It is the only item in that list that moves the distance limit instead of the bandwidth.
 
 Zoom back into any one of these fabrics — a plane, a pod, a hall — and the §4.4 problem is unchanged: a few giant flows overload one path at a time while the parallel paths sit idle. Spreading them is the steering problem of §4.7.
 
@@ -1662,18 +1664,18 @@ Zoom back into any one of these fabrics — a plane, a pod, a hall — and the �
 
 **Load balancing — from a static hash to adaptive spray.** Topology lays down many paths between two GPUs; steering decides which one each packet takes. The baseline you run everywhere is **per-flow ECMP**: hash the 5-tuple, pin the whole flow to one path. §4.4 showed why it breaks on AI traffic — a handful of huge, long-lived flows have almost no entropy to hash on, so two elephants collide on one link while parallel links idle. Fixing it takes two moves at once: **finer granularity** (stop moving whole flows) and **feedback** (stop choosing blind). Start with granularity:
 
-| granularity      | unit moved | reorder risk        | where you see it |
-|------------------|------------|---------------------|------------------|
-| per-flow ECMP    | whole flow | none                | today's default  |
-| flowlet          | a burst    | low (gaps absorb)   | adaptive routing |
-| per-packet spray | one packet | high (NIC reorders) | Spectrum-X / UEC |
+| granularity      | unit moved | reorder risk        | where you see it               |
+|------------------|------------|---------------------|--------------------------------|
+| per-flow ECMP    | whole flow | none                | today's default                |
+| flowlet          | a burst    | low (gaps absorb)   | Ethernet DLB, CONGA-style      |
+| per-packet spray | one packet | high (NIC reorders) | InfiniBand AR, Spectrum-X, UEC |
 
 - **Flowlet switching** splits a flow at the natural gaps between bursts and rebalances per burst; if a gap is longer than the worst path-delay difference, reordered packets can't overtake, so it's a safe win — when the gaps exist.
 - **Per-packet spraying** is the limit case: every packet of one flow is balanced independently across *all* equal-cost paths, so a 400G elephant smears across the whole fabric and no link runs hot.
 
 **Feedback: two places to decide.** Granularity says *how much* to move at a time; feedback says *choose by load, not by hash* — and that decision lives in two places, both now in play:
 
-- **In the switch — adaptive routing.** The switch picks the egress port by **real-time queue occupancy** instead of a fixed hash. InfiniBand has done this in-fabric for years (SM-computed routes plus adaptive port selection — the *subnet-manager-owns-the-fabric* pattern again); on Ethernet it is recent, the **Spectrum-X** switch picking the least-loaded port per packet [[15]](#ref-15).
+- **In the switch — adaptive routing.** The switch picks the egress port by **real-time queue occupancy** instead of a fixed hash. InfiniBand has done this in-fabric for years (SM-computed routes plus adaptive port selection — the *subnet-manager-owns-the-fabric* pattern again), and it is fine-grained enough that packets of one flow arrive out of order, which is why ConnectX adapters carry hardware reordering [[60]](#ref-60). On Ethernet it is recent, the **Spectrum-X** switch picking the least-loaded port per packet [[15]](#ref-15).
 - **At the edge — the transport sprays and steers.** The sending NIC scatters a flow's packets across many paths or planes, watches **per-path congestion** (ECN), shifts off the hot ones, and the receiver reorders. This is where the industry converged, under three names: AWS **SRD** (RTT-aware spray, reorder in the Nitro NIC) [[13]](#ref-13); the open **MRC** transport (OpenAI / OCP — per-packet entropy-value spray, per-path ECN feedback, out-of-order placement straight into GPU memory) [[16]](#ref-16); and Spectrum-X's NIC **Plane Load Balancer**, the "which plane" decision §4.6.4 left open [[15]](#ref-15). Same shape all three: endpoint-driven adaptive spray with hardware reorder.
 
 Both moves point the same way — off the static per-flow hash toward **adaptive, fine-grained** placement, split between a switch that picks ports and a NIC that picks paths and cleans up the disorder.
@@ -1736,7 +1738,7 @@ The vocabulary is portable. The same operations run on every vendor's silicon th
 
 You never train a frontier model on one GPU, so you cut it across many — and every cut leaves a **seam** that communication has to sew shut. The cut you choose *is* the traffic you generate. Four of them matter:
 
-| Parallelism   | Splits                       | Pattern on the wire                        | Cadence         | Rides on            |
+| Parallelism   | Splits                       | Pattern on the wire                        | Cadence         | Prefers             |
 |---------------|------------------------------|--------------------------------------------|-----------------|---------------------|
 | Data (DP)     | the batch; model replicated  | all-reduce (gradients)                     | once / step     | scale-out           |
 | Tensor (TP)   | each weight matrix           | all-reduce (= reduce-scatter + all-gather) | ~2× / layer     | scale-up (NVLink)   |
@@ -2621,6 +2623,8 @@ Where this leaves the networker: the grid is real as an architecture and young a
 56. <a id="ref-56"></a>arXiv — *AI Inference as Relocatable Electricity Demand* (the structural asymmetry: electricity transmission is cost-constrained while compute relocation is latency-constrained, implying a hierarchical geography of inference infrastructure). <https://arxiv.org/pdf/2604.27855>
 57. <a id="ref-57"></a>NVIDIA — *Doubling all2all Performance with NVIDIA Collective Communication Library 2.12* (introduces **PXN**, "PCI × NVLink": rather than sending from its own memory, a GPU writes over NVLink into a buffer on the intermediate GPU that owns the right NIC, which then sends out over PCI — keeping cross-rail traffic on the scale-up fabric in rail-optimized topologies). <https://developer.nvidia.com/blog/doubling-all2all-performance-with-nvidia-collective-communication-library-2-12/>
 58. <a id="ref-58"></a>NVIDIA — *ConnectX-8 SuperNICs Advance AI Platform Architecture with PCIe Gen6 Connectivity* (the first SuperNIC to integrate a PCIe Gen6 switch with 800G networking in one device: 48 lanes of PCIe Gen6 and a direct Gen6 x16 link to the B300 GPU, eliminating the discrete PCIe switch chips of earlier boards; GB300 NVL72 and HGX B300 are the first deployments). <https://developer.nvidia.com/blog/nvidia-connectx-8-supernics-advance-ai-platform-architecture-with-pcie-gen6-connectivity>
+59. <a id="ref-59"></a>Microsoft — *The Deployment of Hollow Core Fiber (HCF) in Azure's Network* (HCF live across Azure regions — over 1,280 km deployed, ~33% lower latency and ~47% faster transmission than single-mode fibre, since light travels through air rather than glass). <https://techcommunity.microsoft.com/blog/azurenetworkingblog/the-deployment-of-hollow-core-fiber-hcf-in-azure%E2%80%99s-network/4395340>
+60. <a id="ref-60"></a>NVIDIA — *NVIDIA InfiniBand Adaptive Routing Technology* (the switch ASIC selects the least-loaded output port by egress queue depth and path priority; this "can cause the network packets to arrive at their destination out-of-order", handled in hardware by ConnectX-5 and later — i.e. AR is finer-grained than flowlet switching). <https://hardwarenation.com/wp-content/uploads/2021/09/infiniband-white-paper-adaptive-routing.pdf>
 
 # TODO list tracking
 
