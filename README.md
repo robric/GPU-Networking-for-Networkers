@@ -1908,13 +1908,13 @@ One row carries the chapter: **CUDA is NVIDIA's ASIC SDK — and the moat.** Eve
 
 Bottom to top, the software above the silicon is five thin layers.
 
-- **CUDA driver** — one name, two artifacts. The **kernel module** (`nvidia.ko`, plus `nvidia-uvm.ko` for unified memory) owns the hardware: memory mapping, DMA, and the PCIe/NVLink links — the counterpart of the platform driver beneath your NOS. Above it, still *inside the driver package*, sits **`libcuda.so`** — the user-space **driver API** (`cu*` calls) that `ioctl`s into the kernel module, and where the PTX JIT of §6.2 actually runs.
+- **CUDA driver** — one name, two artifacts on the host and one on the GPU. The **kernel module** (`nvidia.ko`, plus `nvidia-uvm.ko` for unified memory) is the host-side **Resource Manager**: memory mapping, DMA setup, and the PCIe/NVLink links — the counterpart of the platform driver beneath your NOS. That is only half of it. The other half is **GSP-RM**, running on the **GPU System Processor** (GSP) — a RISC-V core on the die with its own real-time OS, which the kernel module bootstraps and then drives over RPC rather than programming the chip directly. On Blackwell it isn't optional: those GPUs run only on the open kernel modules, and those require GSP [[66]](#ref-66). Above the kernel boundary, still *inside the driver package*, sits **`libcuda.so`** — the user-space **driver API** (`cu*` calls) that `ioctl`s into the kernel module to set up, and where the PTX JIT of §6.2 actually runs.
 - **CUDA runtime + toolkit** — **`libcudart.so`**, the **runtime API** (`cuda*` calls, the `<<< >>>` launch syntax): a convenience layer over `libcuda` carrying the programming model — kernels (functions that run on the GPU), **streams** (ordered queues of work — the handles that let compute and communication overlap, §5.1), and device memory. It ships with the **toolkit**, not the driver, which is why the two version independently (the driver just has to be new enough). This is the SDK every layer above targets.
 - **Math and comms libraries** — almost nobody writes raw kernels; you call libraries. **cuBLAS / cuDNN / CUTLASS** for the matrix math a model is mostly built from, and **NCCL** for the collectives of §5. AMD ships the mirror set (rocBLAS, MIOpen, **RCCL**); Intel has oneAPI (oneMKL, **oneCCL**).
 - **Framework** — **PyTorch**, **JAX**, or **TensorFlow**: tensors, autograd, and a dispatcher that turns each operation into the right library or kernel call. This is where the model is written. They differ mainly on *when the graph is built* (§6.2): PyTorch is eager-first with compilation retrofitted (`torch.compile`) and explicit parallelism (DDP/FSDP); JAX is compiled-first through XLA, which also places the collectives from sharding annotations; TensorFlow pioneered graphs but is now legacy. In the wild the pairing is roughly **NVIDIA → PyTorch, TPU → JAX** — the ecosystem's weight (Hugging Face, Megatron, vLLM) sits on the PyTorch-on-CUDA path, which is what makes the moat of §6.1 so deep in practice.
 - **App / recipe** — the model and its training or serving loop, usually assembled from higher-level libraries: **Hugging Face**, **Megatron-LM**, **DeepSpeed**. This includes inference: an engine like **vLLM** or **TensorRT-LLM** is the same stack with a serving loop in the top slot (§6.3) — only the *fleet* layer of §6.3 lives outside it, on the CPU/frontend side.
 
-Zoom into those bottom layers — "driver" and "runtime" are three artifacts on disk, split by the kernel boundary:
+Zoom into those bottom layers — "driver" and "runtime" are four artifacts on disk, split by two boundaries: the kernel's, and the GPU die's:
 
 ```
         app / framework / libraries
@@ -1926,17 +1926,25 @@ Zoom into those bottom layers — "driver" and "runtime" are three artifacts on 
    +----------------------------+   cu* calls  (cuMemAlloc, cuLaunchKernel)
    |  libcuda.so  (driver API)  |   ships with the DRIVER - user space,
    +----------------------------+   home of the PTX JIT (§6.2)
-                 |  ioctl
+                 |  ioctl  (setup)
    - - - - - - - + - - - - - - -    kernel boundary
                  |
-   +----------------------------+   owns the hardware: memory mapping,
-   |  nvidia.ko  (+ uvm, ...)   |   DMA, the PCIe / NVLink links
+   +----------------------------+   host-side Resource Manager:
+   |  nvidia.ko  (+ uvm, ...)   |   mappings, DMA setup, PCIe / NVLink
+   +----------------------------+
+                 |  RPC
+   - - - - - - - + - - - - - - -    the die boundary
+                 |
+   +----------------------------+   GSP-RM on a RISC-V core:
+   |  GSP   (on the GPU)        |   runlists, power, clocks, MMU setup
    +----------------------------+
                  |
-                GPU
+             GPU engines
 ```
 
-<p align="center"><em>"Driver" and "runtime" on disk: libcudart wraps libcuda, which ioctls into the kernel module. Driver and toolkit version independently.</em></p>
+<p align="center"><em>libcudart wraps libcuda, which ioctls into nvidia.ko, which drives GSP-RM over RPC.</em></p>
+
+**Setup goes through the kernel module; work does not.** Those `ioctl`s allocate memory, map it, and create the queues — then get out of the way. To put work on the GPU, `libcuda` writes commands into a ring buffer it already has mapped, advances a producer index, and makes one store to a **doorbell** register the GPU exposes over PCIe. The GPU fetches the commands by DMA, runs them, and signals completion by writing a value the CPU polls. No system call on that path. That is a NIC descriptor ring — producer and consumer indices, a doorbell, DMA, a completion — and like DPDK's it lives in **user space**: the kernel allocates the queues and maps them, then is off the fast path entirely. Same bargain as §4.2's kernel bypass, struck on the PCIe side rather than the network side [[67]](#ref-67). NVMe works the same way; only the names change.
 
 The reason to draw it as a stack is the reason it matters to you: whatever the entry point — app, framework, or library — every road down to the silicon passes through one gate:
 
@@ -2033,7 +2041,7 @@ The middle stage is the one to remember: PTX is that virtual ISA, and the driver
 
 <p align="center"><em>PTX is forward-portable, like any bytecode: the driver recompiles it for whatever GPU it lands on.</em></p>
 
-Two fine-print caveats a networker would want on the datasheet: the JIT trick only works **if the PTX is actually shipped in the fat binary** — `nvcc` embeds it per `-gencode` settings, while Clang always builds SASS and makes PTX inclusion opt-in (`--cuda-include-ptx`) [[23]](#ref-23); and the *architecture-specific* targets (the `a` suffix — `sm_90a`, `sm_100a`, used to reach some Hopper/Blackwell-only features) trade that portability away — they are **not** forward-compatible.
+Two things break that portability: a binary with no PTX in it runs only on the GPUs it was compiled for, and code built for an architecture-specific target (`sm_90a`, `sm_100a`) will not run on a later GPU at all.
 
 (**Triton** from the compiled path above is a third front end that also lowers to PTX, so it rides the same tail.) **CUDA graphs** add a second trick — capture a whole launch sequence once and replay it as a unit, erasing per-launch overhead in the tight loops where it hurts most (the decode loop of §5.4).
 
@@ -2639,6 +2647,8 @@ Where this leaves the networker: the grid is real as an architecture and young a
 63. <a id="ref-63"></a>NVIDIA — *Inside the NVIDIA Vera Rubin Platform: Six New Chips, One AI Supercomputer* (ConnectX-9 SuperNIC delivers 1.6 Tb/s of scale-out bandwidth per Rubin GPU, against NVLink 6 at 3,600 GB/s aggregate per GPU). <https://developer.nvidia.com/blog/inside-the-nvidia-rubin-platform-six-new-chips-one-ai-supercomputer/>
 64. <a id="ref-64"></a>P. Patarasuk, X. Yuan — *Bandwidth Optimal All-reduce Algorithms for Clusters of Workstations.* Journal of Parallel and Distributed Computing 69(2):117–124, 2009 (derives the tight lower bound on the data an all-reduce must move and shows the ring algorithm achieves it: 2(N−1) steps of one 1/N chunk each, so 2(N−1)/N buffers' worth per node; contention-free on realistic topologies, unlike the butterfly algorithms). <https://www.cs.fsu.edu/~xyuan/paper/09jpdc.pdf>
 65. <a id="ref-65"></a>NVIDIA — *Massively Scale Your Deep Learning Training with NCCL 2.4* (double binary trees: a single binary tree leaves half the ranks as leaves while interior nodes carry twice the traffic, so NCCL builds two complementary trees in which each rank is a leaf in one and an interior node in the other — "full bandwidth and a logarithmic latency", up to 180× latency improvement at 24,576 GPUs on Summit; NCCL switches back to rings where that yields greater bandwidth). <https://developer.nvidia.com/blog/massively-scale-deep-learning-training-nccl-2-4/>
+66. <a id="ref-66"></a>NVIDIA — *Linux Driver README: "GSP Firmware" and "Open Linux Kernel Modules"* (the GPU System Processor is a RISC-V coprocessor that offloads GPU initialization and management; the Resource Manager splits into CPU-RM in the kernel module and GSP-RM running on the GPU, talking over RPC. Blackwell and later are supported only by the open kernel modules, which depend on GSP and cannot disable it — `NVreg_EnableGpuFirmware=0` remains only on the proprietary modules. Firmware ships as `gsp_*.bin` under `/lib/firmware/nvidia/<version>/`). <https://download.nvidia.com/XFree86/Linux-x86_64/580.65.06/README/gsp.html>
+67. <a id="ref-67"></a>AI Infrastructure — *Your GPU Is a Separate Computer* (the command-submission path in detail: BAR windows, MMIO control writes versus DMA bulk transfer, the doorbell register, the GPFIFO ring and pushbuffers, producer/consumer indices, and semaphore completion signalling — and the observation that the same ring/doorbell pattern appears in NVIDIA, AMD and Intel GPUs as well as in NICs and NVMe SSDs, only the names differing). <https://medium.com/ai-infrastructure/part-1-your-gpu-is-a-separate-computer-d029ce9f3d77>
 
 # TODO list tracking
 
