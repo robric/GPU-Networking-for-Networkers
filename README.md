@@ -55,7 +55,7 @@ The golden rule for the whole document: **whenever something looks like magic, w
 - [5. Collectives: the traffic the fabric carries](#5-collectives-the-traffic-the-fabric-carries)
   - [5.1 Where the traffic comes from: parallelism](#51-where-the-traffic-comes-from-parallelism)
   - [5.2 The catalog: what each collective does to a tensor](#52-the-catalog-what-each-collective-does-to-a-tensor)
-  - [5.3 On the wire: ring, tree, and letting the switch do the math](#53-on-the-wire-ring-tree-and-letting-the-switch-do-the-math)
+  - [5.3 On the wire: ring, tree, and offloading to the switch](#53-on-the-wire-ring-tree-and-offloading-to-the-switch)
   - [5.4 Two workloads, two traffic shapes: training vs inference](#54-two-workloads-two-traffic-shapes-training-vs-inference)
 - [6. The software stack: from the model to the silicon](#6-the-software-stack-from-the-model-to-the-silicon)
   - [6.1 The stack, from driver to app](#61-the-stack-from-driver-to-app)
@@ -72,8 +72,9 @@ The golden rule for the whole document: **whenever something looks like magic, w
   - [8.4 The hyperscalers: silicon you mostly can't buy](#84-the-hyperscalers-silicon-you-mostly-cant-buy)
 - [9. Open standards: the fabric without the vendor](#9-open-standards-the-fabric-without-the-vendor)
   - [9.1 The scale-up front: answering NVLink](#91-the-scale-up-front-answering-nvlink)
-  - [9.2 The scale-out front: answering InfiniBand](#92-the-scale-out-front-answering-infiniband)
-  - [9.3 Where it leaves the networker](#93-where-it-leaves-the-networker)
+  - [9.2 The ESUN frame: Ethernet without IP](#92-the-esun-frame-ethernet-without-ip)
+  - [9.3 The scale-out front: rebuilding RDMA on Ethernet](#93-the-scale-out-front-rebuilding-rdma-on-ethernet)
+  - [9.4 Where it leaves the networker](#94-where-it-leaves-the-networker)
 - [Glossary](#glossary)
 - [References](#references)
 
@@ -1035,7 +1036,7 @@ The same correspondence, layer by layer — note the transport (bottom) is struc
 - **NVIDIA — vertically integrated.** It sells *both* answers: **InfiniBand** (Quantum) and its own AI-Ethernet, **Spectrum-X** (a proprietary RoCE with adaptive routing and built-in congestion control). Choosing IB *or* Ethernet can still mean staying all-NVIDIA — Spectrum-X is what runs xAI's Colossus.
 - **Broadcom — the merchant backbone.** Its **Tomahawk** (scale-out, now 102.4 Tb/s) and **Jericho** (scale-across) ASICs sit under almost everyone who isn't buying Spectrum-X — *including the hyperscalers' own switches.*
 
-That last point is the easy one to get wrong: AWS, Google and Meta are **not** a third silicon camp. They wrap **Broadcom** switch chips in their own white-box hardware, their own network OS (Meta's FBOSS, SONiC), and — the part they genuinely own — their own NICs and transport (AWS's **Nitro** running the **SRD** protocol). The only fully in-house *silicon* on that path is the NIC/DPU and the accelerator's scale-up link (Google's **TPU** interconnect + optical-circuit switches), **not** the Ethernet switch.
+That last point is the easy one to get wrong: AWS, Google and Meta are **not** a third silicon camp. They wrap **Broadcom** switch chips in their own white-box hardware, their own network OS (Meta's FBOSS, SONiC), and — the part they own — their own NICs and transport (AWS's **Nitro** running the **SRD** protocol). The only fully in-house *silicon* on that path is the NIC/DPU and the accelerator's scale-up link (Google's **TPU** interconnect + optical-circuit switches), **not** the Ethernet switch.
 
 Two things to carry out of here:
 
@@ -1365,7 +1366,7 @@ Call this design **spine-less rail-only**. It is deliberately **not a Clos**: ea
 
 That's the trade: you have swapped a whole spine layer for NVLink hops, so spine-less rail-only stands or falls on scale-up.
 
-- **Strong scale-up** (large NVLink domains) → cross-rail rides NVLink and the spine is genuinely optional.
+- **Strong scale-up** (large NVLink domains) → cross-rail rides NVLink and the spine is optional.
 - **Weak or no scale-up** → cross-rail has nowhere to go, so you keep the baseline's spine.
 
 That coupling is why rail-only is most at home on NVIDIA. It is about the *size and speed* of the domain, not NVIDIA being the only one with one — AMD and Intel both ship scale-up, but top out at 8 accelerators against NVIDIA's 72, at roughly half the per-GPU bandwidth, which is not enough to soak up cross-rail (§8).
@@ -1454,7 +1455,7 @@ The uplinks are the point. Each rail switch offers 64 of them, so an 8-rail SU p
 
 One row is much worse than the others. A **GB300 NVL72 SU on 128-port switches holds three racks** — 64 downlinks against 18 NICs per rack fits 3, not 3.5, wasting 16% of the downlink budget where every other row wastes 2% or nothing. Shrinking the downlink half sharpens the divisibility problem from §4.6.2: the smaller the budget, the more a chunk of 18 costs you. 
 
-The 50/50 split is what **non-blocking** costs, and on a training fabric it is not really negotiable. Spending fewer ports upward — 96 down, 32 up — would grow the SU by half again, but §4.4 is the reason nobody does it here: the traffic does not statistically multiplex, so a 3:1 uplink gives every collective leaving the SU a third of the bandwidth, and the barrier makes the whole step wait for it. NVIDIA's SuperPOD reference architecture specifies a fully non-blocking fat tree per SU [[4]](#ref-4). Oversubscription does appear in real builds, but higher up, joining pods whose traffic is genuinely rarer — Meta's oversubscribed tier across "AI Zones" (§4.6.4). 
+The 50/50 split is what **non-blocking** costs, and on a training fabric it is not really negotiable. Spending fewer ports upward — 96 down, 32 up — would grow the SU by half again, but §4.4 is the reason nobody does it here: the traffic does not statistically multiplex, so a 3:1 uplink gives every collective leaving the SU a third of the bandwidth, and the barrier makes the whole step wait for it. NVIDIA's SuperPOD reference architecture specifies a fully non-blocking fat tree per SU [[4]](#ref-4). Oversubscription does appear in real builds, but higher up, joining pods whose traffic is rarer — Meta's oversubscribed tier across "AI Zones" (§4.6.4). 
 
 Those uplinks now have to land somewhere. Fan them into a tier of **spine** switches and every rail switch can reach every other — in its own SU or any other. A set of SUs joined this way is a **SuperPOD**. You scale the number of SUs by adding more spines, and each leaf can run one or more links to each spine. (NVIDIA's DGX SuperPOD reference designs: B200 [[3]](#ref-3), GB200 NVL72 [[4]](#ref-4).)
 
@@ -1826,7 +1827,7 @@ Three things to take from the picture:
 - **The one identity to memorize: all-reduce = reduce-scatter + all-gather** (in that order). Sum-and-split so each GPU owns the finished sum of one slice (reduce-scatter), then gather the slices back so everyone has the whole result (all-gather) — you can't gather a sum you haven't computed yet. Trace it in the picture: reduce-scatter leaves `S0..S3` one per GPU, and all-reduce's `[S0 S1 S2 S3]` on every GPU is exactly those gathered. It's how a fast all-reduce is built (§5.3). FSDP (§5.1) uses the *same two primitives in the opposite order and for different buffers*: an **all-gather** to rebuild the weights *before* a layer runs, a **reduce-scatter** to shard the gradients *after* — the two halves repurposed, not one all-reduce.
 - **Which job fires which is the §5.1 table.** DP and TP live on all-reduce; FSDP on all-gather + reduce-scatter; MoE on all-to-all; broadcast mostly shows up at setup, handing the initial weights to every replica. The point-to-point send/recv of pipeline and KV cache isn't here — it never was a collective.
 
-### 5.3 On the wire: ring, tree, and letting the switch do the math
+### 5.3 On the wire: ring, tree, and offloading to the switch
 
 A collective is an *algorithm*, not a single transfer. The same all-reduce can be laid over the physical links several ways, and the choice sets how many bytes cross the wire and how long the barrier lasts. Two families matter.
 
@@ -2294,22 +2295,22 @@ That shaped the scale-up story for two generations. The MI300X and MI355X wire *
 
 **Helios closes that gap.** 72 MI455X GPUs in one scale-up domain, each carrying **36 UALink-over-Ethernet (UALoE) links at 400 Gb/s** — 3.6 TB/s per GPU, the same figure NVIDIA quotes for NVLink 6 on Rubin [[63]](#ref-63). The switch layer is **12 Broadcom Tomahawk 6 ASICs** across six switch trays; every GPU sends three links to every switch, so the fabric is single-hop all-to-all like an NVSwitch tray, spread over 12 planes rather than 36 chips [[73]](#ref-73). Domain size and per-GPU bandwidth read the same on both datasheets.
 
-It gets there on Broadcom silicon. UALink is still a standard and a bet, not a shipping fabric: no native UALink switch is shipping yet, with announced targets running from late 2026 into 2027, and **Broadcom** — volume switch vendor and UALink founder — has since backed the Ethernet path (ESUN) instead, leaving no high-volume UALink switch to buy [[29]](#ref-29). So AMD carries the protocol over Ethernet; UALink and ESUN compose rather than compete, and §9 has the contest. Even AMD's scale-up is Ethernet underneath.
+It gets there on Broadcom silicon. UALink is still a standard and a bet, not a shipping fabric: no native UALink switch is shipping yet, with announced targets running from late 2026 into 2027, and **Broadcom** — volume switch vendor and UALink founder — has since backed the Ethernet path (ESUN) instead, leaving no high-volume UALink switch to buy [[29]](#ref-29). So AMD carries the protocol over Ethernet — its own Hot Chips material counts those links as *Infinity Fabric over Ethernet*, which is what UALink's protocol layer was derived from (§9.1). On AMD's telling UALink and ESUN compose rather than compete; §9 has the argument. Even AMD's scale-up is Ethernet underneath.
 
-Which makes it worth asking what a switch is *for*. §3.7 ended on fabrics that compute: an NVSwitch does not only move bytes, it runs **SHARP** — the arithmetic and multicast offloads of §5.2 and §5.3 — so an all-reduce is summed inside the switch and a broadcast is replicated there. Helios has no equivalent. Broadcom sells one: **Tomahawk Ultra**, 250 ns a hop with **in-network collectives (INC)** for all-reduce, all-gather and broadcast, built to answer NVLink [[71]](#ref-71). It is a different chip from Tomahawk 6 at half the capacity — 51.2 Tbps against 102.4 — and Helios took the bandwidth. The protocol offers no way back: **UALink 1.0 carries no collective offload**, and in-network collectives arrive only in **UALink 2.0\*** [[72]](#ref-72).
+§3.7 ended on fabrics that compute: an NVSwitch does not only move bytes, it runs **SHARP** — the arithmetic and multicast offloads of §5.2 and §5.3 — so an all-reduce is summed inside the switch and a broadcast is replicated there. Helios has no equivalent. Broadcom sells one: **Tomahawk Ultra**, 250 ns a hop with **in-network collectives (INC)** for all-reduce, all-gather and broadcast, built to answer NVLink [[71]](#ref-71). It is a different chip from Tomahawk 6 at half the capacity — 51.2 Tbps against 102.4 — and Helios took the bandwidth. The protocol offers no way back: **UALink 1.0 carries no collective offload**, and in-network collectives arrive only in **UALink 2.0\*** [[72]](#ref-72).
 
-That costs less than it sounds and more than a spec table shows. RCCL still runs a ring or a tree over UALoE at the full 3.6 TB/s, so nothing here is impossible; AMD pays in GPU cycles spent on arithmetic NVIDIA does in the switch, and in the wire volume multicast would have saved. It bites where §5 says it bites — the all-reduce sitting on the barrier — not bulk bandwidth.
+RCCL still runs a ring or a tree over UALoE at the full 3.6 TB/s, so nothing here is impossible; AMD pays in GPU cycles spent on arithmetic NVIDIA does in the switch, and in the wire volume multicast would have saved. It bites where §5 says it bites — the all-reduce sitting on the barrier — not bulk bandwidth.
 
-So AMD's openness is not just a philosophy — it is **structural**, and Helios shows what it costs. A vendor that does not make switch silicon *has* to bet on an open, multi-vendor fabric: UALink for scale-up, Ultra Ethernet for scale-out, plain Ethernet under both. It also inherits that vendor's roadmap — AMD got Broadcom's throughput part rather than its collectives part, and waits on UALink 2.0\* for what NVSwitch has shipped for years. NVIDIA can stay proprietary precisely because it owns the switch on both ends; AMD cannot close the loop alone, so it works to keep the loop open.
+A vendor that does not make switch silicon *has* to bet on an open, multi-vendor fabric: UALink for scale-up, Ultra Ethernet for scale-out, plain Ethernet under both. AMD's openness is **structural**, not philosophical. It also inherits its supplier's roadmap — AMD got Broadcom's throughput part rather than its collectives part, and waits on UALink 2.0\* for what NVSwitch has shipped for years. NVIDIA can stay proprietary precisely because it owns the switch on both ends.
 
-The MI455X I/O makes that menu concrete — deliberately multi-standard:
+The bet shows in the chip's ports — the MI455X's I/O splits four ways:
 
 - **Scale-up, over Ethernet** — **UALoE**: 36 links, each two 200GbE lanes, 400 Gb/s a link — **1.8 TB/s per direction, 3.6 TB/s aggregate** per GPU. This is what Helios runs.
 - **Scale-up, native** — **UALink** (Ultra Accelerator Link, the open *switched* answer to NVLink/NVSwitch): three ×8 links at 128 Gb/s a lane — **384 GB/s per direction, 768 GB/s aggregate**. A configuration nobody runs: there is no UALink switch to plug it into.
 - **To the host** — a coherent ×16 **Infinity Fabric** link, **128 GB/s per direction, 256 GB/s aggregate**, or PCIe Gen6 in its place.
 - **Scale-out** — **UALink** again, now as the GPU-to-NIC attach: three **Pensando Vulcano** 800G NICs per GPU, **3 × 800 Gb/s = 2.4 Tb/s per direction**, running **RoCE** and **Ultra Ethernet** (§9).
 
-The first two bullets are the openness story stated in bandwidth. The standard AMD founded sits on the chip at about a fifth of what that chip wires to Ethernet — native UALink is a compatibility path, UALoE is the product. It is the switch shortage seen from the endpoint: with no volume UALink switch to buy [[29]](#ref-29), a wide native UALink port would have nowhere to land.
+The standard AMD founded sits on the chip at about a fifth of what that chip wires to Ethernet — native UALink is a compatibility path, UALoE is the product. It is the switch shortage seen from the endpoint: with no volume UALink switch to buy [[29]](#ref-29), a wide native UALink port would have nowhere to land.
 
 NVIDIA's bet is that a proprietary, co-designed stack is faster; AMD's is that an **open, multi-vendor** ecosystem wins the way IP/Ethernet did — many silicon suppliers, commodity economics, no single throat to choke. It is the disaggregation argument from the switch world (a turnkey chassis vs whitebox-plus-open-NOS), moved up onto the accelerator fabric.
 
@@ -2391,35 +2392,46 @@ Which sets up the last question of the chapter. Several of these same hyperscale
 
 Every fabric in this document has carried a brand — NVLink, NVSwitch, InfiniBand, Spectrum-X, Quantum, CUDA. §8 showed that the *architecture* outlives the brand: AMD, Intel, and the hyperscalers all build the same scale-up-domain-plus-scale-out-fabric shape from their own parts. This last chapter is about the other way out of the lock-in — not a rival vendor's stack, but an **open standard** that any vendor's accelerators can share, the way Ethernet and IP ended the proprietary-networking era decades ago.
 
-There are two fronts, one open answer to each of NVIDIA's two proprietary interconnects:
+There are two fronts, one for each of the fabrics NVIDIA ships. The scale-out answer is a single specification; the scale-up answer is three:
 
-| Fabric role | NVIDIA's proprietary version | The open answer                                          |
-|-------------|------------------------------|----------------------------------------------------------|
-| Scale-up    | NVLink + NVSwitch            | **UALink** (purpose-built) · **ESUN + SUE-T** (Ethernet) |
-| Scale-out   | InfiniBand (Quantum)         | **Ultra Ethernet** (UEC / UET)                           |
+| Fabric role | What NVIDIA ships                        | The open answer                   |
+|-------------|------------------------------------------|-----------------------------------|
+| Scale-up    | NVLink + NVSwitch                        | **UALink** · **ESUN** · **SUE-T** |
+| Scale-out   | InfiniBand (Quantum) · RoCE (Spectrum-X) | **Ultra Ethernet** (UEC / UET)    |
+
+Only the scale-up row is proprietary in the strict sense: NVLink and NVSwitch have no public spec. InfiniBand and RoCE are both IBTA standards [[79]](#ref-79) — NVIDIA simply supplies nearly all the InfiniBand, and Spectrum-X runs standard RoCE, tuned by a switch and a SuperNIC working as one pair. So Ultra Ethernet is less a rebuilt InfiniBand than a rebuilt RoCE: it takes IB's market, but it replaces RoCE on the wire.
 
 This is the chapter with the most familiar shape for a networker: it is the industry doing to the AI fabric what it once did to the enterprise network — replacing single-vendor interconnects with multi-vendor standards, betting that open economics win in the end.
 
-Open standards, in three steps:
+Open standards, in four steps:
 
 - **§9.1** — the scale-up front: UALink, ESUN, and the switch nobody is building.
-- **§9.2** — the scale-out front: Ultra Ethernet and the UET transport.
-- **§9.3** — where it leaves the networker.
+- **§9.2** — what scale-up Ethernet does to the frame.
+- **§9.3** — the scale-out front: Ultra Ethernet and the UET transport.
+- **§9.4** — where it leaves the networker.
 
 ### 9.1 The scale-up front: answering NVLink
 
-The prize is NVLink + NVSwitch, the one layer that had no open equivalent for years. The open answer is usually cast as a fight — **UALink vs ESUN** — but that framing is wrong: one is a *protocol*, the other a *substrate*, and they **compose** [[40]](#ref-40).
+The prize is NVLink + NVSwitch, the one layer that had no open equivalent for years. The open answer arrived as **three specifications from three constituencies**, and they do not entirely join up:
+
+- **UALink** — the *protocol*, from an accelerator consortium: memory semantics, its own link layer, its own switch.
+- **ESUN** — the *network layer*, from two operators. Meta and Microsoft published its base specification, titled *Network Operator Requirements*, on 9 February 2026 [[80]](#ref-80): what a scale-up frame carries and how a switch forwards it (§9.2).
+- **SUE** — the *endpoint framework*, from a switch vendor. Broadcom's contribution to OCP, continued there as the **SUE-T** transport workstream (§9.2).
+
+Who wrote each one predicts what it optimizes for, and the gaps between them are where this section ends up [[40]](#ref-40).
 
 **UALink is the open load/store fabric — a protocol.** Its premise is that scale-up is not networking at all; it is *memory*. Where a scale-out NIC posts a message and waits for a completion (RDMA, §4.2), a UALink accelerator issues a **read, write, or atomic directly against another accelerator's memory** — the same load/store model as NVLink (§3.5), now an open spec instead of NVIDIA's. The stack is thin and purpose-built: a **Protocol** layer for the load/store/atomic operations, a **Transaction** layer that packs them into **64-byte flits** (the fabric's fixed-size unit) at up to ~95% efficiency, a **Data Link** layer with CRC and replay, and underneath an ordinary **Ethernet PHY** (the 200 GT/s-per-lane IEEE 802.3dj SerDes). It scales to **1,024 accelerators** in one pod with low-latency, memory-semantic access [[38]](#ref-38).
 
-**ESUN is a substrate, not a competitor.** It standardizes the Ethernet L2/L3 lower layers for scale-up *precisely so that a vendor protocol — UALink included — can ride over commodity Ethernet switches*. **SUE-T** (Scale-Up Ethernet Transport, AMD's contribution) is one transport that rides ESUN; UALink's protocol is another thing that can. So UALink runs **two ways** — over its own thin link layer and dedicated **UALink switches**, or carried over **Ethernet** on the ESUN substrate and commodity switches:
+**Whether these compose or compete depends on who you ask.** ESUN standardizes the Ethernet L2/L3 layers for scale-up, and its backers describe that as carriage for someone else's protocol: OCP's announcement says ESUN lets vendor-unique scale-up protocols *including UALink* run over commodity Ethernet [[29]](#ref-29), and AMD — a UALink board member — offers customers "the flexibility to scale using UALink over Ethernet or through dedicated UALink switches" [[83]](#ref-83). The UALink Consortium does not put it that way. Its own white paper files SUE, SUE-T and ESUN under "the Ethernet-derived continuum", compares UALink *against* them, and sells "no MAC encapsulation" and a co-designed stack against a transport and a network layer "governed separately" [[82]](#ref-82). Both readings are self-serving and both are informative: the substrate's authors need protocols to carry, and the protocol's authors need a reason to build a second switch.
+
+On the compose reading, UALink runs **two ways** — over its own thin link layer into dedicated **UALink switches**, or over **Ethernet** on the ESUN substrate into commodity ones, with **SUE-T** riding above ESUN as one transport among the possibilities:
 
 ```
    UALink protocol (load / store / atomic) — carried two ways:
 
                 native UALink                          over Ethernet
    +----------------------------------+   +----------------------------------+
-   | UALink link (flits, CRC, replay) |   | ESUN Ethernet L2/L3 (or SUE-T)   |
+   | UALink link (flits, CRC, replay) |   | ESUN Ethernet L2/L3              |
    +----------------------------------+   +----------------------------------+
    | Ethernet PHY  (IEEE 802.3dj)     |   | Ethernet PHY  (IEEE 802.3dj)     |
    +----------------------------------+   +----------------------------------+
@@ -2428,13 +2440,80 @@ The prize is NVLink + NVSwitch, the one layer that had no open equivalent for ye
 
 <p align="center"><em>One memory-semantic protocol, two ways to carry it — the fork is the switch, not the fabric.</em></p>
 
-Both paths converge on the same 802.3 PHY; the fork is **the switch** — and here the story turns commercial. A native UALink switch is the thin, low-latency ideal (small die, low overhead — why AMD pitches it on TCO), but almost nobody is building one. **Broadcom** — the volume merchant-switch vendor and a UALink *founding* board member — **backtracked**: it left the UALink board for ESUN [[29]](#ref-29), betting that dedicated UALink switches never reach volume and scale-up simply collapses onto the Ethernet it already sells. That left the native path to smaller, later silicon, and none of it has arrived. **Astera Labs**, a UALink board member, plans fabric switches but has published no date — the Scorpio X-Series it ships for scale-up today is **PCIe** [[78]](#ref-78). Announced targets elsewhere run from late 2026 into 2027. So AMD, needing **Helios** to ship in 2026, does the one thing it can: it runs **UALink-over-Ethernet** on Broadcom's Tomahawk (§8.2). The "run it either way" flexibility is genuine — but it is also AMD making a virtue of necessity, because the switch it would prefer does not yet exist at volume.
+**Nobody has published the join.** ESUN 1.0 never mentions UALink — its references are the OCP announcement, two IEEE standards and the UEC specification. UALink defines no MAC encapsulation, and its consortium counts that as a feature. ESUN's own EtherType is still marked *value pending assignment* [[80]](#ref-80). So the right-hand path exists in products before it exists in a document: what AMD sells as **UALink-over-Ethernet**, its own Hot Chips material counts as **IFoE** — Infinity Fabric over Ethernet [[83]](#ref-83). Both names are honest, because UALink's protocol layer was derived from AMD's Infinity Fabric in the first place. But it is a vendor's binding, not a standard one.
 
-So the contest is not UALink versus ESUN — they stack. It is whether a **dedicated UALink switch** ever ships in volume to challenge commodity Ethernet, a bet decided less by the specifications than by whoever chooses to build the silicon. For now the biggest switch vendor has voted with its feet — the purpose-built-versus-reuse-what-exists trade that has run under every fabric in this book.
+Both paths converge on the same 802.3 PHY; the fork is **the switch** — and here the story turns commercial. A native UALink switch is the thin, low-latency ideal (small die, low overhead — why AMD pitches it on TCO), but almost nobody is building one. **Broadcom** — the volume merchant-switch vendor and a UALink *founding* board member — **backtracked**: it left the UALink board for ESUN [[29]](#ref-29), betting that dedicated UALink switches never reach volume and scale-up simply collapses onto the Ethernet it already sells. And it is not only the switch vendor: ESUN's requirements were written by **Meta and Microsoft** [[80]](#ref-80) — the two buyers with the most scale-up ports to purchase specified the Ethernet path themselves. That left the native path to smaller, later silicon, and none of it has arrived. **Astera Labs**, a UALink board member, plans fabric switches but has published no date — the Scorpio X-Series it ships for scale-up today is **PCIe** [[78]](#ref-78). Announced targets elsewhere run from late 2026 into 2027. So AMD, needing **Helios** to ship in 2026, does the one thing it can: it runs **UALink-over-Ethernet** on Broadcom's Tomahawk (§8.2). The "run it either way" flexibility is genuine — but it is also AMD making a virtue of necessity, because the switch it would prefer does not yet exist at volume.
 
-### 9.2 The scale-out front: answering InfiniBand
+So the contest is not a clean UALink-versus-ESUN fight; they are different layers, and on the compose reading they stack. Two things are genuinely undecided. Whether a **dedicated UALink switch** ever ships in volume to challenge commodity Ethernet — and whether the **binding** between the protocol and the Ethernet layers is ever written down. A switch nobody builds and a seam nobody specifies end in the same place: a scale-up fabric that is open in its parts and single-vendor in practice. For now the biggest switch vendor and the two biggest buyers have all voted for Ethernet — the purpose-built-versus-reuse-what-exists trade that has run under every fabric in this book.
 
-Scale-out already had an open contender — RoCE (§4.3) — but RoCE is a *retrofit*: RDMA bolted onto Ethernet, needing PFC and careful tuning (§4.5) to behave. **Ultra Ethernet** is the purpose-built redo. Its consortium — the **Ultra Ethernet Consortium (UEC)** — released **Spec 1.0 in June 2025**, not a RoCE patch but, in its own framing, a reconstruction across every layer: PHY, link, transport, software [[39]](#ref-39).
+### 9.2 The ESUN frame: Ethernet without IP
+
+§9.1 left ESUN standardizing the Ethernet layers underneath everyone else's scale-up protocol. That sounds like a modest job — Ethernet is Ethernet. It is not. §4.3 took a RoCEv2 frame apart to show InfiniBand's transport riding inside a UDP datagram; this is the same exercise on the other fabric, and it runs the other way. RoCE *added* carriage beneath an existing transport. ESUN *removes* it.
+
+**The IP header comes off.** ESUN's base specification [[80]](#ref-80) — contributed by Meta and Microsoft, effective 9 February 2026 — opens by deleting it. A scale-up domain is small and every endpoint is known when the rack is built, so IP's addressing earns nothing: switches forward on the 48-bit Ethernet destination address, and 20–40 bytes leave every frame. On the small transfers a collective actually makes, that is real goodput. But four things a networker depends on lived in that header — ECN, DSCP, TTL, and the entropy ECMP hashes on — so ESUN puts all four back in **4 bytes**, marked by a new EtherType whose value is still pending assignment:
+
+```
+   standard Ethernet, IP inside
+   +------+------+---------+-------+---------------+===============+-----+
+   |  DA  |  SA  | ET+vlan | IP-ET | IP hdr 28-48B | transport PDU | FCS |
+   |  6 B |  6 B |  4 B opt|  2 B  |               |               | 4 B |
+   +------+------+---------+-------+---------------+===============+-----+
+
+   ESUN: the IP header is gone, 4 bytes go back
+   +------+------+---------+-------+------+===============+-----+
+   |  DA  |  SA  | ET+vlan | EH-ET |  EH  | transport PDU | FCS |
+   |  6 B |  6 B |  4 B opt|  2 B  |  4 B |               | 4 B |
+   +------+------+---------+-------+------+===============+-----+
+
+   inside those 4 bytes:
+   +-----+----+--------+--------+------------+------+-----+------+
+   | Rev | F  | EH-CoS | EH-ECN | Flow label | TTL  | UD  | RSVD |
+   | 2b  | 1b |   3b   |   2b   |    16b     |  4b  | 2b  |  2b  |
+   +-----+----+--------+--------+------------+------+-----+------+
+```
+
+<p align="center"><em>The IP header comes off; four bytes put ECN, class, TTL and entropy back.</em></p>
+
+- **EH-ECN** (2b) — the same encoding as ECN in the IP TOS field: §4.7's two bits of the DS field, relocated.
+- **EH-CoS** (3b) — a compressed DSCP. Scale-up domains don't run VLANs, so 3 bits replace the 4-byte 802.1Q tag.
+- **Flow label** (16b) — the entropy that left with the IP header, hashed as {DA, SA, Flow label}; when the F bit is set, the switch forwards deterministically on it.
+- **EH-TTL** (4b) — decremented per hop, discarded at zero, there "for removing loops". ESUN expects scale-up domains past a thousand accelerators, spanning racks rather than one box, so frames now cross several switches and loops become possible at all.
+
+**What that does to the switch is stranger than the header.** MAC tables are configured **statically — no learning, no aging** — and a frame whose destination is unknown is not flooded [[80]](#ref-80). Editing the header in flight, for ECN or TTL, forces the FCS to be recomputed, so a scale-up switch rewrites frames the way a router rewrites packets. Losslessness is PFC plus **CBFC**, credit-based flow control borrowed from Ultra Ethernet (§9.3), and link errors are retried hop by hop with **LLR**, also UEC's — both required in the switch, optional in the host. And with IP gone, **IPsec goes with it**: encryption means MACsec, link by link.
+
+**Broadcom's SUE goes further.** ESUN says what the switch does; **SUE** — the Scale-Up Ethernet framework Broadcom contributed to OCP [[81]](#ref-81) — is the endpoint half of the same stack, and it will spend the address fields too. SUE offers three encapsulations. The first is ordinary Ethernet with IP and UDP, scale-up traffic identified by UDP port. The other two are not:
+
+```
+   SUE AFH Gen 1: the MAC fields stay, 16-32 bits of them do the forwarding
+   +------+------+------+===============+
+   |  DA  |  SA  | type |    SUE PDU    |
+   |  6 B |  6 B |  2 B |               |
+   +------+------+------+===============+
+
+   SUE AFH Gen 2: the address fields themselves collapse
+   +-------------+------+===============+
+   | 6 B or 12 B | type |    SUE PDU    |
+   +-------------+------+===============+
+
+   inside that PDU
+   +------+----------------------------+-------+
+   |  RH  | packed load/store commands | R-CRC |
+   |  8 B |        up to 4 KB          |  4 B  |
+   +------+----------------------------+-------+
+```
+
+<p align="center"><em>SUE's AI Fabric Header: first the addresses stop meaning much, then they shrink.</em></p>
+
+- **AFH Gen 1** keeps standard MAC destination and source addresses, but a switch reads only **16 to 32 bits** of them to forward. An EtherType marks the frame; an optional shim header carries "many fields that are similar to an IP header".
+- **AFH Gen 2** cuts forwarding to **6 or 12 bytes** under the IEEE 802.c-2017 local address plan: accelerator IDs are mapped into 16- or 32-bit values inside what used to be the address fields, and the leftover bytes are the vendor's to use. A Normal form carries a hop count and entropy; a Compressed form carries neither.
+
+**The payload is not a message either.** SUE packs many transactions bound for the same destination into one PDU of up to 4 KB, puts an 8-byte reliability header in front — sequence number, virtual channel, and a 10-bit `partition` field for multi-tenant isolation — and a 32-bit CRC behind, recovering loss with go-back-N (§4.4). The **SUE Lite** profile drops even that: no transport, no CRC, six bytes of header and nothing else. There is no connection to open, because SUE is one-sided load/store — put, get, atomic — and its own spec draws the line, contrasting itself with the "network semantics used by RDMA over Converged Ethernet (RoCE), InfiniBand, and TCP/IP", which "require establishment of a connection". That is §3.5's distinction restated by a switch vendor: this is memory, not messaging.
+
+**So what is left of Ethernet?** The PHY, the address fields, an EtherType, and the FCS. Forwarding is static, flooding is forbidden, IP is gone, the transport is one-sided, and losslessness comes from credits rather than drops. What survives is the part that matters commercially — the SerDes, the optics, the connectors and the switch silicon the industry already builds at volume. That is the whole of §9.1's bet: reuse the manufacturing, not the protocol.
+
+### 9.3 The scale-out front: rebuilding RDMA on Ethernet
+
+Scale-out already had an open contender — RoCE (§4.3) — but RoCE is a *retrofit*: RDMA bolted onto Ethernet, needing PFC and careful tuning (§4.5) to behave. **Ultra Ethernet** is the purpose-built redo. Its consortium — the **Ultra Ethernet Consortium (UEC)** — released **Spec 1.0 in June 2025** — at v1.0.2 by the time ESUN cited it in February 2026 — not a RoCE patch but, in its own framing, a reconstruction across every layer: PHY, link, transport, software [[39]](#ref-39).
 
 The heart of it is a new transport, **UET (Ultra Ethernet Transport)** — a modern RDMA protocol meant to *replace* RoCE and retire the InfiniBand Verbs API. What it standardizes is, in effect, the toolkit §4 described as proprietary tricks:
 
@@ -2444,8 +2523,10 @@ The heart of it is a new transport, **UET (Ultra Ethernet Transport)** — a mod
 
 The pitch is InfiniBand's benefits — RDMA, low latency, scale — on open, multi-vendor Ethernet, without RoCE's fabric-tuning burden. A parallel open effort, **MRC** (§4.7 [[16]](#ref-16)), attacks the same ground from the multipath-transport side. Between them, the mechanisms NVIDIA sells inside Spectrum-X become line items in a public spec.
 
-<a id="93-where-it-leaves-the-networker"></a>
-### 9.3 Where it leaves the networker (??? probably need rework since this is not the last section)
+One detail ties the two fronts together. ESUN does not define its own link-layer reliability: it takes **LLR** (link level retry) and **CBFC** (credit-based flow control) straight from the UEC specification, and requires both in a scale-up switch [[80]](#ref-80). The scale-out standard is quietly supplying the scale-up standard's link layer — which is why the frame in §9.2 ends up lossless by credits rather than by PFC alone.
+
+<a id="94-where-it-leaves-the-networker"></a>
+### 9.4 Where it leaves the networker (??? probably need rework since this is not the last section)
 
 Line the backers up and the pattern is plain: **UALink, ESUN, and Ultra Ethernet are supported by essentially everyone except NVIDIA** — AMD, Intel, Broadcom, Cisco, Arista, and every hyperscaler. NVIDIA holds the one complete proprietary stack (NVLink, NVSwitch, Quantum InfiniBand, Spectrum-X); the rest of the industry is converging on open standards to break the dependence — and NVIDIA has itself joined some of them (it is a UEC and ESUN member) while keeping its own fabrics intact.
 
@@ -2739,13 +2820,14 @@ Every term this document introduces, with the section that explains it. Ordinary
 - **SHARP** — *Scalable Hierarchical Aggregation and Reduction Protocol.* In-switch reduction, and multicast on the way back. §5.3
 - **SM** — *streaming multiprocessor.* The GPU's core cluster. §1.2
 - **SU** — *scalable unit.* NVIDIA's replicable SuperPOD building block. §4.6.3
-- **SUE-T** — *Scale-Up Ethernet Transport.* AMD-seeded OCP transport riding on ESUN. §9.1
+- **SUE** — *Scale-Up Ethernet.* Broadcom's endpoint framework, contributed to OCP: packs an accelerator's load/store commands into Ethernet frames. §9.2
+- **SUE-T** — *Scale-Up Ethernet Transport.* Broadcom-seeded OCP transport riding on ESUN. §9.1
 - **TP** — *tensor parallelism.* Split each weight matrix; an all-reduce roughly twice per layer. §5.1
 - **TPU** — *tensor processing unit.* Google's accelerator. §8.4
 - **TTFT** — *time to first token.* The serving latency prefill and the KV hand-off gate. §5.4
 - **UALink** — open, memory-semantic scale-up interconnect. Runs native or over Ethernet. §9.1
 - **UALink-over-Ethernet (UALoE)** — UALink's protocol carried on commodity Ethernet switches instead of dedicated UALink ones. §9.1
-- **UEC / UET** — *Ultra Ethernet Consortium* and its *Ultra Ethernet Transport*, the RDMA transport meant to replace RoCE. §9.2
+- **UEC / UET** — *Ultra Ethernet Consortium* and its *Ultra Ethernet Transport*, the RDMA transport meant to replace RoCE. §9.3
 - **UVM** — *unified virtual memory*, the `uvm` in `nvidia-uvm.ko`: one address space across CPU and GPU. §6.1
 - **XLA** — *Accelerated Linear Algebra.* The compiler behind JAX and TensorFlow. §6.2
 - **ZeRO** — *Zero Redundancy Optimizer.* The sharding scheme FSDP implements. §5.1
@@ -2832,6 +2914,11 @@ Every term this document introduces, with the section that explains it. Ordinary
 76. <a id="ref-76"></a>AWS — *Amazon EC2 Trn3 UltraServers* and *Trainium3 UltraServers Now Available* (generally available 2 December 2025; up to 144 Trainium3 chips per UltraServer against 64 Trainium2 in the previous generation, with scale-up described as "NeuronSwitch-v1, an all-to-all fabric using NeuronLink-v4 with 2TB/s of bandwidth per chip" — a switched domain replacing the earlier point-to-point NeuronLink binding. Also 144 GB HBM3e and 4.9 TB/s per chip, 20.7 TB and 706 TB/s per UltraServer, up to 362 MXFP8 PFLOPs, deployed in EC2 UltraClusters 3.0. AWS names NeuronSwitch-v1 and describes its topology but does not state who designs or fabricates the part). <https://aws.amazon.com/ec2/instance-types/trn3/>
 77. <a id="ref-77"></a>Google — *Our eighth generation TPUs: two chips for the agentic era* ("two distinct, purpose-built architectures for training and inference: TPU 8t and TPU 8i", both generally available later in 2026, both claiming up to 2× performance-per-watt over Ironwood. TPU 8t scales to 9,600 chips and two petabytes of shared HBM per pod for 121 ExaFLOPS, with double the interchip bandwidth and optical circuit switching for automatic failure rerouting; TPU 8i doubles ICI bandwidth to 19.2 Tb/s and adds a "Boardfly" architecture cutting maximum network diameter by more than half. Ironwood, the seventh generation, ships as TPU7x). <https://blog.google/innovation-and-ai/infrastructure-and-cloud/google-cloud/eighth-generation-tpu-agentic-era/>
 78. <a id="ref-78"></a>Astera Labs — *Advancing AI with AMD: Purpose-built Connectivity for Scale-up Architecture with UALink* and *Astera Labs Broadens Scorpio X-Series Smart Fabric Switch Roadmap* (as a UALink Consortium board member Astera "plan[s] to offer a complete portfolio of UALink products… smart fabric switches, signal conditioners, controllers, and more", but publishes no production or availability date for any of them. The scale-up switch it actually ships — Scorpio X-Series, "now shipping in initial production volumes" as of January 2026 — is PCIe-based, and the published roadmap items (radix, hyperscaler-specific protocols, in-network computing, Hypercast, optical connectivity) do not name UALink with a date. Elsewhere in the ecosystem Marvell's January 2026 acquisition of XConn targets CXL/PCIe switching revenue from H2 FY2027, and Upscale AI targets Q4 2026 for scale-up UALink switches — so announced intentions span late 2026 to 2027 while nothing is shipping). <https://www.asteralabs.com/advancing-ai-with-amd-delivering-purpose-built-connectivity-for-scale-up-architecture-with-ualink/>
+79. <a id="ref-79"></a>InfiniBand Trade Association — *IBTA Enhances Data Center Performance and Management with New InfiniBand Architecture Specification Releases* (21 April 2020; Volume 1 and Volume 2 Release 1.4 improves manageability "as well as integrating previously released RoCE and Virtualization Annexes" — RoCE is specified by the IBTA inside the InfiniBand Architecture Specification, not by a separate body. Release 2.0, 31 July 2025, "strengthen[s] both InfiniBand and RDMA over Converged Ethernet (RoCE) technologies", and its Plugfest tested "both InfiniBand and Ethernet RDMA-based products". The commonly quoted A16/A17 annex designations appear in secondary sources only; IBTA's own announcements do not use them). <https://www.infinibandta.org/ibta-enhances-data-center-performance-and-management-with-new-infiniband-architecture-specification-releases/>
+80. <a id="ref-80"></a>Open Compute Project — *OCP ESUN — Network Operator Requirements — Base Specification 1.0* (effective 9 February 2026; contributed by Meta and Microsoft, authors Manoj Wadekar and Rajesh Sankaran. ESUN "optimizes the packet headers for smaller topologies by removing IP headers and using L2 addresses for forwarding", replacing a 20–40 B IP header with a 4 B ESUN Header (EH) — Rev 2b, F 1b, EH-CoS 3b, EH-ECN 2b, Flow label 16b, TTL 4b, UD 2b, reserved 2b — identified by an EtherType EH-ET whose value is still pending assignment. Switches forward on statically configured 48-bit destination addresses with no MAC learning or aging, and must not broadcast unknown destinations; modifying the EH in flight, for ECN or TTL, requires FCS recomputation. PFC is required; CBFC and LLR, both defined by the Ultra Ethernet Consortium, are required in switches and optional in hosts. Because the ESUN header replaces the IP header it is not compatible with IPsec, and the specification names MACsec as the link-level alternative). <https://www.opencompute.org/documents/ocp-esun-network-operator-requirements-base-specification-rev-1-0-final-pdf>
+81. <a id="ref-81"></a>Broadcom — *Scale-Up Ethernet Framework Specification* (RM104, 26 September 2025; the SUE framework Broadcom contributed to OCP, submitted 16 July 2025 — **SUE is Broadcom's, not AMD's**, a common misattribution, and SUE-T is the OCP workstream continuing it. Three network encapsulations: standard Ethernet with IPv4/IPv6 and UDP, identified by UDP port; AI Fabric Header Gen 1, which "maintains the existing Ethernet MAC destination address and source address formatting" but lets the switch forward on 16 to 32 bits of it; and AFH Gen 2, where "the forwarding information is reduced to 6 or 12 bytes" using the IEEE 802.c-2017 Structured Local Address Plan. SUE packs transactions bound for one {destination, VC} into PDUs of up to 4096 bytes behind an 8-byte reliability header — ver, op, xpuid 10b, PSN 16b, VC, partition 10b, ack PSN 16b — and a 32-bit R-CRC, recovering loss with go-back-N; the SUE Lite profile removes the transport layer and the R-CRC entirely. SUE is one-sided load/store — put, get, atomic — which the specification contrasts with the "network semantics used by RDMA over Converged Ethernet (RoCE), InfiniBand, and TCP/IP" that "require establishment of a connection", naming PCIe and UALink as the comparable technologies). <https://docs.broadcom.com/doc/scale-up-ethernet-framework>
+82. <a id="ref-82"></a>UALink Consortium — *UALink™: An Open, High-Efficiency Scale-Up Interconnect for AI* (white paper, January 2026; the four-layer stack — Protocol (UPLI), Transaction, Data Link, Physical — riding IEEE 802.3 PAM4 PHYs, up to 1,024 accelerators per pod, "93% effective bandwidth target, minimal protocol overhead, no MAC encapsulation", roughly 1 µs round trip on copper under four metres. It does **not** describe carrying UALink inside Ethernet frames. Instead it groups Scale-Up Ethernet (SUE), SUE-Transport (SUE-T) and ESUN under "the Ethernet-derived continuum" and compares UALink *against* them in "Table A-T2: UALink vs Ethernet-Based Scale-Up Approaches", arguing those approaches "retain the fundamental constraint that the transport and network layers are governed separately". It also records that the UALink standard was developed from AMD's Infinity Fabric protocol). <https://ualinkconsortium.org/wp-content/uploads/2026/01/UALink_White_Paper_Publication_Candidate_FINAL_VERSION.pdf>
+83. <a id="ref-83"></a>AMD — *Introducing AMD CDNA 5 and the AMD Helios rack-scale platform* and *Open Standards for AI Scale: How AMD and OCP are Shaping the Next Era of AI Infrastructure* (AMD describes "a single-hop, multi-plane UALink™ over Ethernet (UALoE) scale-up fabric: all 72 GPUs reach each other through 12 UALoE switches across 6 switch trays" delivering 260 TB/s, and states that ESUN "enables vendor-unique scale-up protocols, such as UALink, to operate over standardized Ethernet layers", giving customers "the flexibility to scale using UALink over Ethernet or through dedicated UALink switches". AMD's Hot Chips 2026 presentation counts the same fabric as "72 IFoE links at 200G" — Infinity Fabric over Ethernet — using "a lightweight, reliable protocol with dynamic packet packing", with loss recovered by link-layer replay or end-to-end retransmission; those slide figures reach us through conference reporting rather than an AMD publication, and no encapsulation format — EtherType, header layout, or what exactly rides inside — is published anywhere). <https://rocm.blogs.amd.com/ecosystems-and-partners/cdna5-helios/README.html>
 
 # TODO list tracking
 
