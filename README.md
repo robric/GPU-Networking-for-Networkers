@@ -74,7 +74,7 @@ The golden rule for the whole document: **whenever something looks like magic, w
   - [9.1 The scale-up front: answering NVLink](#91-the-scale-up-front-answering-nvlink)
     - [9.1.1 UALink: the protocol](#911-ualink-the-protocol)
     - [9.1.2 No switch, so Ethernet](#912-no-switch-so-ethernet)
-    - [9.1.3 The join nobody has published yet](#913-the-join-nobody-has-published-yet)
+    - [9.1.3 No standard for how UALink rides Ethernet](#913-no-standard-for-how-ualink-rides-ethernet)
   - [9.2 The ESUN frame: Ethernet without IP](#92-the-esun-frame-ethernet-without-ip)
   - [9.3 The scale-out front: rebuilding RDMA on Ethernet](#93-the-scale-out-front-rebuilding-rdma-on-ethernet)
   - [9.4 Where it leaves the networker](#94-where-it-leaves-the-networker)
@@ -2422,7 +2422,7 @@ The prize is NVLink + NVSwitch, the one layer that had no open equivalent for ye
 **UALink is that protocol, an open load/store fabric.** Its premise is that scale-up is not networking at all; it is *memory*. Where a scale-out NIC posts a message and waits for a completion (RDMA, §4.2), a UALink accelerator issues a **read, write, or atomic directly against another accelerator's memory** — the same load/store model as NVLink (§3.5), with an open specification behind it. Four thin layers, top to bottom [[38]](#ref-38):
 
 - **Protocol** — the load, store and atomic operations themselves.
-- **Transaction** — packs them into **64-byte flits**, the fabric's fixed-size unit, at up to ~95% efficiency.
+- **Transaction** — packs them into **64-byte flits** (fixed-size, hardware-friendly units, like an ATM cell rather than a packet), at up to ~95% efficiency.
 - **Data Link** — packs several flits into a 640-byte unit, with a header and a 32-bit CRC inside it; replay works on that unit.
 - **Physical** — the Ethernet PHY, near enough: standard 200 GT/s-per-lane SerDes, cables and connectors, but each 640-byte unit is packed into a single 680-byte codeword, and getting that alignment takes **changes to a standard Ethernet PCS**.
 
@@ -2431,11 +2431,11 @@ The prize is NVLink + NVSwitch, the one layer that had no open equivalent for ye
                                  \       |       /
                                   v      v      v
    +-------------------------------------------------------+
-   | Transaction   packs them into 64-byte flits           |
+   | Transaction Layer packs ops into 64-byte flits        |
    |                                                       | 
-   |                                                       | 
-   |                                                       | 
-   |                                                       | 
+   | +-----------+ +-----------+                           | 
+   | |  64B flit | |  64B flit | ...                       | 
+   | +-----------+ +-----------+                           | 
    |                                                       | 
    +-------------------------------------------------------+
                                   |  several flits + a header
@@ -2474,7 +2474,7 @@ AMD, needing **Helios** to ship in 2026, took that road: **UALink-over-Ethernet*
 
 > **Networker's version:** UALink-over-Ethernet is to UALink what **RoCE** is to InfiniBand (§4.3) — a purpose-built fabric's upper layers dropped into an Ethernet frame and run over switches that know nothing about the protocol, because the alternative is buying that fabric's own switches.
 
-#### 9.1.3 The join nobody has published yet
+#### 9.1.3 No standard for how UALink rides Ethernet
 
 **The two camps do not describe this the same way.** OCP and AMD present ESUN as carriage for someone else's protocol, UALink included [[29]](#ref-29)[[40]](#ref-40)[[83]](#ref-83); the UALink Consortium presents Ethernet scale-up as the rival, selling "no MAC encapsulation" against a transport and a network layer "governed separately" [[82]](#ref-82). The shape itself is not in dispute:
 
@@ -2482,14 +2482,19 @@ AMD, needing **Helios** to ship in 2026, took that road: **UALink-over-Ethernet*
    +----------------------------------------------------------------------+
    |          UALink protocol + transaction   ->   64-byte flits          |
    +----------------------------------------------------------------------+
+                                     |
+   +----------------------------------------------------------------------+
+   |                         DL: 640 B flit, CRC32 inside                 |
+   +----------------------------------------------------------------------+
                    |                                     |
              native UALink                         over Ethernet
                    |                                     |
-   +--------------------------------+    +--------------------------------+
-   | DL: 640 B flit, CRC32 inside   |    |   ?   nothing published here   |
-   +--------------------------------+    +--------------------------------+
-                                         |   Ethernet MAC frame (802.3)   |
-                                         +--------------------------------+
+                   |                     +--------------------------------+
+                   |                     |     ? not standard yet         |
+                   |                     +--------------------------------+
+                   |                     +--------------------------------+ 
+                   |                     |   Ethernet MAC frame (802.3)   |
+                   |                     +--------------------------------+
    +--------------------------------+    +--------------------------------+
    |  Ethernet PHY (IEEE 802.3dj)   |    |  Ethernet PHY (IEEE 802.3dj)   |
    +--------------------------------+    +--------------------------------+
