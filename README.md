@@ -72,9 +72,9 @@ The golden rule for the whole document: **whenever something looks like magic, w
   - [8.4 The hyperscalers: silicon you mostly can't buy](#84-the-hyperscalers-silicon-you-mostly-cant-buy)
 - [9. Open standards: the fabric without the vendor](#9-open-standards-the-fabric-without-the-vendor)
   - [9.1 The scale-up front: answering NVLink](#91-the-scale-up-front-answering-nvlink)
-    - [9.1.1 UALink: the protocol](#911-ualink-the-protocol)
-    - [9.1.2 No switch, so Ethernet](#912-no-switch-so-ethernet)
-    - [9.1.3 No standard for how UALink rides Ethernet](#913-no-standard-for-how-ualink-rides-ethernet)
+    - [9.1.1 UALink, and the switch nobody builds](#911-ualink-and-the-switch-nobody-builds)
+    - [9.1.2 The Ethernet answer: ESUN and SUE](#912-the-ethernet-answer-esun-and-sue)
+    - [9.1.3 What AMD actually ships](#913-what-amd-actually-ships)
   - [9.2 The ESUN frame: Ethernet without IP](#92-the-esun-frame-ethernet-without-ip)
   - [9.3 The scale-out front: rebuilding RDMA on Ethernet](#93-the-scale-out-front-rebuilding-rdma-on-ethernet)
   - [9.4 Where it leaves the networker](#94-where-it-leaves-the-networker)
@@ -2417,7 +2417,7 @@ Open standards, in four steps:
 
 The prize is NVLink + NVSwitch, the one layer that had no open equivalent for years. Matching it takes two things: a protocol that treats another accelerator's memory as memory, and a switch that speaks it.
 
-#### 9.1.1 UALink: the protocol
+#### 9.1.1 UALink, and the switch nobody builds
 
 **UALink is that protocol, an open load/store fabric.** Its premise is that scale-up is not networking at all; it is *memory*. Where a scale-out NIC posts a message and waits for a completion (RDMA, §4.2), a UALink accelerator issues a **read, write, or atomic directly against another accelerator's memory** — the same load/store model as NVLink (§3.5), with an open specification behind it. Four thin layers, top to bottom [[38]](#ref-38):
 
@@ -2461,20 +2461,20 @@ No Ethernet header or MAC appears anywhere in that stack, and the consortium adv
 
 > **No collective offload:** UALink 1.0 does not do arithmetic — an all-reduce runs as a ring or a tree in the accelerators (§5.3), not summed inside the switch the way NVSwitch does with SHARP (§3.7). In-network collectives are a **UALink 2.0\*** item [[72]](#ref-72).
 
-#### 9.1.2 No UALink switch, so Ethernet
-
 **The UALink switch does not exist yet.** **Broadcom** was a UALink founding board member; in **late 2025** it gave up the seat and helped launch ESUN instead [[29]](#ref-29). The volume merchant-switch vendor is betting that dedicated UALink switches never reach volume, and that scale-up collapses onto the Ethernet it already sells. Two of the biggest buyers went the same way: **Meta and Microsoft** wrote their own Ethernet requirements instead [[80]](#ref-80). That left the native path to smaller, later silicon. **Astera Labs**, a UALink board member, plans fabric switches but has published no date — the scale-up switch it ships today, Scorpio X-Series, is **PCIe** [[78]](#ref-78) — and announced targets elsewhere run from late 2026 into 2027.
 
-**So scale-up gets built on Ethernet, which needs two things UALink never did.** A protocol carrying its own link layer needs no frame and no help at the endpoint; a protocol riding commodity switches needs both:
+#### 9.1.2 The Ethernet answer: ESUN and SUE
+
+The Ethernet camp is not waiting for UALink. It has a two-part answer of its own, with no UALink in it:
 
 - **ESUN** — what the frame carries and how a switch forwards it. Published February 2026: its headline move is deleting the IP header and forwarding on statically configured MAC addresses (§9.2) [[80]](#ref-80).
-- **SUE** — the engine at the endpoint, taking an accelerator's load/stores, packing them, sequencing them and handing them to Ethernet. Broadcom's, contributed to OCP and continued there as the **SUE-T** transport workstream (§9.2) [[81]](#ref-81).
+- **SUE** — the engine at the endpoint, taking an accelerator's load/stores, packing them, sequencing them and handing them to Ethernet. Broadcom's, contributed to OCP and continued there as the **SUE-T** transport workstream (§9.2) [[81]](#ref-81). It is an alternative to UALink's transport, not a way of carrying it.
 
-AMD, needing **Helios** to ship in 2026, took that road: **UALink-over-Ethernet** on Broadcom's Tomahawk (§8.2).
+#### 9.1.3 What AMD actually ships
+
+AMD ships neither answer whole. Needing **Helios** in 2026, it runs **UALink-over-Ethernet** on Broadcom's Tomahawk (§8.2): UALink's memory semantics, commodity switches, and a binding of its own.
 
 > **Networker's version:** UALink-over-Ethernet is to UALink what **RoCE** is to InfiniBand (§4.3) — a purpose-built fabric's upper layers dropped into an Ethernet frame and run over switches that know nothing about the protocol, because the alternative is buying that fabric's own switches.
-
-#### 9.1.3 No standard for how UALink rides Ethernet
 
 OCP and AMD present ESUN as carriage for someone else's protocol, UALink included [[29]](#ref-29)[[40]](#ref-40)[[83]](#ref-83); the UALink Consortium presents Ethernet scale-up as the rival, selling "no MAC encapsulation" against a transport and a network layer "governed separately" [[82]](#ref-82). The shape itself is not in dispute:
 
@@ -2543,7 +2543,7 @@ Nobody builds the switch; nobody has published the join. Both end in the same pl
 
 **What that does to the switch is stranger than the header.** MAC tables are configured **statically — no learning, no aging** — and a frame whose destination is unknown is not flooded [[80]](#ref-80). Editing the header in flight, for ECN or TTL, forces the FCS to be recomputed, so a scale-up switch rewrites frames the way a router rewrites packets. Losslessness is PFC plus **CBFC**, credit-based flow control borrowed from Ultra Ethernet (§9.3), and link errors are retried hop by hop with **LLR**, also UEC's — both required in the switch, optional in the host. And with IP gone, **IPsec goes with it**: encryption means MACsec, link by link.
 
-**Broadcom's SUE goes further.** ESUN says what the switch does; **SUE** — the Scale-Up Ethernet framework Broadcom contributed to OCP [[81]](#ref-81) — is the endpoint half of the same stack, and it will spend the address fields too. SUE offers three encapsulations. The first is ordinary Ethernet with IP and UDP, scale-up traffic identified by UDP port. The other two are not:
+**SUE answers the same question from the other end.** **SUE** — the Scale-Up Ethernet framework Broadcom contributed to OCP [[81]](#ref-81) — specifies the endpoint: how an accelerator's load/stores become frames and how they are made reliable. It brings its own framing too, and where ESUN deleted the IP header and kept the addresses, SUE keeps the frame and redefines the addresses. Three encapsulations, the first ordinary Ethernet with IP and UDP, the other two not:
 
 ```
    SUE AFH Gen 1: the MAC fields stay, 16-32 bits of them do the forwarding
@@ -2553,9 +2553,9 @@ Nobody builds the switch; nobody has published the join. Both end in the same pl
    +------+------+------+===============+
 
    SUE AFH Gen 2: the address fields themselves collapse
-   +-------------+------+===============+
-   | 6 B or 12 B | type |    SUE PDU    |
-   +-------------+------+===============+
+   +--------------------+------+===============+
+   | ids in 6 B or 12 B | type |    SUE PDU    |
+   +--------------------+------+===============+
 
    inside that PDU
    +------+----------------------------+-------+
@@ -2568,6 +2568,8 @@ Nobody builds the switch; nobody has published the join. Both end in the same pl
 
 - **AFH Gen 1** keeps standard MAC destination and source addresses, but a switch reads only **16 to 32 bits** of them to forward. An EtherType marks the frame; an optional shim header carries "many fields that are similar to an IP header".
 - **AFH Gen 2** cuts forwarding to **6 or 12 bytes** under the IEEE 802.c-2017 local address plan: accelerator IDs are mapped into 16- or 32-bit values inside what used to be the address fields, and the leftover bytes are the vendor's to use. A Normal form carries a hop count and entropy; a Compressed form carries neither.
+
+> **How they fit:** ESUN and SUE are not stacked on each other. ESUN specifies the switch, SUE specifies the endpoint, and each defines a header of its own — so at the framing layer they are alternatives. OCP's intent is that SUE-T eventually rides ESUN; SUE 1.0 predates ESUN 1.0 and names its own encapsulations instead.
 
 **The payload is not a message either.** SUE packs many transactions bound for the same destination into one PDU of up to 4 KB, puts an 8-byte reliability header in front — sequence number, virtual channel, and a 10-bit `partition` field for multi-tenant isolation — and a 32-bit CRC behind, recovering loss with go-back-N (§4.4). The **SUE Lite** profile drops even that: no transport, no CRC, six bytes of header and nothing else. There is no connection to open, because SUE is one-sided load/store — put, get, atomic — and its own spec draws the line, contrasting itself with the "network semantics used by RDMA over Converged Ethernet (RoCE), InfiniBand, and TCP/IP", which "require establishment of a connection". That is §3.5's distinction restated by a switch vendor: this is memory, not messaging.
 
