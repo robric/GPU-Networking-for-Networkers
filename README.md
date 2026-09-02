@@ -2463,7 +2463,7 @@ No Ethernet header or MAC appears anywhere in that stack, and the consortium adv
 
 #### 9.1.2 No UALink switch, so Ethernet
 
-**The UALink switch does not exist yet.** **Broadcom** was a UALink founding board member; in **late 2025** it gave up the seat and helped launch ESUN instead [[29]](#ref-29). The volume merchant-switch vendor is betting that dedicated UALink switches never reach volume, and that scale-up collapses onto the Ethernet it already sells. The two biggest buyers went the same way: **Meta and Microsoft** wrote their own Ethernet requirements instead [[80]](#ref-80). That left the native path to smaller, later silicon. **Astera Labs**, a UALink board member, plans fabric switches but has published no date — the scale-up switch it ships today, Scorpio X-Series, is **PCIe** [[78]](#ref-78) — and announced targets elsewhere run from late 2026 into 2027.
+**The UALink switch does not exist yet.** **Broadcom** was a UALink founding board member; in **late 2025** it gave up the seat and helped launch ESUN instead [[29]](#ref-29). The volume merchant-switch vendor is betting that dedicated UALink switches never reach volume, and that scale-up collapses onto the Ethernet it already sells. Two of the biggest buyers went the same way: **Meta and Microsoft** wrote their own Ethernet requirements instead [[80]](#ref-80). That left the native path to smaller, later silicon. **Astera Labs**, a UALink board member, plans fabric switches but has published no date — the scale-up switch it ships today, Scorpio X-Series, is **PCIe** [[78]](#ref-78) — and announced targets elsewhere run from late 2026 into 2027.
 
 **So scale-up gets built on Ethernet, which needs two things UALink never did.** A protocol carrying its own link layer needs no frame and no help at the endpoint; a protocol riding commodity switches needs both:
 
@@ -2476,7 +2476,7 @@ AMD, needing **Helios** to ship in 2026, took that road: **UALink-over-Ethernet*
 
 #### 9.1.3 No standard for how UALink rides Ethernet
 
-**The two camps do not describe this the same way.** OCP and AMD present ESUN as carriage for someone else's protocol, UALink included [[29]](#ref-29)[[40]](#ref-40)[[83]](#ref-83); the UALink Consortium presents Ethernet scale-up as the rival, selling "no MAC encapsulation" against a transport and a network layer "governed separately" [[82]](#ref-82). The shape itself is not in dispute:
+OCP and AMD present ESUN as carriage for someone else's protocol, UALink included [[29]](#ref-29)[[40]](#ref-40)[[83]](#ref-83); the UALink Consortium presents Ethernet scale-up as the rival, selling "no MAC encapsulation" against a transport and a network layer "governed separately" [[82]](#ref-82). The shape itself is not in dispute:
 
 ```
    +----------------------------------------------------------------------+
@@ -2504,9 +2504,9 @@ AMD, needing **Helios** to ship in 2026, took that road: **UALink-over-Ethernet*
 
 <p align="center"><em>The two carriage paths, and the layer nobody has published.</em></p>
 
-But no standard describes the join yet. ESUN 1.0 never mentions UALink, UALink defines no MAC encapsulation, and ESUN's own header is still marked *proposed* — in a specification dated months after Helios's silicon was finished [[80]](#ref-80). What AMD sells as **UALink-over-Ethernet**, its own Hot Chips material counts as **IFoE**, Infinity Fabric over Ethernet [[83]](#ref-83), the protocol UALink's was derived from. What is actually on those wires, nobody has published.
+Every layer in that picture is published except the one that joins them. ESUN 1.0 never mentions UALink, UALink defines no MAC encapsulation, and ESUN's own header is still marked *proposed* — in a specification dated months after Helios's silicon was finished [[80]](#ref-80). What AMD sells as **UALink-over-Ethernet**, its own Hot Chips material counts as **IFoE**, Infinity Fabric over Ethernet [[83]](#ref-83), the protocol UALink's was derived from. What is actually on those wires, nobody has published.
 
-A switch nobody builds and a seam nobody has published end in the same place: a scale-up fabric open in its parts and single-vendor in practice. For now the biggest switch vendor and the two biggest buyers have all voted for Ethernet — the purpose-built-versus-reuse-what-exists trade that has run under every fabric in this document.
+Nobody builds the switch; nobody has published the join. Both end in the same place: a scale-up fabric open in its parts and single-vendor in practice. For now the biggest merchant switch vendor and two of the biggest buyers have all voted for Ethernet — the same choice, purpose-built or commodity, that has run under every fabric in this document.
 
 ### 9.2 The ESUN frame: Ethernet without IP
 
