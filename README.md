@@ -2510,7 +2510,7 @@ Nobody builds the switch; nobody has published the join. Both end in the same pl
 
 ### 9.2 The ESUN frame: Ethernet without IP
 
-§9.1 left ESUN standardizing the Ethernet layers underneath everyone else's scale-up protocol. That sounds like a modest job — Ethernet is Ethernet. It is not. §4.3 took a RoCEv2 frame apart to show InfiniBand's transport riding inside a UDP datagram; this is the same exercise on the other fabric, and it runs the other way. RoCE *added* carriage beneath an existing transport. ESUN *removes* it.
+§9.1 left ESUN as the Ethernet camp's network layer: what a scale-up frame carries and how a switch forwards it. That sounds like a modest job — Ethernet is Ethernet. It is not. §4.3 took a RoCEv2 frame apart to show InfiniBand's transport riding inside a UDP datagram; this is the same exercise on the other fabric, and it runs the other way. RoCE *added* carriage beneath an existing transport. ESUN *removes* it.
 
 **The IP header comes off.** ESUN's base specification [[80]](#ref-80) — contributed by Meta and Microsoft, effective 9 February 2026 — opens by deleting it. A scale-up domain is small and every endpoint is known when the rack is built, so IP's addressing earns nothing: switches forward on the 48-bit Ethernet destination address, and 20–40 bytes leave every frame. On the small transfers a collective actually makes, that is real goodput. But four things a networker depends on lived in that header — ECN, DSCP, TTL, and the entropy ECMP hashes on — so ESUN puts all four back in **4 bytes**, marked by a new EtherType whose value is still pending assignment:
 
