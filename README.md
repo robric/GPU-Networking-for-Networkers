@@ -581,25 +581,27 @@ The chip count depends on the generation, but the wiring rule is the same: every
 - **Hopper (HGX H100)** — **4** third-generation NVSwitch chips; each GPU's 18 links split **5+5+4+4** (18 won't divide evenly by 4). NVLink 4, 900 GB/s per GPU — 7.2 TB/s aggregate across the eight [[30]](#ref-30).
 - **Blackwell (HGX B200)** — a higher-radix switch, so just **2** chips; the same 18 links now divide cleanly **9+9**. NVLink 5, 1.8 TB/s per GPU — 14.4 TB/s aggregate [[31]](#ref-31).
 
-The zoom below traces the Hopper split — one GPU's 18 links landing on its four chips for the HGX H100:
+The zoom below traces both — one GPU's 18 links landing on four chips, then on two:
 
 ```
-   Zoom — how ONE GPU's 18 links land on the 4 chips:
+   Zoom — how ONE GPU's 18 links land on the switch chips:
 
-                     +---------+
-                     |  GPU 0  |    18 NVLinks
-                     +---------+
-                    /   /   \   \
-                  5/  5/   4\   \4      <- links per chip
-                  /   /       \   \
-             +----+ +----+ +----+ +----+
-             | S0 | | S1 | | S2 | | S3 |
-             +----+ +----+ +----+ +----+
-                5  +  5  +  4  +  4  = 18      (every GPU wires up
-                                                the same way)
+        HGX H100 (Hopper)                 HGX B200 (Blackwell)
+
+           +---------+                       +---------+
+           |  GPU 0  |                       |  GPU 0  |
+           +---------+                       +---------+
+          /   /   \   \                        /     \
+        5/  5/   4\   \4                     9/       \9
+        /   /       \   \                    /         \
+   +----+ +----+ +----+ +----+           +------+   +------+
+   | S0 | | S1 | | S2 | | S3 |           |  S0  |   |  S1  |
+   +----+ +----+ +----+ +----+           +------+   +------+
+
+      5 +  5  +  4  +  4  = 18              9   +   9  = 18
 ```
 
-<p align="center"><em>One GPU's 18 links, split 5+5+4+4 across the four chips.</em></p>
+<p align="center"><em>One GPU's 18 links: 5+5+4+4 on Hopper's four chips, 9+9 on Blackwell's two.</em></p>
 
 The result is **full bisection bandwidth**: all 8 GPUs can be talking to all others simultaneously, each at the full per-GPU rate, with no internal bottleneck.
 
