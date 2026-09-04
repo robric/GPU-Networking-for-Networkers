@@ -2490,7 +2490,7 @@ Whether that answer carries UALink or competes with it depends on who is asked. 
 
 #### 9.1.3 What AMD actually ships
 
-AMD ships neither answer whole. Needing **Helios** in 2026, it runs **UALink-over-Ethernet** on Broadcom's Tomahawk (§8.2): UALink's memory semantics, commodity switches, and a binding of its own.
+AMD ships neither the native UALink fabric nor the ESUN and SUE stack. Needing **Helios** in 2026, it runs **UALink-over-Ethernet** on Broadcom's Tomahawk (§8.2): UALink's memory semantics, commodity switches, and a binding of its own.
 
 > **Networker's version:** UALink-over-Ethernet is to UALink what **RoCE** is to InfiniBand (§4.3) — a purpose-built fabric's upper layers dropped into an Ethernet frame and run over switches that know nothing about the protocol, because the alternative is buying that fabric's own switches.
 
@@ -2520,9 +2520,9 @@ AMD takes the right-hand path — the same stack down to the 640-byte flit, then
         dedicated UALink switch              commodity Ethernet switch
 ```
 
-<p align="center"><em>The two carriage paths, and the layer nobody has published.</em></p>
+<p align="center"><em>The two carriage paths, native and over Ethernet.</em></p>
 
-Every layer in that picture is published except the one that joins them. ESUN 1.0 never mentions UALink, UALink defines no MAC encapsulation, and ESUN's own header is still marked *proposed* — in a specification dated months after Helios's silicon was finished [[80]](#ref-80). What AMD sells as **UALink-over-Ethernet**, its own Hot Chips material counts as **IFoE**, Infinity Fabric over Ethernet [[83]](#ref-83), the protocol UALink's was derived from. What is actually on those wires, nobody has published.
+Every layer in that picture is published except the one that joins them. ESUN 1.0 never mentions UALink, UALink defines no MAC encapsulation, and ESUN's own header is still marked *proposed* — in a specification dated months after Helios's silicon was finished [[80]](#ref-80). What AMD sells as **UALink-over-Ethernet**, its own Hot Chips material counts as **IFoE**, Infinity Fabric over Ethernet [[83]](#ref-83), the protocol UALink's was derived from.
 
 Nobody builds the switch; nobody has published the join. Both end in the same place: a scale-up fabric open in its parts and single-vendor in practice. For now the biggest merchant switch vendor and two of the biggest buyers have all voted for Ethernet — the same choice, purpose-built or commodity, that has run under every fabric in this document.
 
