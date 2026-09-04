@@ -555,7 +555,7 @@ We left §3.2 with a cliffhanger: a GPU has **18 links, and each link reaches ex
 
 **Option B: connect every GPU to a switch (NVSwitch).** NVSwitch is precisely that — a **non-blocking crossbar switch for NVLink traffic**. Every GPU plugs its 18 links into the switch tier instead of into other GPUs. The crossbar then lets **any GPU reach any other GPU at full NVLink bandwidth, uniformly**.
 
-In a real server that switch is not a separate box. The standard building block is an **8-GPU node**: eight GPUs and the NVSwitch chips share one baseboard (NVIDIA's **HGX** board), soldered down and wired by board traces, not cables, in a single ~**8 RU** chassis — so the whole scale-up fabric sits *inside one box*:
+In a real server that switch is not a separate box. The standard building block is an **8-GPU node**: eight GPUs and the NVSwitch chips share one baseboard (NVIDIA's **HGX** board), soldered down and wired by board traces, not cables, in a single **8–10 RU** chassis — so the whole scale-up fabric sits *inside one box*:
 
 ```
    8-GPU HGX H100 — each GPU spreads its 18 links across 4 NVSwitch chips
@@ -572,9 +572,23 @@ In a real server that switch is not a separate box. The standard building block 
    |      => any GPU <-> any GPU, full ~900 GB/s, uniform  |
    +-------------------------------------------------------+
 
+   8-GPU HGX B200 — the same 18 links now land on just 2 chips
+   (higher radix, so two chips make the same non-blocking crossbar)
+
+   +--------------- HGX B200 server (10 RU) ---------------+
+   |    G0    G1    G2    G3    G4    G5    G6    G7       |  8 GPUs, 18 links each
+   |     \     \     \    |     |    /     /     /         |
+   |      \     \     \   |     |   /     /     /          |  each GPU's 18 links
+   |       \     \     \  |     |  /     /     /           |  go to BOTH chips
+   | +-------------------------+-------------------------+ |  (the 9+9 split)
+   | |        NVSwitch 0       |        NVSwitch 1       | |
+   | +-------------------------+-------------------------+ |
+   |     => any GPU <-> any GPU, full ~1.8 TB/s, uniform   |
+   +-------------------------------------------------------+
+
 ```
 
-<p align="center"><em>One 8 RU HGX H100 server: 8 GPUs and their 4-chip NVSwitch crossbar, any-to-any.</em></p>
+<p align="center"><em>The same 8-GPU node, two generations: four NVSwitch chips on Hopper, two on Blackwell.</em></p>
 
 The chip count depends on the generation, but the wiring rule is the same: every GPU fans its 18 links evenly across all the NVSwitch chips on the baseboard.
 
@@ -2472,13 +2486,15 @@ The Ethernet camp is not waiting for UALink. It has a two-part answer of its own
 - **ESUN** — what the frame carries and how a switch forwards it. Published February 2026: its headline move is deleting the IP header and forwarding on statically configured MAC addresses (§9.2) [[80]](#ref-80).
 - **SUE** — the engine at the endpoint, taking an accelerator's load/stores, packing them, sequencing them and handing them to Ethernet. Broadcom's, contributed to OCP and continued there as the **SUE-T** transport workstream (§9.2) [[81]](#ref-81). It is an alternative to UALink's transport, not a way of carrying it.
 
+Whether that answer carries UALink or competes with it depends on who is asked. OCP and AMD present ESUN as carriage for someone else's protocol, UALink included [[29]](#ref-29)[[40]](#ref-40)[[83]](#ref-83); the UALink Consortium presents Ethernet scale-up as the rival, selling "no MAC encapsulation" against a transport and a network layer "governed separately" [[82]](#ref-82).
+
 #### 9.1.3 What AMD actually ships
 
 AMD ships neither answer whole. Needing **Helios** in 2026, it runs **UALink-over-Ethernet** on Broadcom's Tomahawk (§8.2): UALink's memory semantics, commodity switches, and a binding of its own.
 
 > **Networker's version:** UALink-over-Ethernet is to UALink what **RoCE** is to InfiniBand (§4.3) — a purpose-built fabric's upper layers dropped into an Ethernet frame and run over switches that know nothing about the protocol, because the alternative is buying that fabric's own switches.
 
-OCP and AMD present ESUN as carriage for someone else's protocol, UALink included [[29]](#ref-29)[[40]](#ref-40)[[83]](#ref-83); the UALink Consortium presents Ethernet scale-up as the rival, selling "no MAC encapsulation" against a transport and a network layer "governed separately" [[82]](#ref-82). The shape itself is not in dispute:
+AMD takes the right-hand path — the same stack down to the 640-byte flit, then a different route to the wire:
 
 ```
    +----------------------------------------------------------------------+
