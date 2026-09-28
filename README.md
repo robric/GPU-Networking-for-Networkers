@@ -38,7 +38,8 @@ The golden rule for the whole document: **whenever something looks like magic, w
     - [3.4.2 NVL576: eight racks, two switch tiers (a folded Clos)](#342-nvl576-eight-racks-two-switch-tiers-a-folded-clos)
   - [3.5 Memory semantics: load/store vs send/receive](#35-memory-semantics-loadstore-vs-sendreceive)
   - [3.6 Decoding the names: DGX/HGX/MGX, Oberon/Kyber, and the NVL## trap](#36-decoding-the-names-dgxhgxmgx-oberonkyber-and-the-nvl-trap)
-  - [3.7 Where scale-up ends and scale-out must begin](#37-where-scale-up-ends-and-scale-out-must-begin)
+  - [3.7 A second scale-up fabric: Groq LPX](#37-a-second-scale-up-fabric-groq-lpx)
+  - [3.8 Where scale-up ends and scale-out must begin](#38-where-scale-up-ends-and-scale-out-must-begin)
 - [4. Scale-out: the GPU cluster network](#4-scale-out-the-gpu-cluster-network)
   - [4.1 The job: connect the islands](#41-the-job-connect-the-islands)
   - [4.2 RDMA on the wire: one-sided, kernel-bypass, GPUDirect](#42-rdma-on-the-wire-one-sided-kernel-bypass-gpudirect)
@@ -70,6 +71,7 @@ The golden rule for the whole document: **whenever something looks like magic, w
   - [8.2 AMD: the open bet](#82-amd-the-open-bet)
   - [8.3 Intel Gaudi: one fabric for both scales](#83-intel-gaudi-one-fabric-for-both-scales)
   - [8.4 The hyperscalers: silicon you mostly can't buy](#84-the-hyperscalers-silicon-you-mostly-cant-buy)
+  - [8.5 What it costs to move a model](#85-what-it-costs-to-move-a-model)
 - [9. Open standards: the fabric without the vendor](#9-open-standards-the-fabric-without-the-vendor)
   - [9.1 The scale-up front: answering NVLink](#91-the-scale-up-front-answering-nvlink)
     - [9.1.1 UALink, and the switch nobody builds](#911-ualink-and-the-switch-nobody-builds)
@@ -288,7 +290,7 @@ Everything so far — sharded tensors, GPUs collaborating mid-computation — ha
 
 <p align="center"><em>Training: backend lockstep. Inference: user-facing front, lighter back.</em></p>
 
-**Training — build the model.** This is the heavy one. Thousands of GPUs run in **lockstep**, grinding through the dataset for days or weeks, and after every step they reconcile what they learned — the **gradient all-reduce** from §3.7: *every parameter, summed across every replica.* Its traffic signature:
+**Training — build the model.** This is the heavy one. Thousands of GPUs run in **lockstep**, grinding through the dataset for days or weeks, and after every step they reconcile what they learned — the **gradient all-reduce** from §3.8: *every parameter, summed across every replica.* Its traffic signature:
 - **East-west and internal** — GPU↔GPU collectives dominate; almost nothing leaves for a user. Pure **backend** (§1.4).
 - **Synchronized and bursty** — everyone hits the network at the same instant, then waits for the slowest before the next step (§4.1). **Tail latency sets the pace of the whole job.**
 - **Throughput-bound** — you care about sustained bandwidth, not single-request microseconds.
@@ -439,7 +441,7 @@ This document tackles **scale-up first** (NVLink), then scale-out later.
 
 > Goal: by the end you should be able to explain, to another networking person, what NVLink *is*, what problem it solves, and why it is **not** just "a faster PCIe" and **not** quite "an Ethernet for GPUs" either.
 
-NVLink, in seven steps:
+Scale-up, in eight steps:
 
 - **§3.1** — the problem NVLink solves.
 - **§3.2** — NVLink as a link: lanes, sublinks, reading a spec sheet.
@@ -447,7 +449,8 @@ NVLink, in seven steps:
 - **§3.4** — scaling past the box: NVL72, then NVL576.
 - **§3.5** — memory semantics: load/store vs send/receive.
 - **§3.6** — decoding the names: DGX/HGX/MGX, Oberon/Kyber, the NVL## trap.
-- **§3.7** — where scale-up ends and scale-out begins.
+- **§3.7** — a second scale-up fabric: Groq LPX, scheduled instead of switched.
+- **§3.8** — where scale-up ends and scale-out begins.
 
 ### 3.1 The problem NVLink solves
 
@@ -738,7 +741,7 @@ Two things change from NVL72:
 
 > board traces (pizza box) → **copper** spine (NVL72) → **copper in-rack + optics between racks** (NVL576) → **co-packaged optics** (NVL1152).
 
-Even so, scale-up still has a ceiling. You can keep stacking NVLink tiers, but each one costs more optics, power, and latency, and the NVLink domain stays in the hundreds-to-low-thousands of GPUs. Past that you stop extending the *memory* fabric and cross into the packet-switched **scale-out** network — a different fabric with different rules, which is why it gets its own half of the document. The hand-off is §3.7; the scale-out fabric itself is §4.
+Even so, scale-up still has a ceiling. You can keep stacking NVLink tiers, but each one costs more optics, power, and latency, and the NVLink domain stays in the hundreds-to-low-thousands of GPUs. Past that you stop extending the *memory* fabric and cross into the packet-switched **scale-out** network — a different fabric with different rules, which is why it gets its own half of the document. The hand-off is §3.8; the scale-out fabric itself is §4.
 
 \**NVL576 / Rubin Ultra (~2027) and NVL1152 / Feynman (~2028) are announced roadmap, not shipping — treat the specifics as preliminary. The durable point is the **media ladder**: copper → optics → co-packaged optics, as the NVLink domain grows.*
 
@@ -813,7 +816,21 @@ We've met the technology (§3.2) and the systems (§3.4). What's left is the par
 
 With the names decoded, a sentence like *"the Kyber-based Rubin Ultra NVL576 MGX rack"* stops being noise and parses cleanly: **Rubin Ultra GPUs**, in the **Kyber** rack design, wired into a **576-GPU NVLink domain**, to the **MGX** modular spec.
 
-### 3.7 Where scale-up ends and scale-out must begin
+### 3.7 A second scale-up fabric: Groq LPX
+
+Everything in §3 so far is one design: a switch in the middle, any GPU reaching any other, and hardware deciding at run time where each transfer goes. NVIDIA now ships a second scale-up fabric that does none of that. The chip is the **LPU** (Language Processing Unit), designed by **Groq** and licensed by NVIDIA in December 2025 [[88]](#ref-88). It ships as **NVIDIA Groq 3 LPX**, in full production since August 2026 [[87]](#ref-87). Keeping §3.6's habit: **LP30** is the accelerator, **LPX** is the rack. It is not a GPU, it does not train, and it sits beside a Vera Rubin NVL72 rather than replacing it.
+
+Two numbers explain the design. Each accelerator holds **500 MB of SRAM on the die**, read at **150 TB/s**, where a GPU reads HBM at 3–8 TB/s (§1.2). Decode is memory-bandwidth-bound (§1.5), so that ratio is the entire argument. The cost is capacity. 500 MB holds no model at all, so a model is spread across the rack by layer, and a 256-accelerator rack carries 128 GB of SRAM with 12 TB of DDR5 behind it [[87]](#ref-87).
+
+The fabric is where it stops resembling §3.3. Each LPU has **96 chip-to-chip links at 112 Gbps**, which is 2.5 TB/s per accelerator and 640 TB/s across the rack [[87]](#ref-87). There is no switch. The links are direct and source-routed, and the compiler "explicitly schedules computation, data movement, and synchronization" instead of leaving it to hardware [[87]](#ref-87). An NVSwitch decides where a transfer goes while the job runs. Here the decision was made at compile time.
+
+That trade should feel familiar. It is TDM against statistical multiplexing, the SDH bargain rather than the IP one: guaranteed timing, no adaptation, and stranded capacity whenever the schedule does not match the traffic. §4 spends a chapter on the machinery a dynamic fabric needs to stay lossless and to steer around congestion. A statically scheduled fabric needs none of it, because nothing about the timing is uncertain.
+
+Holding a static schedule across 256 chips takes one clock, and that part deserves a networker's attention. NVIDIA describes a "plesiosynchronous, chip-to-chip protocol in hardware that cancels natural clock drift and aligns hundreds of LPU accelerators to act as a single coordinated system" [[87]](#ref-87). *Plesiochronous* is the PDH word. Every chip runs its own oscillator, nominally at the same frequency, drifting by parts per million. At 1 GHz a 10 ppm offset is ten thousand cycles of drift per second, which would break a cycle-accurate schedule within milliseconds. So the link protocol measures the drift and cancels it, and the rack presents one time base to the compiler. Ethernet solves the same problem one link at a time, with an elastic buffer and idle insertion in the inter-packet gap. Here it has to hold across a whole rack.
+
+What runs on it is a finer split than §1.5 draws. NVIDIA calls the pairing **Attention-FFN Disaggregation** (AFD): the Vera Rubin GPUs take "decode work that benefits most from throughput and large memory capacity, such as full-context attention", and LPX takes "latency-sensitive execution within decode, such as sparse MoE expert feed-forward networks" [[87]](#ref-87). §1.5 splits prefill from decode. This splits inside decode, attention on one chip type and expert feed-forward on the other, within the same token. §5.4 comes back to what that does to the traffic.
+
+### 3.8 Where scale-up ends and scale-out must begin
 
 Everything in §3 has been **one bounded thing**: a single NVLink memory domain — 8 GPUs, 72, eventually a few thousand — where any GPU can `load`/`store` any other's HBM as if it were local. Beautiful, fast, and *finite.* This last section is about the wall it hits, and what you do when you reach it.
 
@@ -886,7 +903,7 @@ Scale-out, in seven steps:
 
 ### 4.1 The job: connect the islands
 
-§3.7 left us with the picture: **scale-up islands** — each an NVLink memory domain of 8–72 GPUs — that now have to be wired into a **cluster**. That's the whole job of scale-out. The numbers are what make it hard.
+§3.8 left us with the picture: **scale-up islands** — each an NVLink memory domain of 8–72 GPUs — that now have to be wired into a **cluster**. That's the whole job of scale-out. The numbers are what make it hard.
 
 **The scale.** A frontier training run wants **tens of thousands** of GPUs; the biggest clusters are now **100,000+**. At 72 GPUs per NVL72 island, 100k GPUs is roughly **1,400 islands** to interconnect. And each GPU brings its **own NIC** — well-provisioned AI clusters run about **one NIC per GPU** (the NIC edge from §1.2) — so the fabric is terminating on the order of **100,000 high-speed ports**, all for a *single job*. That's a bigger network than most enterprises run in total.
 
@@ -898,9 +915,9 @@ Scale-out, in seven steps:
 | Blackwell + ConnectX-8 | 7,200    | 800       | 9×   |
 | Rubin + 2 × ConnectX-9 | 14,400   | 1,600     | 9×   |
 
-So an **~18× drop** at the island edge on the 400G generation, ~9× on the 800G one — and the gap is closing, not widening, because Rubin doubles both sides at once [[63]](#ref-63). Cross the boundary and your bandwidth falls by an order of magnitude. *This* is the quantitative reason for §3.7's workload-cut rule: keep the chatty traffic **inside** the island; push across the NIC only what you must.
+So an **~18× drop** at the island edge on the 400G generation, ~9× on the 800G one — and the gap is closing, not widening, because Rubin doubles both sides at once [[63]](#ref-63). Cross the boundary and your bandwidth falls by an order of magnitude. *This* is the quantitative reason for §3.8's workload-cut rule: keep the chatty traffic **inside** the island; push across the NIC only what you must.
 
-**What actually crosses.** Mostly the coarse, periodic collective traffic from §3.7:
+**What actually crosses.** Mostly the coarse, periodic collective traffic from §3.8:
 
 - **data-parallel gradient all-reduce** — once per training step, but it's *every* parameter, summed across *every* replica;
 - **pipeline activations** — handed stage to stage;
@@ -1264,7 +1281,7 @@ This is **server-centric** homing, and it's the honest fallback when you have no
 
 The baseline spends a whole spine on rank-aligned traffic. Re-homing the NICs makes that spine unnecessary.
 
-**A rail is a track between scale-up islands** — the NVLink domains of §3.7. Every NIC takes the rank of the GPU it serves: GPU *k*'s NIC is NIC *k*, and the heavy traffic runs between NICs of the same rank (§4.6.1).
+**A rail is a track between scale-up islands** — the NVLink domains of §3.8. Every NIC takes the rank of the GPU it serves: GPU *k*'s NIC is NIC *k*, and the heavy traffic runs between NICs of the same rank (§4.6.1).
 
 **The simple form is one NIC per rail.** Cable NIC *k* of every island onto the same switch, and that switch is **rail *k***. An **8-GPU B200 node** (§3.3) — eight GPUs on one HGX baseboard, one NIC each — is an island of eight NICs, so it gives eight rails, one switch apiece, and rank-*k* traffic crosses **one switch, one hop, no spine**.
 
@@ -1793,7 +1810,7 @@ You never train a frontier model on one GPU, so you cut it across many — and e
 What the table flattens:
 
 - **Cadence decides the placement.** TP and MoE exchange data *inside every layer*, so their traffic is fine-grained and latency-bound — which is why §4 kept it on NVLink, inside the island. DP and PP communicate once per step or per micro-batch, coarse enough to ride the scale-out Clos.
-- **Scale-up is a budget, not a guarantee.** TP and MoE *prefer* NVLink but aren't pinned there — a TP degree or EP group larger than the NVLink domain spills across the NIC onto scale-out, over the island-edge bandwidth cliff we measured earlier (the ~18× drop). It still runs, just slower, with §4.4's tail back in play. That penalty is the argument for big NVLink domains (§3.7): a 72-GPU NVL72 keeps far more of this traffic on the fast side than an 8-GPU scale-up (AMD, Intel, pre-NVL72 NVIDIA).
+- **Scale-up is a budget, not a guarantee.** TP and MoE *prefer* NVLink but aren't pinned there — a TP degree or EP group larger than the NVLink domain spills across the NIC onto scale-out, over the island-edge bandwidth cliff we measured earlier (the ~18× drop). It still runs, just slower, with §4.4's tail back in play. That penalty is the argument for big NVLink domains (§3.8): a 72-GPU NVL72 keeps far more of this traffic on the fast side than an 8-GPU scale-up (AMD, Intel, pre-NVL72 NVIDIA).
 - **All-to-all is MoE-only.** A dense model never issues one. A Mixture-of-Experts layer holds many **experts** — independent feed-forward network (FFN) blocks — and routes each token to just the one or two it needs; expert parallelism shards those experts across a set of GPUs, the **expert-parallel (EP) group**, and the all-to-all is the token shuffle *within that group* — dispatch each token to the GPU holding its expert, combine the results back — never a cluster-wide exchange (§4.4).
 - **Real jobs stack the cuts.** A frontier run does DP × TP × PP, often × MoE, at once — "3D/4D parallelism" — so the fabric carries every one of these patterns simultaneously, each pinned to the layer that suits it.
 - **Scale-across is the next tier out.** Same rule, one step further: the *least chatty* dimension goes on the slowest link. When a job outgrows one building and spills into a second datacenter (§4.6.5), only traffic that communicates *rarely* can tolerate that long, high-latency hop — so it's **data parallelism**, which syncs gradients just once per step. Even that cost gets hidden two ways: **overlap** the sync with the backward pass (average the last layer's gradients while the earlier layers are still computing), or **desynchronize** it — let each site train on its own for tens of steps and only average the models now and then, the local-SGD / DiLoCo [[18]](#ref-18) trick that cuts cross-site traffic by hundreds of times. TP and MoE never leave the building: they talk *every layer*, thousands of times a step, so even a few kilometers of added delay is fatal.
@@ -2115,7 +2132,10 @@ The same silicon runs two different software stacks, tuned for opposite goals.
 
 <p align="center"><em>The training stack: model down to fabric — mostly open; the lock-in is below, in CUDA.</em></p>
 
-**Serving** optimizes **latency**, and it stacks in *two* layers. First the **inference engine** — **vLLM**, **TensorRT-LLM**, **SGLang** — which runs the model on one instance (one or a few GPUs) with the tricks §5.4 named: continuous batching, a **paged KV cache** (vLLM's PagedAttention [[22]](#ref-22)), quantization. Then a **distributed serving layer** — the **control plane for the fleet**, working at the *request* level, not the tensor level: a cache-aware router and scheduler sitting above the engines — think an L7 load balancer plus a service mesh:
+**Serving** maximizes throughput under a latency budget, and it stacks in two layers:
+
+- **The inference engine** — **vLLM**, **TensorRT-LLM** (NVIDIA's own), **SGLang**. It runs the model on one instance, which is one or a few GPUs, and holds the tricks §5.4 named: continuous batching, a **paged KV cache** (vLLM's PagedAttention [[22]](#ref-22)), quantization.
+- **The distributed serving layer** — the control plane for the fleet. It works at the *request* level rather than the tensor level: a cache-aware router plus a scheduler above the engines. Think of an L7 load balancer and a service mesh.
 
 ```
                        user requests   (N-S, frontend §1.4)
@@ -2146,7 +2166,12 @@ The fleet layer does four jobs — this is the fleet §5.4 described:
 
 The collectives of §5 stay *inside* each engine instance; this layer works one level up, moving **requests and KV caches**, not tensors.
 
-Two stacks compete at that fleet layer, and **both are open source**, so it is not a clean open-vs-closed fight. NVIDIA's **Dynamo** [[20]](#ref-20) is the wider one: an *engine-agnostic* platform (it drives vLLM, SGLang, or TensorRT-LLM underneath) with its own KV-cache manager and the **NIXL** transfer library [[26]](#ref-26) that shuttles KV tensors over NVLink/IB. It is agnostic about the engine, not about the vendor: its support matrix is written in CUDA toolkit and NVIDIA driver versions [[68]](#ref-68). The community's **llm-d** [[45]](#ref-45) is narrower and **Kubernetes-native**, built around vLLM and the CNCF gateway/scheduling ecosystem — disaggregation as a first-class K8s project rather than a vendor's platform. They are not a like-for-like (Dynamo is the broader system), and they even share plumbing: llm-d reuses Dynamo's NIXL. So the real split is less open-vs-closed than **integrated NVIDIA platform vs portable Kubernetes assembly**:
+Two stacks compete at that fleet layer, and **both are open source**, so this is not a clean open-vs-closed fight:
+
+- **Dynamo** (NVIDIA) [[20]](#ref-20) — the wider of the two. It is *engine-agnostic*: it drives vLLM, SGLang or TensorRT-LLM underneath. Its **KV Block Manager** treats the KV cache as a hierarchy and spills it from GPU memory to host memory, to local disk, then to remote storage [[86]](#ref-86); a later request that shares a prefix gets a cache hit instead of a fresh prefill. The **NIXL** library [[26]](#ref-26) moves those blocks, and what matters is that it abstracts the *endpoint*, not just the wire: one transfer can start in HBM and end in an object store. It is flexible about the engine. It is not flexible about the hardware: its support matrix is written in CUDA toolkit and NVIDIA driver versions [[68]](#ref-68).
+- **llm-d** (community) [[45]](#ref-45) — the narrower one, and **Kubernetes-native**. It is built around vLLM and the CNCF gateway and scheduling ecosystem. It treats disaggregation as a Kubernetes project rather than as a vendor's platform.
+
+The two are not equivalent, and they share plumbing: llm-d reuses Dynamo's NIXL. So the split is not really open versus closed. It is an **integrated NVIDIA platform against a portable Kubernetes assembly**:
 
 ```
    SERVING stack - two flavors
@@ -2271,12 +2296,13 @@ Almost every concrete *product* in this document — NVLink, NVSwitch, NCCL, CUD
 
 > **NVIDIA** — vertically integrated, proprietary top to bottom. **→ AMD** — its own silicon, but betting on *open* interconnect standards. **→ Intel Gaudi** — commodity Ethernet, all the way down.
 
-The vendor landscape, in four steps:
+The vendor landscape, in five steps:
 
 - **§8.1** — the same shape, different names: NVIDIA and AMD, layer for layer.
 - **§8.2** — AMD: no switch silicon, and why that forces the open bet.
 - **§8.3** — Intel Gaudi: one Ethernet fabric for both scales.
 - **§8.4** — the hyperscalers: custom silicon, off the openness axis.
+- **§8.5** — what it costs to move a model between stacks.
 
 ### 8.1 The same shape, different names
 
@@ -2292,7 +2318,11 @@ The closest like-for-like is **AMD**: its Instinct accelerators mirror NVIDIA's 
 | Programming model | **CUDA**                          | **ROCm / HIP**           |
 | Collectives       | **NCCL**                          | **RCCL**                 |
 
-Read across any row and it is the same idea wearing a different badge — which is the whole point: nothing in §3–§7 was NVIDIA-specific *architecture*, only NVIDIA-specific *product*. **Intel** is the third player, but its AI chip — **Gaudi** — is not a GPU and makes a more radical bet on the network, so it gets its own section (§8.3). Both of Intel's AI lines have since ended — Falcon Shores cancelled, Gaudi with no fourth generation — so §8.3 reads Gaudi as an architecture lesson rather than an option.
+Read across any row and it is the same idea wearing a different badge — which is the whole point: nothing in §3–§7 was NVIDIA-specific *architecture*, only NVIDIA-specific *product*.
+
+That is true of the architecture, not of a running job. A model is written against one vendor's kernels, collective library, and fabric shape, and those do not travel with it. §8.5 works through what a move actually costs.
+
+**Intel** is the third player, but its AI chip — **Gaudi** — is not a GPU and makes a more radical bet on the network, so it gets its own section (§8.3). Both of Intel's AI lines have since ended — Falcon Shores cancelled, Gaudi with no fourth generation — so §8.3 reads Gaudi as an architecture lesson rather than an option.
 
 ### 8.2 AMD: the open bet
 
@@ -2316,7 +2346,7 @@ That shaped the scale-up story for two generations. The MI300X and MI355X wire *
 
 It gets there on Broadcom silicon. UALink is still a standard and a bet, not a shipping fabric: no native UALink switch is shipping yet, with announced targets running from late 2026 into 2027, and **Broadcom** — volume switch vendor and UALink founder — has since backed the Ethernet path (ESUN) instead, leaving no high-volume UALink switch to buy [[29]](#ref-29). So AMD carries the protocol over Ethernet — its own Hot Chips material counts those links as *Infinity Fabric over Ethernet*, which is what UALink's protocol layer was derived from (§9.1). On AMD's telling UALink and ESUN compose rather than compete; §9 has the argument. Even AMD's scale-up is Ethernet underneath.
 
-§3.7 ended on fabrics that compute: an NVSwitch does not only move bytes, it runs **SHARP** — the arithmetic and multicast offloads of §5.2 and §5.3 — so an all-reduce is summed inside the switch and a broadcast is replicated there. Helios has no equivalent. Broadcom sells one: **Tomahawk Ultra**, 250 ns a hop with **in-network collectives (INC)** for all-reduce, all-gather and broadcast, built to answer NVLink [[71]](#ref-71). It is a different chip from Tomahawk 6 at half the capacity — 51.2 Tbps against 102.4 — and Helios took the bandwidth. The protocol offers no way back: **UALink 1.0 carries no collective offload**, and in-network collectives arrive only in **UALink 2.0\*** [[72]](#ref-72).
+§3.8 ended on fabrics that compute: an NVSwitch does not only move bytes, it runs **SHARP** — the arithmetic and multicast offloads of §5.2 and §5.3 — so an all-reduce is summed inside the switch and a broadcast is replicated there. Helios has no equivalent. Broadcom sells one: **Tomahawk Ultra**, 250 ns a hop with **in-network collectives (INC)** for all-reduce, all-gather and broadcast, built to answer NVLink [[71]](#ref-71). It is a different chip from Tomahawk 6 at half the capacity — 51.2 Tbps against 102.4 — and Helios took the bandwidth. The protocol offers no way back: **UALink 1.0 carries no collective offload**, and in-network collectives arrive only in **UALink 2.0\*** [[72]](#ref-72).
 
 RCCL still runs a ring or a tree over UALoE at the full 3.6 TB/s, so nothing here is impossible; AMD pays in GPU cycles spent on arithmetic NVIDIA does in the switch, and in the wire volume multicast would have saved. It bites where §5 says it bites — the all-reduce sitting on the barrier — not bulk bandwidth.
 
@@ -2390,16 +2420,32 @@ The last stop is the companies that build silicon but don't sell it: the hypersc
 
 ### 8.4 The hyperscalers: silicon you mostly can't buy
 
-There is a third category that fits no point on the openness axis, because most of it is not for sale. Google, Amazon, Microsoft, and Meta each design their own AI accelerators — for their own fleets, not the market. They are as vertically integrated as NVIDIA, but *captive*: the chip, the interconnect, and the software all exist to serve one operator. What makes them worth a look is that they build the **same architecture** — a scale-up domain, a scale-out fabric, collectives over both — out of entirely custom parts. That is the strongest evidence yet that the architecture, not any one product, is the durable thing.
+A third category fits nowhere on the openness axis, because most of it is not for sale. Google, Amazon, Microsoft and Meta each design their own AI accelerators, for their own fleets rather than for the market. They are as vertically integrated as NVIDIA, but *captive*. The chip, the interconnect and the software all serve one operator. They are worth a look because they build the same architecture out of entirely custom parts: a scale-up domain, a scale-out fabric, and collectives over both. The shape holds even when every part of it is replaced.
 
 Two are worth naming, because they take opposite roads on scale-up:
 
-- **Google TPU** (seventh-generation **Ironwood** shipping, an eighth announced) is the oldest custom AI chip, and its fabric is the most unusual in this chapter. Scale-up is **ICI** (Inter-Chip Interconnect), wiring chips into a direct **3-D torus** — no switch, a mesh with wraparound — at ~1.2 TB/s per chip. To grow a pod, Google adds no packet spine; it links whole 64-chip cubes through **optical circuit switches (OCS)** [[37]](#ref-37), scaled to a **9,216-chip** pod — the same class of reconfigurable optical switching Google runs in its datacenter network (§4.6.4), here dedicated to the TPU fabric. Circuit switching, not packet switching: the fabric *rewires* rather than routing every packet — the provisioned-light-path world of optical transport, applied to an AI pod. Two caveats the NVIDIA mapping blurs: ICI is a **message-passing** collective fabric, not NVLink-style **load/store** memory — closer to IB in semantics even as it plays the scale-up role; and the optical OCS is the pod-*internal* fabric — to go beyond one pod, TPUs scale *out* over ordinary datacenter Ethernet (**multislice**), not more optics. Software is **XLA**, not CUDA [[33]](#ref-33), though **TorchTPU\***, whose public repo is still to come, runs PyTorch natively on TPU and compiles through XLA instead of CUDA [[84]](#ref-84). The eighth generation splits the work across two chips — **TPU 8t** for training, **TPU 8i** for inference — which is §5.4's prefill/decode divergence appearing in silicon; 8t holds 9,600 chips and 121 ExaFLOPS in a pod, still switched optically [[77]](#ref-77).
+- **Google TPU** is the oldest custom AI chip, and its fabric is the most unusual in this chapter. The shipping generation is the seventh, **Ironwood**. Scale-up is **ICI** (Inter-Chip Interconnect), about 1.2 TB/s per chip, and it uses no switch at all. ICI wires the chips into a **3-D torus**: a direct mesh, with the edges wrapped around. Growing a pod adds no packet spine either. Google links whole 64-chip cubes through **optical circuit switches (OCS)** [[37]](#ref-37), up to a **9,216-chip** pod. This is circuit switching rather than packet switching. The fabric is rewired to suit the job, instead of routing every packet, much as an optical transport network provisions a light path. Google already runs this kind of switching in its datacenter network (§4.6.4), and here it is dedicated to the TPU fabric.
+
+  The NVIDIA mapping blurs two things. First, ICI plays the scale-up role, but it carries **messages**, not NVLink-style **load/store** memory. Its semantics are closer to InfiniBand than to NVLink. Second, the optical fabric stops at the pod. To go beyond one pod, TPUs scale *out* over ordinary datacenter Ethernet (**multislice**), not over more optics. The software is **XLA**, not CUDA [[33]](#ref-33). For years that also meant JAX. The model ecosystem is written for PyTorch on CUDA (§6.1), so moving a model to a TPU was a port rather than a recompile. **TorchTPU\*** is aimed at that gap. It makes the TPU an ordinary PyTorch device, so the model sees a normal `torch.Tensor` on `device="tpu"` and the operators lower to XLA underneath. The older PyTorch/XLA route was a wrapper with its own rules, and this one is a native backend. The public repo has not landed yet [[84]](#ref-84).
+
+  The eighth generation\* splits the chip in two, and the fabric with it. **TPU 8t**, for training, keeps the torus and stretches it to 9,600 chips in one superpod. **TPU 8i**, for inference, drops the torus. Its **Boardfly** topology builds four-chip rings into boards, wires eight boards together in copper, then links 36 of those groups through OCS, up to 1,024 active chips. The reason is hop count. Across the same 1,024 chips the torus is 16 hops wide, and Boardfly is 7 [[85]](#ref-85). More direct optical links between groups, fewer hops across the pod. That is §5.4's training-and-inference split reaching the topology, not just the silicon. Google announced both in April 2026, and neither has shipped yet [[77]](#ref-77).
 - **AWS Trainium** takes the familiar road, and has just taken it further. The Trainium2 UltraServer bound **64 chips** across four servers with **NeuronLink**; the Trainium3 UltraServer, generally available since December 2025, carries **144 chips** on **NeuronSwitch-v1** — in AWS's words, "an all-to-all fabric using NeuronLink-v4 with 2TB/s of bandwidth per chip" [[76]](#ref-76). Point-to-point binding became a switched domain. That is the row §8.2 leaves empty for AMD, filled here by an operator that never has to sell the switch. Scale-out stays plain **EFA / SRD** — the packet-spray Ethernet transport of §4.7 [[13]](#ref-13). Software is the **Neuron SDK**. The scale is real: **Project Rainier**, built with Anthropic, runs ~500,000 Trainium2 chips across several datacenters [[34]](#ref-34).
 
 Microsoft (**Maia**) and Meta (**MTIA**) round out the set, both inference-first. The pattern holds across all of them: custom silicon, a named scale-up link, an Ethernet-or-optical scale-out fabric, a private software stack. The lock-in is simply *theirs* instead of NVIDIA's.
 
-One exception is already cracking that captive model: **TPU.** Google has begun placing TPUs beyond its own cloud — **Anthropic** has contracted for up to a million of them, part of a deliberately multi-sourced fleet that also spans AWS Trainium (the Project Rainier above) and NVIDIA GPUs [[36]](#ref-36), and **Meta** is set to rent TPUs in 2026 and run them in its own datacenters by 2027 [[35]](#ref-35). It is the first custom hyperscaler chip to reach other operators as a direct NVIDIA alternative.
+One exception is already cracking that captive model: **TPU.** Google has begun placing TPUs beyond its own cloud — **Anthropic** has contracted for up to a million of them, part of a deliberately multi-sourced fleet that also spans AWS Trainium (the Project Rainier above) and NVIDIA GPUs [[36]](#ref-36), and **Meta** is set to rent TPUs in 2026 and run them in its own datacenters by 2027 [[35]](#ref-35). It is the first custom hyperscaler chip to reach other operators as a direct NVIDIA alternative. TorchTPU is the software half of the same move. A rented chip only substitutes for a GPU if the model runs on it without a rewrite, and that is the part Google has not shipped yet.
+
+### 8.5 What it costs to move a model
+
+The chapter has shown the same shape four times over. That makes the hardware substitutable in principle. Moving a real workload is a separate question, and it is decided almost entirely above the fabric, layer by layer.
+
+- **The model travels.** Transformers, MoE, convnets are standard operations on every accelerator here. Framework-level code compiles. This is the layer §8.1's table covers, and it is the easy one.
+- **The collective library is mostly a rename.** NCCL, RCCL and oneCCL share the vocabulary of §5, so the calls port. XLA is the exception: it places collectives from sharding annotations instead of taking explicit calls, so the parallelism has to be expressed differently rather than translated (§6.1).
+- **Custom kernels do not travel.** A fused attention kernel, a paged-attention implementation, a quantization kernel: each is written against one vendor's instruction set and memory hierarchy. AMD's **HIP** cross-compiles CUDA source (§8.2). The other stacks need the kernel rewritten in their own language: **Pallas** on TPU, **SYCL** on Intel. For a stock model this layer is empty. For a tuned serving stack it is most of the work.
+- **The parallelism plan is fitted to the fabric shape, not just its size.** NVL72 puts every GPU one hop from every other (§3.4.1), so a tensor-parallel group can be carved out of it in any shape. A 3-D torus (§8.4) makes near neighbours cheap and distant chips several hops away, so the same group has to be laid out along the mesh. An 8-way mesh (§8.3) is smaller than both. The model runs on all three. The placement that made it fast on one does not carry over.
+- **The serving stack has to exist on the target.** In production you do not run a model on its own. You run it inside an inference engine such as vLLM or TensorRT-LLM, which adds continuous batching and a paged KV cache (§6.3). Those engines were built on CUDA first. On another accelerator the same features arrive later and cover fewer models, so a port can be blocked by the engine rather than by the chip.
+
+So the lock-in is not the chip and it is not the wire. It is the tail above them: the kernels, the runtime, and the placement. That is worth holding on to through the next chapter, because the open standards of §9 open the wire between accelerators and leave this tail exactly where it is.
 
 Which sets up the last question of the chapter. Several of these same hyperscalers, unwilling to depend on any one vendor's fabric, are among the main backers of the **open standards** — UALink, Ultra Ethernet, ESUN — that would let anyone's accelerators talk over a common wire. §9 is that story.
 
@@ -2475,7 +2521,7 @@ The prize is NVLink + NVSwitch, the one layer that had no open equivalent for ye
 
 No Ethernet header or MAC appears anywhere in that stack, and the consortium advertises the absence as the point: a purpose-built fabric reaching **1,024 accelerators** in one pod [[82]](#ref-82).
 
-> **No collective offload:** UALink 1.0 does not do arithmetic — an all-reduce runs as a ring or a tree in the accelerators (§5.3), not summed inside the switch the way NVSwitch does with SHARP (§3.7). In-network collectives are a **UALink 2.0\*** item [[72]](#ref-72).
+> **No collective offload:** UALink 1.0 does not do arithmetic — an all-reduce runs as a ring or a tree in the accelerators (§5.3), not summed inside the switch the way NVSwitch does with SHARP (§3.8). In-network collectives are a **UALink 2.0\*** item [[72]](#ref-72).
 
 **The UALink switch does not exist yet.** **Broadcom** was a UALink founding board member; in **late 2025** it gave up the seat and helped launch ESUN instead [[29]](#ref-29). The volume merchant-switch vendor is betting that dedicated UALink switches never reach volume, and that scale-up collapses onto the Ethernet it already sells. Two of the biggest buyers went the same way: **Meta and Microsoft** wrote their own Ethernet requirements instead [[80]](#ref-80). That left the native path to smaller, later silicon. **Astera Labs**, a UALink board member, plans fabric switches but has published no date — the scale-up switch it ships today, Scorpio X-Series, is **PCIe** [[78]](#ref-78) — and announced targets elsewhere run from late 2026 into 2027.
 
@@ -3003,6 +3049,10 @@ Every term this document introduces, with the section that explains it. Ordinary
 82. <a id="ref-82"></a>UALink Consortium — *UALink™: An Open, High-Efficiency Scale-Up Interconnect for AI* (white paper, January 2026; the four-layer stack — Protocol (UPLI), Transaction, Data Link, Physical — riding IEEE 802.3 PAM4 PHYs, up to 1,024 accelerators per pod, "93% effective bandwidth target, minimal protocol overhead, no MAC encapsulation", roughly 1 µs round trip on copper under four metres. It does **not** describe carrying UALink inside Ethernet frames. Instead it groups Scale-Up Ethernet (SUE), SUE-Transport (SUE-T) and ESUN under "the Ethernet-derived continuum" and compares UALink *against* them in "Table A-T2: UALink vs Ethernet-Based Scale-Up Approaches", arguing those approaches "retain the fundamental constraint that the transport and network layers are governed separately". It also records that the UALink standard was developed from AMD's Infinity Fabric protocol). <https://ualinkconsortium.org/wp-content/uploads/2026/01/UALink_White_Paper_Publication_Candidate_FINAL_VERSION.pdf>
 83. <a id="ref-83"></a>AMD — *Introducing AMD CDNA 5 and the AMD Helios rack-scale platform* and *Open Standards for AI Scale: How AMD and OCP are Shaping the Next Era of AI Infrastructure* (AMD describes "a single-hop, multi-plane UALink™ over Ethernet (UALoE) scale-up fabric: all 72 GPUs reach each other through 12 UALoE switches across 6 switch trays" delivering 260 TB/s, and states that ESUN "enables vendor-unique scale-up protocols, such as UALink, to operate over standardized Ethernet layers", giving customers "the flexibility to scale using UALink over Ethernet or through dedicated UALink switches". AMD's Hot Chips 2026 presentation counts the same fabric as "72 IFoE links at 200G" — Infinity Fabric over Ethernet — using "a lightweight, reliable protocol with dynamic packet packing", with loss recovered by link-layer replay or end-to-end retransmission; those slide figures reach us through conference reporting rather than an AMD publication, and no encapsulation format — EtherType, header layout, or what exactly rides inside — is published anywhere). <https://rocm.blogs.amd.com/ecosystems-and-partners/cdna5-helios/README.html>
 84. <a id="ref-84"></a>Google — *TorchTPU: Running PyTorch Natively on TPUs at Google Scale* (a native PyTorch backend for TPU built on PyTorch's PrivateUse1 interface, exposing an ordinary `torch.Tensor` on `device="tpu"` rather than a JAX-backed wrapper; ATen operators lower directly to StableHLO and XLA compiles the executable, with `torch.compile` driving TorchDynamo and AOTAutograd on the graph path. Successor to PyTorch/XLA, which "only supported pure SPMD code"; Pallas and JAX custom kernels stay callable. Google lists the public GitHub repository among *planned* 2026 initiatives — so the project is announced and running internally, but not yet publicly released; deep vLLM and TorchTitan integration is also listed as a goal rather than shipped). <https://developers.googleblog.com/torchtpu-running-pytorch-natively-on-tpus-at-google-scale/>
+85. <a id="ref-85"></a>Google Cloud — *TPU 8t and TPU 8i technical deep dive* (TPU 8t "utilizes our proven 3D torus network topology at an even larger scale of 9,600 chips in a single superpod"; TPU 8i replaces the torus with **Boardfly**, where each tray "forms a four-chip ring using internal ICI links, providing 16 external connections", eight boards are "fully connected via copper cabling to create a localized group", and "the final architecture scales to 36 groups (up to 1,024 active chips) linked through Optical Circuit Switches (OCS), ensuring a maximum latency of seven hops" — "for that same 1024-chip pod, Boardfly reduces the network diameter from 16 hops down to just seven". Also describes **Virgo**, TPU 8t's scale-out DCN: a "flat, two-layer non-blocking topology" on high-radix switches, linking "over 134,000 TPU 8t chips with up to 47 petabits/sec of non-blocking bi-sectional bandwidth in a single fabric". The page carries no availability date and ends in an interest form). <https://cloud.google.com/blog/products/compute/tpu-8t-and-tpu-8i-technical-deep-dive>
+86. <a id="ref-86"></a>NVIDIA — *KVBM Guide: KV cache offloading* (the Dynamo **KV Block Manager**, "a scalable runtime component designed to handle memory allocation, management, and remote sharing of Key-Value (KV) blocks for inference tasks across heterogeneous and distributed environments". Blocks are offloaded down a hierarchy — GPU device, CPU host, disk, remote — and the benefit depends on having "enough prefix cache hits on KVBM to reuse offloaded KV blocks", which improves time-to-first-token). <https://docs.nvidia.com/dynamo/v1.3.0/user-guides/kv-cache-offloading>
+87. <a id="ref-87"></a>NVIDIA — *Inside NVIDIA Groq 3 LPX: The Low-Latency Inference Accelerator for the NVIDIA Vera Rubin Platform*, with the *NVIDIA Groq 3 LPX* product page (500 MB of "compiler-managed SRAM" per accelerator at 150 TB/s and 2.5 TB/s of scale-up bandwidth over "96 C2C links running at 112 Gbps each"; a 256-accelerator rack with 128 GB of SRAM, 12 TB of DDR5, 40 PB/s of aggregate SRAM bandwidth and "640 TB/s scale-up bandwidth". The compiler "explicitly schedules computation, data movement, and synchronization" rather than relying on dynamic hardware schedulers, and a "plesiosynchronous, chip-to-chip protocol in hardware … cancels natural clock drift and aligns hundreds of LPU accelerators to act as a single coordinated system". Larger models are scaled "using parallel execution strategies such as layer-wise partitioning". Attention-FFN Disaggregation puts Vera Rubin GPUs on "decode work that benefits most from throughput and large memory capacity, such as full-context attention" and LPX on "latency-sensitive execution within decode, such as sparse MoE expert feed-forward networks". In full production since 24 August 2026, with Nebius named as the first AI cloud to adopt it. NVIDIA's "35x higher throughput per megawatt for trillion-parameter models" is a vendor figure and is not used above). <https://developer.nvidia.com/blog/inside-nvidia-groq-3-lpx-the-low-latency-inference-accelerator-for-the-nvidia-vera-rubin-platform>
+88. <a id="ref-88"></a>Groq — *Groq and NVIDIA Enter Non-Exclusive Inference Technology Licensing Agreement to Accelerate AI Inference at Global Scale* (24 December 2025; Groq describes a "non-exclusive licensing agreement" covering its inference technology, states that "GroqCloud will continue to operate without interruption", and records founder Jonathan Ross and president Sunny Madra joining NVIDIA while Groq continues as an independent company under a new chief executive. **No transaction value is disclosed by either company** — the ~$20bn figure in wide circulation comes from press coverage, not from the announcements. NVIDIA's LPX pages carry the line "Groq and LPU are used under license from Groq, Inc."). <https://groq.com/newsroom/groq-and-nvidia-enter-non-exclusive-inference-technology-licensing-agreement-to-accelerate-ai-inference-at-global-scale>
 
 # TODO list tracking
 
