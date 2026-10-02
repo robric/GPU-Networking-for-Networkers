@@ -818,11 +818,36 @@ With the names decoded, a sentence like *"the Kyber-based Rubin Ultra NVL576 MGX
 
 ### 3.7 A second scale-up fabric: Groq LPX
 
-Everything in §3 so far is one design: a switch in the middle, any GPU reaching any other, and hardware deciding at run time where each transfer goes. NVIDIA now ships a second scale-up fabric that does none of that. The chip is the **LPU** (Language Processing Unit), designed by **Groq** and licensed by NVIDIA in December 2025 [[88]](#ref-88). It ships as **NVIDIA Groq 3 LPX**, in full production since August 2026 [[87]](#ref-87). Keeping §3.6's habit: **LP30** is the accelerator, **LPX** is the rack. It is not a GPU, it does not train, and it sits beside a Vera Rubin NVL72 rather than replacing it.
+Everything in §3 so far is one design: a switch in the middle, any GPU reaching any other, and hardware deciding at run time where each transfer goes. NVIDIA now ships a second scale-up fabric that does none of that. The compute element is the **LPU** (Language Processing Unit), designed by **Groq** and licensed by NVIDIA in December 2025 [[88]](#ref-88). NVIDIA calls the accelerator module **LP30**; **LPX** is the rack system, in full production since August 2026 [[87]](#ref-87). It is not a GPU, it does not train, and it sits beside a Vera Rubin NVL72 rather than replacing it.
 
-Two numbers explain the design. Each accelerator holds **500 MB of SRAM on the die**, read at **150 TB/s**, where a GPU reads HBM at 3–8 TB/s (§1.2). Decode is memory-bandwidth-bound (§1.5), so that ratio is the entire argument. The cost is capacity. 500 MB holds no model at all, so a model is spread across the rack by layer, and a 256-accelerator rack carries 128 GB of SRAM with 12 TB of DDR5 behind it [[87]](#ref-87).
+The reason for the design is the **bandwidth-versus-capacity trade**. Each LPU has **500 MB of SRAM on-chip**, read at **150 TB/s**; a GPU's HBM is much larger but reads at **3–8 TB/s** (§1.2). Decode is memory-bandwidth-bound (§1.5), so the LPU trades capacity for exceptional bandwidth and predictable access. 500 MB cannot hold a model, so the model is spread across many LPUs by layer [[87]](#ref-87).
 
-The fabric is where it stops resembling §3.3. Each LPU has **96 chip-to-chip links at 112 Gbps**, which is 2.5 TB/s per accelerator and 640 TB/s across the rack [[87]](#ref-87). There is no switch. The links are direct, and the compiler "explicitly schedules computation, data movement, and synchronization" instead of leaving it to hardware [[87]](#ref-87). An NVSwitch routes each flit on the address it carries and arbitrates between flits that want the same output port, with queueing and flow control behind that. Here there is nothing to arbitrate: the compiler has already fixed which link carries what, and when.
+Physically, LPX is a rack of 32 liquid-cooled 1U compute trays:
+
+```
+   NVIDIA Groq 3 LPX rack             
+                                                         rear
+      +----------------------------------------------------------+
+   1U | tray 0       [LPU0][LPU1]...[LPU7]                |======|\
+      +----------------------------------------------------------+ \
+      |                                                   |======|  \
+      |                          ...                      |======|   +-- C2C link spine
+      |                                                   |======|  /
+      +----------------------------------------------------------+ /
+      | tray 31      [LPU0][LPU1]...[LPU7]                |======|/
+      +----------------------------------------------------------+
+
+      each tray: 8 LP30/LPU modules, 4 GB SRAM
+      each LPU: 500 MB SRAM, 150 TB/s
+      Total for 32 trays: 32*8 = 256 LPUs and 500*256 = 128GB Memory  
+
+```
+
+   **C2C** means the chip-to-chip links, not one connector shared by all the LPUs. NVIDIA describes a C2C spine carrying those links between trays, but does not publish its connector-level construction or say that every LPU has a dedicated link to every other LPU [[87]](#ref-87).
+
+So the rack has **32 compute trays, with 8 LP30 modules per tray**: 32 × 8 = 256 accelerators. The SRAM arithmetic checks at both levels: 8 × 500 MB = 4 GB per tray, and 32 × 4 GB = 128 GB per rack [[87]](#ref-87). NVIDIA's public material calls each LP30 an accelerator/chip and describes its SRAM as on-chip. 
+
+The fabric is where it stops resembling §3.3. Each LPU has **96 chip-to-chip links at 112 Gbps**, which NVIDIA reports as 2.5 TB/s per accelerator and 640 TB/s across the rack [[87]](#ref-87). This is a **switchless, compiler-scheduled fabric**, but not a documented full physical mesh: 96 links per LPU does not mean one dedicated link to each of the other 255 LPUs. NVIDIA says links communicate directly within a tray and across trays via the C2C spine, but does not publish the complete rack link map [[87]](#ref-87). An NVSwitch dynamically routes traffic and arbitrates between links; LPX instead relies on the compiler to schedule which C2C link carries each transfer, and when.
 
 That is the whole difference. §4 spends a chapter on the machinery a dynamic fabric needs to stay lossless and to steer around congestion, and all of it exists because the arrival time of any given transfer is uncertain. A statically scheduled fabric removes the uncertainty instead of managing it. What it pays is rigidity: the plan holds only for the workload it was compiled for.
 
