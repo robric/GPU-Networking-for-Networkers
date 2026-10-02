@@ -215,7 +215,7 @@ A GPU is not a standalone computer. It lives inside a server, attached to a CPU:
 - Software enumerates the GPUs in a node as `cuda:0`, `cuda:1`, `cuda:2`, … — just an index per device, like interface IDs (`eth0`, `eth1`) on a box. This is what people mean by "N distinct GPUs": even when the GPUs are fully wired together, you still address `cuda:0 … cuda:7` individually. (Hold onto this — it's why "8 GPUs acting as one" is an abstraction, not a hardware fact.)
 - **The fabric unifies devices, not hosts.** Wiring GPUs together (NVLink, §3) can make many act as one pool of memory — but it never fuses the *machines*. A GPU rack stays a **cluster of separate servers**, each with its own OS. A GB200 NVL72's 72 GPUs form a single NVLink domain (§3.4.1), yet its CPUs are **18 independent hosts** — an `lscpu` on one shows that tray's ~144 cores, never all 2,592 [[44]](#ref-44). The memory fabric unifies; the operating systems do not.
 - **PCIe** is the general-purpose bus connecting CPU and GPUs (and NICs). It's fine for loading data and control, but it is **far too slow** to be the path GPUs use to share memory with each other at HBM speeds. Hold that thought — it's the exact gap NVLink exists to fill, in §3.
-- *Aside:* "superchip" designs (Grace-Hopper, GB200) change this CPU↔GPU relationship — the CPU attaches to the GPU over a fast, **cache-coherent NVLink-C2C** link (~900 GB/s, ~7× a PCIe-5 link) instead of PCIe, at a higher ratio (GB200 = 1 Grace CPU per 2 Blackwell GPUs). How that ratio is chosen — and why it has drifted over the years — is §1.5.2; the naming is §3.6.
+- *Aside:* "superchip" designs such as Grace-Hopper and GB200 change this CPU-to-GPU relationship. In these designs, the CPU connects to the GPU over a fast, **cache-coherent NVLink-C2C** link (about 900 GB/s, roughly 7 x  PCIe-5 link) instead of PCIe, and the ratio is higher. A GB200 has one Grace CPU for every two Blackwell GPUs. How that ratio is chosen, and why it has changed over the years, is covered in §1.5.2; the naming is discussed in §3.6.
 
 ### 1.4 The two network paths: host vs GPU
 
@@ -454,7 +454,7 @@ Scale-up, in eight steps:
 
 ### 3.1 The problem NVLink solves
 
-Back in §1.1 we established the uncomfortable fact that drives all of this: tensors are **sharded** across GPUs, so the GPUs must **collaborate mid-computation** — exchanging slices and summing partial results constantly, every layer, while the math is running. And §1.2 gave us the speed those exchanges happen at: the data lives in **HBM**, which moves at **3–8 TB/s**. The collaboration traffic wants to run at something close to *that*, because the moment GPU-to-GPU transfer is much slower than HBM, the Tensor cores sit idle waiting for data — and idle Tensor cores are the one thing a $40k GPU must never do.
+[§1.1 Why GPUs run the show](#11-why-gpus-run-the-show-and-what-the-cpu-still-does) showed that tensors are **sharded** across GPUs. This means the GPUs must **collaborate mid-computation**. At every layer, while the math is running, they exchange slices and sum partial results. [§1.2 What a GPU looks like](#12-what-a-gpu-looks-like-and-the-words-for-its-parts) showed that the data lives in **HBM**, which moves at **3–8 TB/s**. The traffic between GPUs needs to run close to that speed. If it is much slower, the Tensor cores sit idle waiting for data, and an idle Tensor core on a $40k GPU is wasted money.
 
 So the requirement is brutally simple to state: **let one GPU read and write another GPU's HBM at a useful fraction of HBM speed, with very low latency.** That's it. The question is just what wire you do it over.
 
@@ -544,7 +544,7 @@ Map this to networking and it's familiar territory:
 
 †*Pairs-per-sub-link is well-documented as 8 for 1.0/2.0 and 4 from 3.0 through 5.0; for 6.0 it is neither published nor derivable from the totals, hence the `?`. The exact lane signaling rate of the newest gens also varies by source, so treat that detail as approximate. The per-link and per-GPU totals are the solid, NVIDIA-published numbers.*
 
-\**NVLink 6.0 / Rubin: three figures are published — **3,600 GB/s per GPU**, **~260 TB/s per NVL72 rack**, and **9 x 4 = 36 NVLink 6 switches** wired all-to-all [[63]](#ref-63). The **36 × 100 GB/s** split shown is derived from those, not stated by NVIDIA: an all-to-all rack means one link from each GPU to each switch, so 36 switches implies 36 links, and 3,600 ÷ 36 = 100 GB/s — the same per-link rate as NVLink 5. Treat the split as inference; the totals are solid.*
+\**NVLink 6.0 / Rubin: NVIDIA gives three published numbers — **3,600 GB/s per GPU**, **~260 TB/s per NVL72 rack**, and **9 x 4 = 36 NVLink 6 switches** wired all-to-all [[63]](#ref-63). The **36 × 100 GB/s** breakdown is not stated directly by NVIDIA; it is worked out from those totals. In an all-to-all rack, each GPU must connect to each switch, so 36 switches implies 36 links, and 3,600 ÷ 36 = 100 GB/s per link — the same per-link rate as NVLink 5. The totals are solid; the link-by-link split is a deduction.*
 
 Notice *how* the bandwidth grows: from 2.0 to 4.0 the per-link rate was flat at 50 GB/s and NVIDIA just **added more links** (6 → 12 → 18). With 5.0 they ran out of "more links" headroom and instead **doubled the per-link rate** (faster ~200G-class SerDes lanes), keeping 18 links but reaching 1.8 TB/s — then 6.0 (Rubin) went back to the first knob, **doubling the links** to 36 at the same 100 GB/s each. Same two knobs any network architect has: *more ports*, or *faster ports* — and NVIDIA has alternated between them.
 
@@ -751,7 +751,7 @@ Four sections on *how the wires are arranged*. Now the part that breaks networki
 
 There are two fundamentally different ways for one chip to get at data sitting in another:
 
-**1. Message passing (send / receive) — the model you already know.** Both sides are active. The sender packages data into a message, addresses it, hands it to the network; the receiver posts a receive and copies it out. This is sockets, MPI, and — at the wire — every packet you've ever `tcpdump`'d. The defining trait: **the data is an explicit message, and the receiver has to participate.**
+**1. Message passing (send / receive) — the network model you already know.** Both sides are active. The sender packages data into a message, addresses it, hands it to the network; the receiver posts a receive and copies it out. This is sockets, MPI, and — at the wire — every packet you've ever `tcpdump`'d. The defining trait: **the data is an explicit message, and the receiver has to participate.**
 
 **2. Memory semantics (load / store) — the NVLink model.** There is no "send." A GPU just executes a **`load` or `store` to a memory address** — and if that address happens to live in *another* GPU's HBM, the NVLink fabric quietly fetches or writes it. The remote GPU is **passive**: it runs no code, posts no receive; its memory is simply *there*, in a shared address space. To the program, reaching a peer's HBM looks like reaching its own — just a few times slower (§3.1).
 
@@ -843,11 +843,11 @@ Physically, LPX is a rack of 32 liquid-cooled 1U compute trays:
 
 ```
 
-   **C2C** means the chip-to-chip links, not one connector shared by all the LPUs. NVIDIA describes a C2C spine carrying those links between trays, but does not publish its connector-level construction or say that every LPU has a dedicated link to every other LPU [[87]](#ref-87).
+   **C2C** means chip-to-chip links, not a single connector shared by all the LPUs. NVIDIA describes a C2C spine that carries those links between trays, but it does not publish the connector-level details or claim that every LPU has a dedicated link to every other LPU [[87]](#ref-87).
 
-So the rack has **32 compute trays, with 8 LP30 modules per tray**: 32 × 8 = 256 accelerators. The SRAM arithmetic checks at both levels: 8 × 500 MB = 4 GB per tray, and 32 × 4 GB = 128 GB per rack [[87]](#ref-87). NVIDIA's public material calls each LP30 an accelerator/chip and describes its SRAM as on-chip. 
+So the rack contains **32 compute trays with 8 LP30 modules per tray**: 32 × 8 = 256 accelerators. The SRAM math is consistent at both levels: 8 × 500 MB = 4 GB per tray, and 32 × 4 GB = 128 GB per rack [[87]](#ref-87). NVIDIA's public materials call each LP30 an accelerator or chip and describe its SRAM as on-chip.
 
-The fabric is where it stops resembling §3.3. Each LPU has **96 chip-to-chip links at 112 Gbps**, which NVIDIA reports as 2.5 TB/s per accelerator and 640 TB/s across the rack [[87]](#ref-87). This is a **switchless, compiler-scheduled fabric**, but not a documented full physical mesh: 96 links per LPU does not mean one dedicated link to each of the other 255 LPUs. NVIDIA says links communicate directly within a tray and across trays via the C2C spine, but does not publish the complete rack link map [[87]](#ref-87). An NVSwitch dynamically routes traffic and arbitrates between links; LPX instead relies on the compiler to schedule which C2C link carries each transfer, and when.
+The fabric is where LPX stops looking like the switch-centric designs in §3.3. Each LPU has **96 chip-to-chip links at 112 Gbps**, which NVIDIA reports as 2.5 TB/s per accelerator and 640 TB/s across the rack [[87]](#ref-87). This is a **switchless, compiler-scheduled fabric**, but not a documented full physical mesh. Ninety-six links per LPU does not mean one dedicated link to each of the other 255 LPUs. NVIDIA says the links connect directly within a tray and across trays through the C2C spine, but it does not publish the complete rack-level link map [[87]](#ref-87). An NVSwitch dynamically routes traffic and arbitrates between links; LPX instead relies on the compiler to schedule which C2C link carries each transfer and when.
 
 That is the whole difference. §4 spends a chapter on the machinery a dynamic fabric needs to stay lossless and to steer around congestion, and all of it exists because the arrival time of any given transfer is uncertain. A statically scheduled fabric removes the uncertainty instead of managing it. What it pays is rigidity: the plan holds only for the workload it was compiled for.
 
