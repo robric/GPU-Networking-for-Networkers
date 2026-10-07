@@ -526,17 +526,16 @@ The PCIe row is the problem. Using PCIe between GPUs is like connecting two 400G
 
 **What about PCIe cards?** The PCIe cards of [§1.2.2 The GPU generations](#122-the-gpu-generations) have no NVLink, so they share a model over PCIe. This hurts them less than the table above suggests, because their own memory is slower too:
 
-| GPU            | Memory         | GPU-to-GPU link (TX+RX) | Memory ÷ link |
-|----------------|----------------|-------------------------|---------------|
-| H100           | 3.35 TB/s HBM  | NVLink, 900 GB/s        | ~4×           |
-| H200           | 4.8 TB/s HBM   | NVLink, 900 GB/s        | ~5×           |
-| B200 / B300    | 8 TB/s HBM     | NVLink, 1.8 TB/s        | ~4×           |
-| *L40S*         | 864 GB/s GDDR6 | PCIe 4, 64 GB/s         | ~13×          |
-| *RTX PRO 6000* | 1.6 TB/s GDDR7 | PCIe 5, 128 GB/s        | ~12×          |
+| GPU              | Memory             | GPU-to-GPU link (TX+RX) | Memory ÷ link |
+|------------------|--------------------|-------------------------|---------------|
+| H100             | 3.35 TB/s HBM      | NVLink, 900 GB/s        | ~4×           |
+| **L40S**         | **864 GB/s GDDR6** | **PCIe 4, 64 GB/s**     | **~13×**      |
+| B200 / B300      | 8 TB/s HBM         | NVLink, 1.8 TB/s        | ~4×           |
+| **RTX PRO 6000** | **1.6 TB/s GDDR7** | **PCIe 5, 128 GB/s**    | **~12×**      |
 
-<p align="center"><em>Local memory speed against GPU-to-GPU link speed.</em></p>
+<p align="center"><em>NVLink against PCIe GPUs, generation by generation: memory speed against link speed.</em></p>
 
-So a PCIe card reaches a peer at about 1/12 of its local memory speed, against about 1/4 to 1/5 for an NVLink GPU. This is enough to split a model across a few cards, but not across all 8 cards of a server.
+So a PCIe card reaches a peer at about 1/12 of its local memory speed, against about 1/4 for an NVLink GPU. This is enough to split a model across a few cards, but not across all 8 cards of a server.
 
 In an 8-card server, the cards are not all on one PCIe switch. In older designs, traffic between them goes up through the CPUs, at 200 Gb/s (25 GB/s) per GPU or less. In newer designs, each ConnectX-8 SuperNIC has a PCIe switch built in and serves a pair of cards, and traffic between pairs goes out over the network at 400 Gb/s (50 GB/s) per GPU [[58]](#ref-58). Either way, this is far below NVLink, which gives a B200 900 GB/s (7.2 Tb/s) per direction.
 
