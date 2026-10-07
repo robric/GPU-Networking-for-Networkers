@@ -20,6 +20,9 @@ The golden rule for the whole document: **whenever something looks like magic, w
 - [1. The landscape: the GPU and the networks around it](#1-the-landscape-the-gpu-and-the-networks-around-it)
   - [1.1 Why GPUs run the show (and what the CPU still does)](#11-why-gpus-run-the-show-and-what-the-cpu-still-does)
   - [1.2 What a GPU looks like, and the words for its parts](#12-what-a-gpu-looks-like-and-the-words-for-its-parts)
+    - [1.2.1 Inside the GPU](#121-inside-the-gpu)
+    - [1.2.2 The GPU generations](#122-the-gpu-generations)
+    - [1.2.3 The edges: NVLink, PCIe and the NIC](#123-the-edges-nvlink-pcie-and-the-nic)
   - [1.3 Host vs device](#13-host-vs-device)
   - [1.4 The two network paths: host vs GPU](#14-the-two-network-paths-host-vs-gpu)
   - [1.5 The two workloads: training vs inference](#15-the-two-workloads-training-vs-inference)
@@ -37,7 +40,7 @@ The golden rule for the whole document: **whenever something looks like magic, w
     - [3.4.1 NVL72: one rack, one switch tier](#341-nvl72-one-rack-one-switch-tier)
     - [3.4.2 NVL576: eight racks, two switch tiers (a folded Clos)](#342-nvl576-eight-racks-two-switch-tiers-a-folded-clos)
   - [3.5 Memory semantics: load/store vs send/receive](#35-memory-semantics-loadstore-vs-sendreceive)
-  - [3.6 Decoding the names: DGX/HGX/MGX, Oberon/Kyber, and the NVL## trap](#36-decoding-the-names-dgxhgxmgx-oberonkyber-and-the-nvl-trap)
+  - [3.6 Decoding the names: DGX/HGX/MGX, Oberon/Kyber, NVL##, and C-G-N-B](#36-decoding-the-names-dgxhgxmgx-oberonkyber-nvl-and-c-g-n-b)
   - [3.7 A second scale-up fabric: Groq LPX](#37-a-second-scale-up-fabric-groq-lpx)
   - [3.8 Where scale-up ends and scale-out must begin](#38-where-scale-up-ends-and-scale-out-must-begin)
 - [4. Scale-out: the GPU cluster network](#4-scale-out-the-gpu-cluster-network)
@@ -94,7 +97,7 @@ Before we can talk about GPU networking, we need to cover two things. The first 
 The landscape, in six steps:
 
 - **§1.1** — why GPUs run the show, and what the CPU still does.
-- **§1.2** — what a GPU looks like, and the words for its parts.
+- **§1.2** — what a GPU looks like, its generations, and the NIC that pairs with it.
 - **§1.3** — host vs device: the GPU inside a server.
 - **§1.4** — the several networks an AI data center runs, in two categories.
 - **§1.5** — the two workloads that drive their traffic.
@@ -112,7 +115,11 @@ Because the payload is spread across chips, the GPUs cannot work alone. They mus
 
 ### 1.2 What a GPU looks like, and the words for its parts
 
-Before the glossary, one picture. At the highest level a GPU is **a big grid of compute tiles (Streaming Multiprocessor - SMs -) wrapped in a ring of very fast memory (HBM)**, with link interfaces (PCIe, NVLink) at the edges to talk to the outside world:
+This section has three parts. [§1.2.1](#121-inside-the-gpu) looks inside one GPU. [§1.2.2](#122-the-gpu-generations) lists the GPU generations and the two lines NVIDIA builds in each one. [§1.2.3](#123-the-edges-nvlink-pcie-and-the-nic) covers the links that leave the GPU, and the NIC that connects it to the network.
+
+#### 1.2.1 Inside the GPU
+
+Start with one picture. At the highest level, a GPU is **a big grid of compute tiles, called SMs (Streaming Multiprocessors), surrounded by very fast memory called HBM**. Links at the edges, PCIe and NVLink, connect it to the outside world. [§1.2.3](#123-the-edges-nvlink-pcie-and-the-nic) covers those links.
 
 ```
    +================ GPU (one device / one die) =================+
@@ -121,7 +128,7 @@ Before the glossary, one picture. At the highest level a GPU is **a big grid of 
    | +------------------------------------------------------+    |
    | | SM  SM  SM  SM  SM  SM  SM  SM  SM  SM  SM  SM  SM   |    |
    | | SM  SM  SM  SM  SM  SM  SM  SM  SM  SM  SM  SM  SM   |    |
-   | | SM  SM  SM   ...  ~100-150 SMs total  ...  SM  SM    |    |
+   | | SM  SM  SM   ...  ~130-160 SMs total  ...  SM  SM    |    |
    | | SM  SM  SM  SM  SM  SM  SM  SM  SM  SM  SM  SM  SM   |    |
    | +------------------------------------------------------+    |
    |         shared L2 cache   (die-wide cache layer)            +===> NVLink : peer GPUs (scale-up)
@@ -139,26 +146,7 @@ Before the glossary, one picture. At the highest level a GPU is **a big grid of 
 
 <p align="center"><em>A GPU: a grid of SMs wrapped in HBM, links at the edges.</em></p>
 
-The three edges leaving the box map exactly onto the two-interconnect story coming up:
-
-- **NVLink → peer GPUs** — the sideways link. This is *scale-up* (§3).
-- **PCIe → host CPU** — the general-purpose link for control and loading data.
-- **PCIe → NIC** (ConnectX / BlueField) — the on-ramp to the *scale-out* network (§4).
-
-**Which NIC, though?** Several NVIDIA names circulate. What separates them is how much general-purpose compute rides on the card:
-
-| Adapter                  | Speed | Onboard Arm | Typical plane                           |
-|--------------------------|-------|-------------|-----------------------------------------|
-| **ConnectX-7**           | 400G  | —           | backend compute fabric                  |
-| **ConnectX-8 SuperNIC**  | 800G  | —           | backend compute fabric                  |
-| **BlueField-3 SuperNIC** | 400G  | 8 cores     | backend compute fabric                  |
-| **BlueField-3 DPU**      | 400G  | 16 cores    | frontend - storage, management, tenancy |
-
-The real line is the **DPU**: enough onboard Arm compute to *run* infrastructure services — storage, security, multi-tenancy — on the host's behalf, which is why it sits on the frontend. Everything above it is an adapter whose job is simply to move GPU traffic, and that split is §1.4's frontend/backend line. **"SuperNIC" is a badge, not a boundary** — NVIDIA introduced it with Spectrum-X for adapters aimed at the AI east-west fabric, but ConnectX-7 had been doing that job for years before the term existed. Read it as "NIC tuned for the backend," not as a separate class of hardware.
-
-That last edge, the NIC, matters more than it looks. With **GPUDirect RDMA** the NIC reads and writes GPU HBM *directly* over PCIe, without bouncing through CPU memory — so GPU-to-GPU traffic across nodes never touches the host's RAM. On the newest Grace-Blackwell boards this gets tighter still. On **GB200** the NIC hangs off the **Grace CPU's PCIe**, so a **ConnectX-7** (400 Gb/s per GPU) reaches HBM by transiting Grace's fabric over **NVLink-C2C** (chip-to-chip). That is a *routing* hop, not a processing one — the data still lands straight in HBM and no CPU cycle touches it, the way a packet transits a router's forwarding plane without being punted to the route processor. But it is still a hop, and it shares Grace's C2C bandwidth. **GB300** removes it: the **ConnectX-8 SuperNIC** integrates the PCIe Gen6 switch and attaches directly to the GPU as well as to Grace, giving **800 Gb/s per GPU** [[58]](#ref-58). Still PCIe electrically — *not* a new non-PCIe link, and *not* NVLink — just a more integrated PCIe topology.
-
-Zoom into **one SM** — this is where the actual math happens:
+Now zoom into **one SM**. This is where the math happens:
 
 ```
    +------------------- one SM (Streaming Multiprocessor) -------------------+
@@ -174,17 +162,78 @@ Zoom into **one SM** — this is where the actual math happens:
 
 <p align="center"><em>Inside one SM: schedulers, math units, and local scratch memory.</em></p>
 
-The takeaway: **compute is the grid of SMs; memory bandwidth is the HBM ring feeding them; the network (PCIe/NVLink) hangs off the edge.** Everything in this document is about that last part — the edge — but it only makes sense once you see that the edge exists to keep the HBM, and through it the SMs, fed.
+A few terms come up again and again. Here is the minimum you need to read a spec sheet:
 
-Now the terms. A few recur everywhere — here's the minimum to read a spec sheet:
+- **SM (Streaming Multiprocessor)**: the GPU's basic compute block. A current data-center GPU has about 130 to 160 SMs [[90]](#ref-90), and each one is packed with arithmetic units. You can think of an SM as "a core, but really a cluster of cores." As a networker you will rarely tune them. Just remember that more SMs means more compute.
+- **CUDA core and Tensor core**: the arithmetic units inside an SM. **Tensor cores** are special units for matrix multiplication, and they do most of the work for AI. When NVIDIA quotes "FLOPS", the number comes from these units.
+- **HBM (High-Bandwidth Memory)**: the GPU's own RAM, stacked right next to the chip in the same package. It plays the role of a server's DRAM, but it is much faster: **~3–8 TB/s** on Hopper and Blackwell. Its capacity is small, from tens of GB up to 288 GB on Blackwell Ultra [[90]](#ref-90). That is *why* a large model must be split across many GPUs, and that split is what creates GPU-to-GPU traffic in the first place.
+- **VRAM**: an informal name for the GPU's memory capacity ("this GPU has 80 GB of VRAM").
+- **CUDA**: NVIDIA's programming model and software stack for running code on the GPU. In this document it matters mostly because it *names and numbers* the GPUs, as [§1.3 Host vs device](#13-host-vs-device) shows.
 
-- **SM (Streaming Multiprocessor)** — the GPU's basic compute building block. One GPU has many SMs (think ~100–150 on a modern data-center GPU), each packed with arithmetic units. Roughly "a core, but really a cluster of cores." You rarely tune these as a networker; just know "more SMs = more compute."
-- **CUDA core / Tensor core** — the arithmetic units inside an SM. **Tensor cores** are the specialized matrix-multiply units that do the heavy lifting for AI. When NVIDIA quotes "FLOPS", this is where they come from.
-- **HBM (High-Bandwidth Memory)** — the GPU's own RAM, stacked right next to the chip on the same package. This is the GPU's equivalent of a server's DRAM, but enormously faster: **~3–8 TB/s** of bandwidth on current parts. Capacity is smallish (tens to ~192 GB), which is *why* models must be split across many GPUs — and that splitting is what creates GPU-to-GPU traffic in the first place.
-- **VRAM** — informal synonym for HBM capacity ("this GPU has 80 GB of VRAM").
-- **CUDA** — NVIDIA's programming model/software stack for running code on the GPU. For our purposes it's mostly relevant as the thing that *names and addresses* GPUs.
+> **Why a networker should care about HBM:** GPU networking exists because one GPU's HBM cannot hold a big model. You split the model across GPUs, and those GPUs must then exchange data all the time, as close to HBM speed as possible. The network is there to feed the HBM. Most of this document is about keeping these memories fed.
 
-> **Why a networker should care about HBM:** the whole reason GPU networking exists is that one GPU's HBM can't hold a big model. You split the model across GPUs, and now those GPUs must constantly exchange data at speeds that *approach HBM bandwidth*. The network is there to feed the HBM. Keep that framing — everything downstream is about not starving these memories.
+#### 1.2.2 The GPU generations
+
+NVIDIA names each GPU generation after a scientist: Ampere, Hopper, Blackwell, Rubin. In each generation it builds two different lines of GPU:
+
+- **The data-center GPU** uses HBM and NVLink. It sits on an 8-GPU board or on a superchip board next to a Grace CPU, and it is built for the scale-up fabric of [§3 Scale-up: the NVLink fabric](#3-scale-up-the-nvlink-fabric).
+- **The PCIe card** uses cheaper GDDR memory and plugs into a normal server slot, like a NIC. It has no NVLink fabric, so it reaches other GPUs only over PCIe and the network.
+
+| Generation | Year | Data-center GPU | Superchip    | PCIe card               |
+|------------|------|-----------------|--------------|-------------------------|
+| Ampere     | 2020 | A100            | none         | A10, A40                |
+| Hopper     | 2022 | H100, H200      | GH200        | L4, L40S (Ada Lovelace) |
+| Blackwell  | 2024 | B200, B300      | GB200, GB300 | RTX PRO 6000            |
+| Rubin\*    | 2026 | Rubin           | Vera Rubin   | see note                |
+
+<p align="center"><em>Four GPU generations, each with a data-center line and a PCIe line.</em></p>
+
+\**Rubin figures are preliminary [[63]](#ref-63). NVIDIA announced a GDDR7 Rubin card for long-context prefill, Rubin CPX, in 2025, but its status is unclear.*
+
+Three things in this table often confuse people:
+
+- **The same family name does not mean the same chip.** B200 and RTX PRO 6000 are both Blackwell, but they are different chips with different memory. In the Hopper generation, the PCIe line even had its own name, **Ada Lovelace**.
+- **B300 and GB300 are a mid-generation refresh**, called **Blackwell Ultra**. They keep the Blackwell architecture but are faster: 50% more memory (288 GB), 1.5× more FP4 compute, up to 2× faster attention [[90]](#ref-90), and a faster NIC ([§1.2.3](#123-the-edges-nvlink-pcie-and-the-nic)).
+- **A superchip is a board, not a chip.** It carries one CPU and one or two GPUs, joined by a fast link called NVLink-C2C. [§1.3 Host vs device](#13-host-vs-device) explains it.
+
+The edge sites in [§10 The AI grid](#10-the-ai-grid-serving-from-gslb-to-the-gpu) run the PCIe line. This is why they cannot host a §3 scale-up island.
+
+#### 1.2.3 The edges: NVLink, PCIe and the NIC
+
+Three kinds of link leave the GPU in the picture in [§1.2.1](#121-inside-the-gpu). They map onto the two networks this document is about:
+
+- **NVLink → peer GPUs**: the sideways link between GPUs. This is *scale-up*, covered in [§3 Scale-up: the NVLink fabric](#3-scale-up-the-nvlink-fabric).
+- **PCIe → host CPU**: the general-purpose link, used for control and for loading data.
+- **PCIe → NIC**: the on-ramp to the *scale-out* network, covered in [§4 Scale-out: the GPU cluster network](#4-scale-out-the-gpu-cluster-network).
+
+In short: **the SMs do the compute, the HBM feeds them, and the network hangs off the edge.** Most of this document is about that edge. But the edge exists for one reason: to keep the HBM, and through it the SMs, supplied with data.
+
+**Which NIC?** Each GPU gets its own NIC for the scale-out network, and the NIC is paired with the GPU generation. Its speed has doubled at most generation steps:
+
+| GPU generation                | Scale-out NIC | Per GPU |
+|-------------------------------|---------------|---------|
+| Ampere (A100)                 | ConnectX-6    | 200G    |
+| Hopper (H100, H200)           | ConnectX-7    | 400G    |
+| Blackwell (B200, GB200)       | ConnectX-7    | 400G    |
+| Blackwell Ultra (B300, GB300) | ConnectX-8    | 800G    |
+| Rubin\*                       | ConnectX-9    | 1.6T    |
+
+<p align="center"><em>Each GPU generation and the scale-out NIC that pairs with it.</em></p>
+
+For a networker, this table sets the switch port speed you buy. Plain Blackwell kept Hopper's 400G NIC, and Blackwell Ultra caught up with 800G. [§4.6 Shaping the fabric](#46-shaping-the-fabric-leaves-spines-and-how-gpus-hang-off-them) shows how the 400G and 800G generations change the number of switch ports.
+
+**SuperNIC or DPU?** NVIDIA uses several names for its adapters. What separates them is how much general-purpose compute the card carries:
+
+- A **ConnectX** NIC has no Arm cores. Its job is to move GPU traffic on the backend fabric.
+- A **BlueField-3 SuperNIC** adds 8 Arm cores, and it may also sit on the backend.
+- A **BlueField-3 DPU** has 16 Arm cores. That is enough to *run* infrastructure services for the host, such as storage, security and multi-tenancy. This is why it sits on the frontend.
+
+The real dividing line is the **DPU**, and it matches the frontend and backend split in [§1.4 The two network paths](#14-the-two-network-paths-host-vs-gpu). "SuperNIC" is a badge, not a separate class of hardware. NVIDIA introduced the name with Spectrum-X for adapters aimed at the AI backend, but ConnectX-7 was doing that job years before the name existed. Read it as "a NIC tuned for the backend."
+
+**How the NIC reaches the GPU.** With **GPUDirect RDMA**, the NIC reads and writes GPU memory *directly* over PCIe, without a copy through CPU memory. So GPU-to-GPU traffic between nodes never touches the host's RAM. The superchip boards change the path, in two steps that follow the NIC table:
+
+- On **GB200**, the ConnectX-7 hangs off the **Grace CPU's PCIe**. Its traffic crosses Grace and then the **NVLink-C2C** link to reach the GPU's memory. This is a *routing* hop, not a processing one. The data still lands straight in HBM and no CPU cycle touches it, the way a packet crosses a router's forwarding plane without being punted to the route processor. But it is still a hop, and it shares Grace's C2C bandwidth.
+- On **GB300**, the **ConnectX-8 SuperNIC** has a PCIe Gen6 switch built in, and it attaches directly to the GPU as well as to Grace. That removes the hop and gives **800 Gb/s per GPU** [[58]](#ref-58). It is still PCIe electrically. It is not a new kind of link and it is not NVLink, just a tighter PCIe layout.
 
 ### 1.3 Host vs device
 
@@ -210,13 +259,13 @@ A GPU is not a standalone computer. It lives inside a server, attached to a CPU:
 
 <p align="center"><em>One node: two CPU sockets, eight GPUs, two NUMA domains.</em></p>
 
-- The **CPU is the "host"**; each **GPU is a "device."**
+- The **CPU is the "host"**, and each **GPU is a "device."**
 - **The reference 8-GPU x86 server is dual-socket.** An NVIDIA HGX or DGX-class server has **two CPU sockets**, and the GPUs are split between them. In the diagram, GPU0–3 sit under CPU0 and GPU4–7 under CPU1, often behind PCIe switches. The second socket is **not there for failover**. If a CPU dies, its GPUs do not move to the other one. It is there for **PCIe lanes**, because 8 GPUs, about 8 NICs and the NVMe drives need more lanes than one socket has. Each CPU, with its memory and the GPUs and NICs under it, forms one **NUMA domain**, and traffic is fastest when it stays inside one domain. That is why each GPU sends through a NIC behind its own PCIe switch. The GPUs talk to each other over NVLink, which the diagram leaves out and [§3 Scale-up: the NVLink fabric](#3-scale-up-the-nvlink-fabric) covers. The two CPUs are joined by an inter-socket link. Intel calls this link **UPI** (Ultra Path Interconnect), and AMD calls it **Infinity Fabric**. Infinity Fabric is AMD's name for a whole family of chip-to-chip links. AMD also uses it to connect GPUs to each other, as [§8.2 AMD: the open bet](#82-amd-the-open-bet) describes, but those are separate links doing a different job.
-- **NVIDIA's superchip trays are not strictly dual-socket.** A GB200 or GB300 compute tray carries two boards, each with one Grace CPU and two Blackwell GPUs (NVIDIA calls this CPU+GPU board a **superchip**). Vera Rubin keeps the same layout, with one Vera CPU and two Rubin GPUs per board [[63]](#ref-63). The CPUs are soldered onto these boards, not plugged into sockets, and each one reaches its two GPUs over NVLink-C2C instead of PCIe. But the tray still runs one OS across both CPUs, with one NUMA domain per CPU, so it behaves much like the dual-socket box above.
-- Software enumerates the GPUs in a node as `cuda:0`, `cuda:1`, `cuda:2`, … — just an index per device, like interface IDs (`eth0`, `eth1`) on a box. This is what people mean by "N distinct GPUs": even when the GPUs are fully wired together, you still address `cuda:0 … cuda:7` individually. (Hold onto this — it's why "8 GPUs acting as one" is an abstraction, not a hardware fact.)
-- **The fabric joins devices, not hosts.** NVLink can make many GPUs act as one pool of memory, but it never merges the *machines*. A GPU rack is still a **cluster of separate servers**, each with its own OS. In a GB200 NVL72, the 72 GPUs form one NVLink domain, which as described in [§3.4.1 NVL72](#341-nvl72-one-rack-one-switch-tier). But the CPUs form **18 separate hosts**, one per tray. Running `lscpu` on one host shows that tray's ~144 cores, never all 2,592 in the rack [[44]](#ref-44).
-- **PCIe** is the general-purpose bus connecting CPU and GPUs (and NICs). It's fine for loading data and control, but it is **far too slow** to be the path GPUs use to share memory with each other at HBM speeds. Hold that thought — it's the exact gap NVLink exists to fill, in §3.
-- *Aside:* NVLink-C2C is cache-coherent and fast: about 900 GB/s on Grace, roughly 7× a PCIe 5 link, and 1.8 TB/s on Vera [[63]](#ref-63). The superchip also changes the ratio. It has one CPU for every two GPUs, against one for every four in the x86 box. [§1.5.2 How much CPU per GPU](#152-the-other-axis-how-much-cpu-per-gpu) covers why that ratio changes.
+- **A server of PCIe cards has no NVLink.** With PCIe cards such as the L40S or RTX PRO 6000, described in [§1.2.2 The GPU generations](#122-the-gpu-generations), the GPUs reach each other only over PCIe. Traffic between a GPU under CPU0 and a GPU under CPU1 then also crosses the inter-socket link. PCIe is much slower than NVLink, as [§3.1 The problem NVLink solves](#31-the-problem-nvlink-solves) shows.
+- **Superchip servers are not strictly dual-socket.** A GB200 or GB300 compute tray carries two superchips, each with one Grace CPU and two Blackwell GPUs. Vera Rubin keeps the same layout, with one Vera CPU and two Rubin GPUs per superchip [[63]](#ref-63). The tray still runs one OS across both CPUs, with one NUMA domain per CPU, so it behaves much like the dual-socket box above. The earlier **GH200** pairs one Grace CPU with one Hopper GPU, and a server holds one or two of them [[89]](#ref-89). In all of these designs, the CPUs are soldered onto the boards rather than plugged into sockets, and each CPU reaches its GPUs over **NVLink-C2C** instead of PCIe.
+- *Aside:* NVLink-C2C is cache-coherent and fast. On Grace it carries about **450 GB/s per direction** (900 GB/s in NVIDIA's both-directions count), roughly 7× a PCIe 5 x16 link. On Vera it doubles to **900 GB/s per direction** (1.8 TB/s) [[63]](#ref-63). The superchip also changes the CPU-to-GPU ratio. GB200, GB300 and Vera Rubin have one CPU for every two GPUs, and GH200 has one for one. The x86 box has one for every four. [§1.5.2 How much CPU per GPU](#152-the-other-axis-how-much-cpu-per-gpu) covers why that ratio changes.
+- Software numbers the GPUs in a node as `cuda:0`, `cuda:1`, `cuda:2`, and so on. This is just an index per device, like interface names (`eth0`, `eth1`) on a server. It is what people mean by "N distinct GPUs": even when the GPUs are fully wired together, you still address `cuda:0` to `cuda:7` one by one. Keep this in mind, because it is why "8 GPUs acting as one" is a software abstraction, not a hardware fact.
+- **The fabric joins devices, not hosts.** NVLink can make many GPUs act as one pool of memory, but it never merges the *machines*. A GPU rack is still a **cluster of separate servers**, each with its own OS. In a GB200 NVL72, the 72 GPUs form one NVLink domain, as described in [§3.4.1 NVL72](#341-nvl72-one-rack-one-switch-tier). But the CPUs form **18 separate hosts**, one per tray. Running `lscpu` on one host shows that tray's ~144 cores, never all 2,592 in the rack [[44]](#ref-44).
 
 ### 1.4 The two network paths: host vs GPU
 
@@ -449,7 +498,7 @@ Scale-up, in eight steps:
 - **§3.3** — from links to a fabric: a single NVSwitch.
 - **§3.4** — scaling past the box: NVL72, then NVL576.
 - **§3.5** — memory semantics: load/store vs send/receive.
-- **§3.6** — decoding the names: DGX/HGX/MGX, Oberon/Kyber, the NVL## trap.
+- **§3.6** — decoding the names: DGX/HGX/MGX, Oberon/Kyber, the NVL## trap, and C-G-N-B.
 - **§3.7** — a second scale-up fabric: Groq LPX, scheduled instead of switched.
 - **§3.8** — where scale-up ends and scale-out begins.
 
@@ -457,28 +506,45 @@ Scale-up, in eight steps:
 
 [§1.1 Why GPUs run the show](#11-why-gpus-run-the-show-and-what-the-cpu-still-does) showed that tensors are **sharded** across GPUs. This means the GPUs must **collaborate mid-computation**. At every layer, while the math is running, they exchange slices and sum partial results. [§1.2 What a GPU looks like](#12-what-a-gpu-looks-like-and-the-words-for-its-parts) showed that the data lives in **HBM**, which moves at **3–8 TB/s**. The traffic between GPUs needs to run close to that speed. If it is much slower, the Tensor cores sit idle waiting for data, and an idle Tensor core on a $40k GPU is wasted money.
 
-So the requirement is brutally simple to state: **let one GPU read and write another GPU's HBM at a useful fraction of HBM speed, with very low latency.** That's it. The question is just what wire you do it over.
+So the requirement is simple: **let one GPU read and write another GPU's HBM at a useful fraction of HBM speed, with very low latency.** The question is which link to use.
 
-**Why PCIe ran out of road.** PCIe is the obvious candidate — it's already there (§1.3) — but it fails on two counts:
+**Why PCIe is not enough.** PCIe is the obvious candidate, because every server already has it, as [§1.3 Host vs device](#13-host-vs-device) showed. But it has two problems: bandwidth and topology.
 
-- **Bandwidth.** A PCIe Gen5 x16 link is about **64 GB/s per direction** (~128 GB/s if you add both directions - nvidia math -). HBM is **3,000–8,000 GB/s**. So PCIe is roughly **30–60× slower** than the memory it's trying to feed. Routing the collaboration traffic over PCIe is like giving each line card in a chassis a single 1G uplink and asking it to keep up with a 100G backplane — the GPUs would spend most of their time stalled.
-- **Topology.** PCIe is a **tree rooted at the CPU** (the root complex). GPUs don't talk to each other as equals; they talk *up* toward the CPU and back *down*, sharing the root's bandwidth. Even with peer-to-peer (GPUDirect P2P), you're squeezing many GPUs through a hierarchy that was designed for a CPU to reach its peripherals — not for 8 GPUs to all blast each other at full tilt simultaneously. It's an oversubscribed access network, not a non-blocking fabric.
-
-**The goal: turn the tree into a memory fabric.** What NVLink sets out to do is replace that slow, CPU-rooted tree, *between the GPUs*, with a **flat, dedicated, high-bandwidth fabric** where any GPU can reach any peer's HBM directly — and do it with **memory semantics** (plain `load`/`store` to an address), not packet send/receive. In other words: make the GPUs a real **NUMA shared-memory domain** (the framing from §2), where "remote" memory is merely a few times slower than local, instead of dozens of times slower.
-
-Here's the whole motivation in one table — one GPU's view of its three options for reaching data:
+**Problem 1: bandwidth.** A PCIe Gen5 x16 link carries about **64 GB/s per direction** while HBM runs at **3,000–8,000 GB/s**. So PCIe is roughly **30–60× slower** than the memory it has to feed. The table shows one GPU's view of the three places its data can be:
 
 | Where the data is (one GPU's view) | Bandwidth          | Speed vs local HBM |
 |------------------------------------|--------------------|--------------------|
 | **Local HBM** (its own memory)     | ~3,000–8,000 GB/s  | 1× (baseline)      |
-| **Peer GPU over NVLink**           | ~900–1,800 GB/s    | ~¼ – ½             |
+| **Peer GPU over NVLink**           | ~900–1,800 GB/s    | ~⅕ – ¼             |
 | **Peer GPU over PCIe Gen5**        | ~128 GB/s (aggr.)  | ~1/30 – 1/60       |
 
-That middle row is the whole point of NVLink. It brings "another GPU's memory" from *60× slower than local* to *2–4× slower than local*. That is close enough for the whole group of GPUs to work as one big pool of memory. Watch the units, as [§2.1 The three scales](#21-the-three-scales-up-out-and-across) warned: HBM and NVLink are quoted in **GB/s** (bytes), but the scale-out network later is quoted in **Gb/s** (bits). Mixing them up gives an error of 8×.
+The PCIe row is the problem. Using PCIe between GPUs is like connecting two 400G routers with a 10G link: the link is 40 times slower than what each router can push. The GPUs would spend most of their time waiting for data. The NVLink row is the fix. It brings another GPU's memory from *30–60× slower than local* to *about 4–5× slower*, which is close enough for the whole group of GPUs to work as one big pool of memory.
 
-> **One-line version:** PCIe is a slow tree to the CPU; NVLink is a fast mesh between GPUs. Scale-up is the art of making "remote HBM" almost as cheap as "local HBM."
+**Problem 2: topology.** PCIe is a **tree with the CPU at the root** (the root complex). GPUs do not talk to each other as equals. Their traffic goes *up* toward the CPU and back *down*, and it shares the root's bandwidth. Peer-to-peer transfers (GPUDirect P2P) can turn around at a PCIe switch instead of going up to the CPU. But they still share a tree built for a CPU to reach its peripherals, not for 8 GPUs to send to each other at full speed at the same time. It is an oversubscribed access network, not a non-blocking fabric.
 
-The next subsections unpack *how*: NVLink as a physical link (§3.2), how links become a fabric via NVSwitch (§3.3), what "memory semantics" really buys you (§3.5), and the real systems and numbers (§3.6).
+**The goal: turn the tree into a memory fabric.** NVLink replaces the slow tree between the GPUs with a **flat, dedicated, high-bandwidth fabric**. Any GPU can reach any peer's memory directly. It does this with **memory semantics**, plain `load` and `store` to an address, not packet send and receive. In other words, the GPUs become a real **NUMA shared-memory domain**, the framing from [§2 GPU Networking, the big picture](#2-gpu-networking-the-big-picture-two-fundamentally-different-problems), where remote memory is only a few times slower than local.
+
+**What about PCIe cards?** The PCIe cards of [§1.2.2 The GPU generations](#122-the-gpu-generations) have no NVLink, so they share a model over PCIe. This hurts them less than the table above suggests, because their own memory is slower too:
+
+| GPU            | Memory         | GPU-to-GPU link (TX+RX) | Memory ÷ link |
+|----------------|----------------|-------------------------|---------------|
+| H100           | 3.35 TB/s HBM  | NVLink, 900 GB/s        | ~4×           |
+| H200           | 4.8 TB/s HBM   | NVLink, 900 GB/s        | ~5×           |
+| B200 / B300    | 8 TB/s HBM     | NVLink, 1.8 TB/s        | ~4×           |
+| *L40S*         | 864 GB/s GDDR6 | PCIe 4, 64 GB/s         | ~13×          |
+| *RTX PRO 6000* | 1.6 TB/s GDDR7 | PCIe 5, 128 GB/s        | ~12×          |
+
+<p align="center"><em>Local memory speed against GPU-to-GPU link speed.</em></p>
+
+So a PCIe card reaches a peer at about 1/12 of its local memory speed, against about 1/4 to 1/5 for an NVLink GPU. PCIe is also a tree, not a fabric, as the topology point above explains. This is enough to split a model across a few cards. Spreading it over all 8 cards of a server is harder. A typical 8-card server has 4 ConnectX-8 SuperNICs at 800 Gb/s. Each one has a PCIe switch built in and serves a pair of cards. Traffic between pairs leaves through the NICs and goes over the network, at 400 Gb/s (50 GB/s) per GPU [[58]](#ref-58). So inside this server, the path between card pairs is the scale-out network. Before ConnectX-8, this traffic went up through the CPUs instead, at 200 Gb/s (25 GB/s) per GPU or less [[58]](#ref-58).
+
+This is far below NVLink, which gives a B200 900 GB/s (7.2 Tb/s) per direction. Benchmarks show the cost: on a model that needs all 8 GPUs, 8 H100s deliver nearly 3× the throughput of 8 RTX PRO 6000s [[91]](#ref-91). The edge sites in [§10 The AI grid](#10-the-ai-grid-serving-from-gslb-to-the-gpu) avoid the problem by serving models that fit on one card or a few.
+
+Watch the units, as [§2.1 The three scales](#21-the-three-scales-up-out-and-across) warned: HBM and NVLink are quoted in **GB/s** (bytes), but the scale-out network later is quoted in **Gb/s** (bits). Mixing them up gives an error of 8×.
+
+> **One-line version:** PCIe is a slow tree rooted at the CPU. NVLink is a fast fabric between the GPUs. Scale-up is about bringing remote HBM within a few times of local HBM.
+
+The rest of §3 shows how NVLink does this, starting with the link itself in [§3.2 NVLink as a link](#32-nvlink-as-a-link-lanes-sublinks-and-how-to-read-a-spec-sheet).
 
 ### 3.2 NVLink as a *link*: lanes, sublinks, and how to read a spec sheet
 
@@ -787,7 +853,7 @@ RDMA is the interesting middle: it's **one-sided** like NVLink (the remote CPU d
 
 > **Keep this:** scale-up = **load/store into a shared address space** (memory semantics, NUMA). Scale-out = **send/receive or RDMA of messages** (packets). Same goal — move bytes between GPUs — opposite programming models.
 
-### 3.6 Decoding the names: DGX/HGX/MGX, Oberon/Kyber, and the NVL## trap
+### 3.6 Decoding the names: DGX/HGX/MGX, Oberon/Kyber, NVL##, and C-G-N-B
 
 We've met the technology (§3.2) and the systems (§3.4). What's left is the part that makes NVIDIA's slides unreadable to a newcomer: **the names.** None of them are hard once decoded — here's the cheat sheet.
 
@@ -805,6 +871,18 @@ We've met the technology (§3.2) and the systems (§3.4). What's left is the par
 
 - A modern "GPU" **package is 2 dies** (Blackwell, Rubin). So "NVL72" (72 packages) and the short-lived "NVL144" (144 dies) were **the same rack**, counted two ways.
 - So when the number jumps, ask *dies or packages?* before assuming the domain doubled. **NVL72 = NVL144 = one 72-package rack.**
+
+**C-G-N-B: a server in four numbers.** NVIDIA's reference architectures name each server design with four numbers: **CPUs, GPUs, NICs, and east-west bandwidth per GPU in Gb/s** [[92]](#ref-92). The last two matter most to a networker. They tell you how many backend ports each server needs, and at what speed.
+
+| Name      | Server                | East-west NICs | Per GPU  |
+|-----------|-----------------------|----------------|----------|
+| 2-8-5-200 | 8 RTX PRO 6000 (PCIe) | 4 BlueField-3  | 200 Gb/s |
+| 2-8-9-800 | HGX B300              | 8 ConnectX-8   | 800 Gb/s |
+| 2-4-5-800 | GB300 NVL72, one tray | 4 ConnectX-8   | 800 Gb/s |
+
+<p align="center"><em>Three NVIDIA server designs, named CPUs-GPUs-NICs-Gb/s per GPU.</em></p>
+
+In each design, one more NIC, a BlueField-3, serves the north-south frontend, so the east-west NICs are the total minus one. Read the GPU and NIC numbers together. In 2-8-9-800, each of the 8 GPUs has its own NIC. In 2-8-5-200, two GPUs share each NIC. In 2-4-5-800, the 2 counts the two Grace CPUs of a GB300 tray, even though they are not in sockets, as [§1.3 Host vs device](#13-host-vs-device) explains. In this notation, the ConnectX-8 PCIe server of [§3.1 The problem NVLink solves](#31-the-problem-nvlink-solves) would be a 2-8-5-400.
 
 **The whole lineup, on one line each** (NVLink-gen numbers and bandwidth are back in §3.2; this is just the name map):
 
@@ -2346,15 +2424,15 @@ The closest like-for-like is **AMD**: its Instinct accelerators mirror NVIDIA's 
 
 Read across any row and it is the same idea wearing a different badge — which is the whole point: nothing in §3–§7 was NVIDIA-specific *architecture*, only NVIDIA-specific *product*.
 
-That is true of the architecture, not of a running job. A model is written against one vendor's kernels, collective library, and fabric shape, and those do not travel with it. §8.5 works through what a move actually costs.
+But a running model depends on the product, not only on the architecture. It is built on one vendor's GPU kernels and collective library (NCCL or RCCL), and it is tuned for that vendor's fabric. None of this moves with the model when it changes vendor. [§8.5 What it costs to move a model](#85-what-it-costs-to-move-a-model) works through the cost of a move.
 
-**Intel** is the third player, but its AI chip — **Gaudi** — is not a GPU and makes a more radical bet on the network, so it gets its own section (§8.3). Both of Intel's AI lines have since ended — Falcon Shores cancelled, Gaudi with no fourth generation — so §8.3 reads Gaudi as an architecture lesson rather than an option.
+**Intel** is the third player. Its AI chip, **Gaudi**, is not a GPU, and it makes a more radical bet on the network, so it gets its own section, [§8.3 Intel Gaudi](#83-intel-gaudi-one-fabric-for-both-scales). Gaudi and its planned successor, Falcon Shores, have both ended since: Falcon Shores was cancelled, and Gaudi has no fourth generation. So that section treats Gaudi as a lesson in architecture, not as an option for a new cluster.
 
 ### 8.2 AMD: the open bet
 
-§8.1 matched AMD to NVIDIA box for box. The real difference is not the boxes — it is the *wires between them*.
+[§8.1 The same shape, different names](#81-the-same-shape-different-names) matched AMD to NVIDIA part by part. The real difference is not in the parts. It is in the *wires between them*.
 
-AMD builds its own silicon for every box. The **Instinct MI355X** ships today; the **MI455X** anchors the **Helios** rack — 72 MI455X GPUs, 18 sixth-generation **EPYC** "Venice" CPUs, and **Pensando "Vulcano"** NICs in one double-wide **Open Rack Wide** chassis, programmed through ROCm. A roadmap promise in 2025 [[28]](#ref-28), in production since July 2026 [[70]](#ref-70), deploying at scale from Q4. That is the same full-stack ambition as an NVIDIA DGX rack.
+AMD builds its own chips for the GPU, the CPU and the NIC. The **Instinct MI355X** ships today. The **MI455X** is the GPU of the **Helios** rack. Helios puts 72 MI455X GPUs, 18 sixth-generation **EPYC** "Venice" CPUs and **Pensando "Vulcano"** NICs into one double-wide **Open Rack Wide** chassis, and the whole rack is programmed through ROCm. It was a roadmap promise in 2025 [[28]](#ref-28) and has been in production since July 2026 [[70]](#ref-70), with large-scale deployment starting in Q4 2026. This is the same full-stack goal as an NVIDIA DGX rack.
 
 What AMD deliberately does *not* build is the **switch** — the silicon in the middle of the fabric — and that gap traces straight to the acquisitions. NVIDIA's **Mellanox** (2020) was a NIC *and switch* house: ConnectX adapters **plus** the **Spectrum** Ethernet and **Quantum** InfiniBand switch ASICs. A week later it added **Cumulus Networks** — the open network OS for whitebox switches — so the switch software came too [[74]](#ref-74). AMD's **Pensando** (2022) was NICs/DPUs only. So NVIDIA fills every row of the stack; AMD builds the endpoints and leaves the two switch rows empty.
 
@@ -3048,7 +3126,7 @@ Every term this document introduces, with the section that explains it. Ordinary
 55. <a id="ref-55"></a>Introl — *Microsoft's $60B Neocloud Bet* (Microsoft's ~$23B commitment to Nscale for roughly 200,000 GB300 GPUs across the UK, Norway, Portugal, and Texas, within $60B+ of neocloud capacity deals driven by Azure's capacity shortfall). <https://introl.com/blog/microsoft-60-billion-neocloud-spending-capacity-crunch-december-2025>
 56. <a id="ref-56"></a>arXiv — *AI Inference as Relocatable Electricity Demand* (the structural asymmetry: electricity transmission is cost-constrained while compute relocation is latency-constrained, implying a hierarchical geography of inference infrastructure). <https://arxiv.org/pdf/2604.27855>
 57. <a id="ref-57"></a>NVIDIA — *Doubling all2all Performance with NVIDIA Collective Communication Library 2.12* (introduces **PXN**, "PCI × NVLink": rather than sending from its own memory, a GPU writes over NVLink into a buffer on the intermediate GPU that owns the right NIC, which then sends out over PCI — keeping cross-rail traffic on the scale-up fabric in rail-optimized topologies). <https://developer.nvidia.com/blog/doubling-all2all-performance-with-nvidia-collective-communication-library-2-12/>
-58. <a id="ref-58"></a>NVIDIA — *ConnectX-8 SuperNICs Advance AI Platform Architecture with PCIe Gen6 Connectivity* (the first SuperNIC to integrate a PCIe Gen6 switch with 800G networking in one device: 48 lanes of PCIe Gen6 and a direct Gen6 x16 link to the B300 GPU, eliminating the discrete PCIe switch chips of earlier boards; GB300 NVL72 and HGX B300 are the first deployments). <https://developer.nvidia.com/blog/nvidia-connectx-8-supernics-advance-ai-platform-architecture-with-pcie-gen6-connectivity>
+58. <a id="ref-58"></a>NVIDIA — *ConnectX-8 SuperNICs Advance AI Platform Architecture with PCIe Gen6 Connectivity* (the first SuperNIC to integrate a PCIe Gen6 switch with 800G networking in one device: 48 lanes of PCIe Gen6 and a direct Gen6 x16 link to the B300 GPU, eliminating the discrete PCIe switch chips of earlier boards; GB300 NVL72 and HGX B300 are the first deployments; for the RTX PRO Server, a "2:1 GPU-to-NIC ratio", with NCCL routing inter-GPU traffic "directly through the network" at "up to 50 GB/s per GPU", against "25 GB/s or less" in traditional designs built on "two to four discrete PCIe switches"). <https://developer.nvidia.com/blog/nvidia-connectx-8-supernics-advance-ai-platform-architecture-with-pcie-gen6-connectivity>
 59. <a id="ref-59"></a>Microsoft — *The Deployment of Hollow Core Fiber (HCF) in Azure's Network* (HCF live across Azure regions — over 1,280 km deployed, ~33% lower latency and ~47% faster transmission than single-mode fibre, since light travels through air rather than glass). <https://techcommunity.microsoft.com/blog/azurenetworkingblog/the-deployment-of-hollow-core-fiber-hcf-in-azure%E2%80%99s-network/4395340>
 60. <a id="ref-60"></a>NVIDIA — *NVIDIA InfiniBand Adaptive Routing Technology* (the switch ASIC selects the least-loaded output port by egress queue depth and path priority; this "can cause the network packets to arrive at their destination out-of-order", handled in hardware by ConnectX-5 and later — i.e. AR is finer-grained than flowlet switching). <https://hardwarenation.com/wp-content/uploads/2021/09/infiniband-white-paper-adaptive-routing.pdf>
 61. <a id="ref-61"></a>NVIDIA — *Enabling Fast Inference and Resilient Training with NCCL 2.27* (SHARP support extended to AllGather and ReduceScatter; NVLink SHARP multicast — `multimem` stores to a multicast address that the NVSwitch fabric duplicates to every subscribed GPU). <https://developer.nvidia.com/blog/enabling-fast-inference-and-resilient-training-with-nccl-2-27/>
@@ -3079,6 +3157,10 @@ Every term this document introduces, with the section that explains it. Ordinary
 86. <a id="ref-86"></a>NVIDIA — *KVBM Guide: KV cache offloading* (the Dynamo **KV Block Manager**, "a scalable runtime component designed to handle memory allocation, management, and remote sharing of Key-Value (KV) blocks for inference tasks across heterogeneous and distributed environments". Blocks are offloaded down a hierarchy — GPU device, CPU host, disk, remote — and the benefit depends on having "enough prefix cache hits on KVBM to reuse offloaded KV blocks", which improves time-to-first-token). <https://docs.nvidia.com/dynamo/v1.3.0/user-guides/kv-cache-offloading>
 87. <a id="ref-87"></a>NVIDIA — *Inside NVIDIA Groq 3 LPX: The Low-Latency Inference Accelerator for the NVIDIA Vera Rubin Platform*, with the *NVIDIA Groq 3 LPX* product page (500 MB of "compiler-managed SRAM" per accelerator at 150 TB/s and 2.5 TB/s of scale-up bandwidth over "96 C2C links running at 112 Gbps each"; a 256-accelerator rack with 128 GB of SRAM, 12 TB of DDR5, 40 PB/s of aggregate SRAM bandwidth and "640 TB/s scale-up bandwidth". The compiler "explicitly schedules computation, data movement, and synchronization" rather than relying on dynamic hardware schedulers, and a "plesiosynchronous, chip-to-chip protocol in hardware … cancels natural clock drift and aligns hundreds of LPU accelerators to act as a single coordinated system". Larger models are scaled "using parallel execution strategies such as layer-wise partitioning". Attention-FFN Disaggregation puts Vera Rubin GPUs on "decode work that benefits most from throughput and large memory capacity, such as full-context attention" and LPX on "latency-sensitive execution within decode, such as sparse MoE expert feed-forward networks". In full production since 24 August 2026, with Nebius named as the first AI cloud to adopt it. NVIDIA's "35x higher throughput per megawatt for trillion-parameter models" is a vendor figure and is not used above). <https://developer.nvidia.com/blog/inside-nvidia-groq-3-lpx-the-low-latency-inference-accelerator-for-the-nvidia-vera-rubin-platform>
 88. <a id="ref-88"></a>Groq — *Groq and NVIDIA Enter Non-Exclusive Inference Technology Licensing Agreement to Accelerate AI Inference at Global Scale* (24 December 2025; Groq describes a "non-exclusive licensing agreement" covering its inference technology, states that "GroqCloud will continue to operate without interruption", and records founder Jonathan Ross and president Sunny Madra joining NVIDIA while Groq continues as an independent company under a new chief executive. **No transaction value is disclosed by either company** — the ~$20bn figure in wide circulation comes from press coverage, not from the announcements. NVIDIA's LPX pages carry the line "Groq and LPU are used under license from Groq, Inc."). <https://groq.com/newsroom/groq-and-nvidia-enter-non-exclusive-inference-technology-licensing-agreement-to-accelerate-ai-inference-at-global-scale>
+89. <a id="ref-89"></a>NVIDIA — *Simplify System Memory Management with the Latest NVIDIA GH200 NVL2 Enterprise RA* (GH200 NVL2 "combines two NVIDIA GH200 Superchips in a single node", so two Grace CPUs and two Hopper GPUs; listed links: CPU-CPU NVLink-C2C at 600 GB/s, GPU-GPU NVLink at 900 GB/s). <https://developer.nvidia.com/blog/simplify-system-memory-management-with-the-latest-nvidia-gh200-nvl2-enterprise-ra/>
+90. <a id="ref-90"></a>NVIDIA — *Inside NVIDIA Blackwell Ultra: The Chip Powering the AI Factory Era* ("160 Streaming Multiprocessors (SMs)" in the full GPU; 288 GB of HBM3e per GPU at 8 TB/s, "50% more than Blackwell"; dense NVFP4 from 10 to 15 petaFLOPS, "a 1.5x increase"; SFU throughput doubled for attention instructions, "up to 2x faster attention-layer compute"). <https://developer.nvidia.com/blog/inside-nvidia-blackwell-ultra-the-chip-powering-the-ai-factory-era/>
+91. <a id="ref-91"></a>CloudRift — *RTX PRO 6000 vs H100, H200, and L40S: LLM Inference* (third-party benchmark; GLM-4.6-FP8 with 8-way tensor parallelism: "The H100 achieves nearly 3x the throughput of RTX PRO 6000", H200 "almost 4x"; "Once inter-GPU communication enters the picture, the PRO 6000's PCIe limitation becomes obvious"). <https://www.cloudrift.ai/blog/benchmarking-rtx6000-vs-datacenter-gpus>
+92. <a id="ref-92"></a>NVIDIA — *NVIDIA Reference Architectures: Deep Dive* (Enterprise Reference Architectures; server designs named CPU-GPU-NIC-Bandwidth, e.g. "2-8-5-200 (CPU-GPU-NIC-Bandwidth)", the last field being east-west bandwidth per GPU; RTX PRO AI Factory 2-8-5-200 with 4 BlueField-3 east-west NICs plus 1 BlueField-3 north-south; HGX B300 2-8-9-800 with 8 ConnectX-8 plus 1 BlueField-3; GB300 NVL72 tray 2-4-5-800 with 4 ConnectX-8 plus 1 BlueField-3). <https://docs.nvidia.com/enterprise-reference-architectures/white-paper/latest/reference-architectures-deep-dive.html>
 
 # TODO list tracking
 
