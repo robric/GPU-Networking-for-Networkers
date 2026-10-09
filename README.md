@@ -4,22 +4,22 @@
 
 > A deep dive into how GPUs talk to each other, written by a networking person, for networking people.
 
-If you have spent your career thinking in terms of routers, MPLS labels, routing tables, BGP and the occasional `tcpdump`, the world of "GPU networking" can feel like it was designed by aliens. People throw around words like *NVLink*, *NVSwitch*, *collective*, *all-reduce*, *RDMA*, *RoCE* and *rail-optimized fabric* as if they were obvious. They are not.
+If you have spent your career working with routers, MPLS, routing tables, BGP and `tcpdump`, the world of "GPU networking" can feel like it was designed by aliens. People throw around words like *NVLink*, *NVSwitch*, *collective*, *all-reduce*, *RDMA*, *RoCE* and *rail-optimized fabric* as if they were obvious. They are not.
 
-This document is two things at once, the same way my [k8s service & LB testing notes](https://github.com/robric/k8s-svc-and-lb-testing) were:
-- a **personal cheat sheet** so I (and maybe you) can stop re-clauding/googling "how does this NVLink thing connect GPUs to each other ?" every six months.
-- an **educational source** to explain how GPU interconnects actually work, starting from networking intuition you already have.
+This document has two goals, like my [k8s service & LB testing notes](https://github.com/robric/k8s-svc-and-lb-testing) did:
+- a **personal cheat sheet**, so that I (and maybe you) can stop asking Claude or Google "how does this NVLink thing connect GPUs to each other?" every six months.
+- an **educational guide** that explains how GPU interconnects really work, starting from the networking knowledge you already have.
 
 
-The golden rule for the whole document: **whenever something looks like magic, we map it back to a networking concept you already know** — a link, a switch, a fabric, a routing decision, a congestion problem. GPUs are just a new kind of endpoint. The wires are still wires.
+One rule runs through the whole document: **whenever something looks like magic, we map it back to a networking concept you already know**, such as a link, a switch, a fabric, a routing decision or a congestion problem. GPUs are just a new kind of endpoint. The wires are still wires.
 
-> **One vendor as the worked example.** "GPU" here means the category, not a brand. We build the whole mental model on **NVIDIA** hardware — it is the most widely deployed and the most concrete to point at, and its vocabulary (NVLink, SM, CUDA, NCCL) is what you will hit first in the wild. But the *architecture* is universal: a die of throughput tiles, fast on-package memory, a high-bandwidth **scale-up** link to nearby peers, and an **RDMA NIC** out to the cluster. AMD and Intel assemble the same building blocks under different names. We learn it once on NVIDIA, then map the alternatives — **AMD and Intel** in their own chapter, and the **open standards (UALink, Ultra Ethernet)** that answer NVIDIA's proprietary stack in theirs — once the model is in place.
+> **NVIDIA as the worked example.** "GPU" here means the category, not a brand. We build the mental model on **NVIDIA** hardware, because it is the most widely deployed and the easiest to point at. Its vocabulary (NVLink, SM, CUDA, NCCL) is also what you will meet first. But the *architecture* is the same everywhere: a chip with many compute units, fast memory right next to it, a fast **scale-up** link to nearby GPUs, and an **RDMA NIC** to the rest of the cluster. AMD and Intel build the same pieces under different names. So we learn the model once on NVIDIA, then map the alternatives. **AMD and Intel** get their own chapter, [§8 The vendor landscape](#8-the-vendor-landscape-amd-intel-and-the-hyperscalers), and so do the **open standards (UALink, Ultra Ethernet)**, which offer an open alternative to NVIDIA's own stack, in [§9 Open standards](#9-open-standards-the-fabric-without-the-vendor).
 
 ## Contents
 
 - [1. The landscape: the GPU and the networks around it](#1-the-landscape-the-gpu-and-the-networks-around-it)
   - [1.1 Why GPUs run the show (and what the CPU still does)](#11-why-gpus-run-the-show-and-what-the-cpu-still-does)
-  - [1.2 What a GPU looks like, and the words for its parts](#12-what-a-gpu-looks-like-and-the-words-for-its-parts)
+  - [1.2 What a GPU looks like](#12-what-a-gpu-looks-like)
     - [1.2.1 Inside the GPU](#121-inside-the-gpu)
     - [1.2.2 The GPU generations](#122-the-gpu-generations)
     - [1.2.3 The edges: NVLink, PCIe and the NIC](#123-the-edges-nvlink-pcie-and-the-nic)
@@ -111,18 +111,47 @@ The CPU still has a job, though. A GPU server divides its work the same way a ro
 
 But there is one **subtle difference that makes GPU networking its own beast**, and everything that follows comes from it. In a router, the data-plane payload is a **packet**, and a packet fits *entirely inside a single ASIC* while it's processed. One packet, one chip, done. An AI data-plane payload is different. The **tensors** (the model's weights and activations) can be too big to fit in one GPU, so they are **sharded** across many GPUs, and each GPU holds only a slice. No single GPU sees the whole thing.
 
-Because the payload is spread across chips, the GPUs cannot work alone. They must **constantly collaborate** *mid-computation*. They exchange slices, sum partial results, and redistribute outputs. A router ASIC forwards independent packets that never need to know about each other. GPUs instead work as a tightly coordinated team. **That collaboration *is* the traffic GPU networking has to carry**, and it is a much more demanding pattern than "forward this packet."
+```
+   Router: each packet fits inside one chip and moves from chip to chip
 
-### 1.2 What a GPU looks like, and the words for its parts
+       [IP PACKET] ------------------------------------------->  
+            |                                                 
+            v                                                 
+   +-----------------+      +-----------------+      +-----------------+
+   | forwarding ASIC |      |  switch fabric  |      | forwarding ASIC |
+   |                 |<====>|                 |<====>|                 |
+   +-----------------+      +-----------------+      +-----------------+
+
+
+   GPUs: one tensor is split across chips
+
+                 [              TENSOR                  ]
+                   /                                  \
+                 /                                      \
+               /                                          \
+   [ Tensor shard 1 ]                                [ Tensor shard 2 ]
+            |                                                 |
+            v                                                 v
+   +-----------------+      +-----------------+      +-----------------+
+   |      GPU A      |      |     NVSwitch    |      |      GPU B      |
+   |                 |<====>|                 |<====>|                 |
+   +-----------------+      +-----------------+      +-----------------+
+```
+
+<p align="center"><em>Each packet fits in one ASIC, but one tensor spans two GPUs.</em></p>
+
+Because the tensor is spread across GPUs, no GPU can finish its work alone. The GPUs must **constantly collaborate** *mid-computation*. They exchange pieces of the tensor and combine their partial results. Packets never need this, because a router ASIC handles each packet on its own. **This collaboration is the traffic that GPU networking has to carry**, and it is much more demanding than "forward this packet."
+
+### 1.2 What a GPU looks like
 
 This section has three parts. [§1.2.1](#121-inside-the-gpu) looks inside one GPU. [§1.2.2](#122-the-gpu-generations) lists the GPU generations and the two lines NVIDIA builds in each one. [§1.2.3](#123-the-edges-nvlink-pcie-and-the-nic) covers the links that leave the GPU, and the NIC that connects it to the network.
 
 #### 1.2.1 Inside the GPU
 
-Start with one picture. At the highest level, a GPU is **a big grid of compute tiles, called SMs (Streaming Multiprocessors), surrounded by very fast memory called HBM**. Links at the edges, PCIe and NVLink, connect it to the outside world. [§1.2.3](#123-the-edges-nvlink-pcie-and-the-nic) covers those links.
+Start with one picture, of a high-end DC GPU. At the highest level, it is **a big grid of compute tiles, called SMs (Streaming Multiprocessors), surrounded by very fast memory called HBM**. Links at the edges, PCIe and NVLink, connect it to the outside world. [§1.2.3](#123-the-edges-nvlink-pcie-and-the-nic) covers those links. NVIDIA also sells a second, cheaper type of GPU: the PCIe card, covered in [§1.2.2 The GPU generations](#122-the-gpu-generations). It has the same layout, but with slower GDDR memory and no NVLink.
 
 ```
-   +================ GPU (one device / one die) =================+
+   +=============== Data-center GPU (one device) ================+
    |                                                             |
    | HBM stacks:   [====] [====] [====] [====]   (feed the grid) |
    | +------------------------------------------------------+    |
@@ -144,7 +173,7 @@ Start with one picture. At the highest level, a GPU is **a big grid of compute t
                                  scale-out fabric
 ```
 
-<p align="center"><em>A GPU: a grid of SMs wrapped in HBM, links at the edges.</em></p>
+<p align="center"><em>A data-center GPU: a grid of SMs wrapped in HBM, links at the edges.</em></p>
 
 Now zoom into **one SM**. This is where the math happens:
 
@@ -166,11 +195,12 @@ A few terms come up again and again. Here is the minimum you need to read a spec
 
 - **SM (Streaming Multiprocessor)**: the GPU's basic compute block. A current data-center GPU has about 130 to 160 SMs [[90]](#ref-90), and each one is packed with arithmetic units. You can think of an SM as "a core, but really a cluster of cores." As a networker you will rarely tune them. Just remember that more SMs means more compute.
 - **CUDA core and Tensor core**: the arithmetic units inside an SM. **Tensor cores** are special units for matrix multiplication, and they do most of the work for AI. When NVIDIA quotes "FLOPS", the number comes from these units.
-- **HBM (High-Bandwidth Memory)**: the GPU's own RAM, stacked right next to the chip in the same package. It plays the role of a server's DRAM, but it is much faster: **~3–8 TB/s** on Hopper and Blackwell. Its capacity is small, from tens of GB up to 288 GB on Blackwell Ultra [[90]](#ref-90). That is *why* a large model must be split across many GPUs, and that split is what creates GPU-to-GPU traffic in the first place.
+- **HBM (High-Bandwidth Memory)**: the memory of data-center GPUs, stacked right next to the chip in the same package. It plays the role of a server's DRAM, but it is much faster: **~3–8 TB/s** on Hopper and Blackwell. Its capacity is small, from tens of GB up to 288 GB on Blackwell Ultra [[90]](#ref-90). That is *why* a large model must be split across many GPUs, and that split is what creates GPU-to-GPU traffic in the first place.
+- **GDDR**: the memory on the PCIe cards of [§1.2.2 The GPU generations](#122-the-gpu-generations). It is cheaper than HBM and slower: under 2 TB/s, against up to 8 TB/s for HBM.
 - **VRAM**: an informal name for the GPU's memory capacity ("this GPU has 80 GB of VRAM").
 - **CUDA**: NVIDIA's programming model and software stack for running code on the GPU. In this document it matters mostly because it *names and numbers* the GPUs, as [§1.3 Host vs device](#13-host-vs-device) shows.
 
-> **Why a networker should care about HBM:** GPU networking exists because one GPU's HBM cannot hold a big model. You split the model across GPUs, and those GPUs must then exchange data all the time, as close to HBM speed as possible. The network is there to feed the HBM. Most of this document is about keeping these memories fed.
+> **Why a networker should care about GPU memory:** GPU networking exists because one GPU's memory cannot hold a big model. You split the model across GPUs, and those GPUs must then exchange data all the time, as close to memory speed as possible. The network is there to feed GPU memory, whether HBM or GDDR. Most of this document is about keeping these memories fed.
 
 #### 1.2.2 The GPU generations
 
@@ -260,7 +290,7 @@ A GPU is not a standalone computer. It lives inside a server, attached to a CPU:
 <p align="center"><em>One node: two CPU sockets, eight GPUs, two NUMA domains.</em></p>
 
 - The **CPU is the "host"**, and each **GPU is a "device."**
-- **The reference 8-GPU x86 server is dual-socket.** An NVIDIA HGX or DGX-class server has **two CPU sockets**, and the GPUs are split between them. In the diagram, GPU0–3 sit under CPU0 and GPU4–7 under CPU1, often behind PCIe switches. The second socket is **not there for failover**. If a CPU dies, its GPUs do not move to the other one. It is there for **PCIe lanes**, because 8 GPUs, about 8 NICs and the NVMe drives need more lanes than one socket has. Each CPU, with its memory and the GPUs and NICs under it, forms one **NUMA domain**, and traffic is fastest when it stays inside one domain. That is why each GPU sends through a NIC behind its own PCIe switch. The GPUs talk to each other over NVLink, which the diagram leaves out and [§3 Scale-up: the NVLink fabric](#3-scale-up-the-nvlink-fabric) covers. The two CPUs are joined by an inter-socket link. Intel calls this link **UPI** (Ultra Path Interconnect), and AMD calls it **Infinity Fabric**. Infinity Fabric is AMD's name for a whole family of chip-to-chip links. AMD also uses it to connect GPUs to each other, as [§8.2 AMD: the open bet](#82-amd-the-open-bet) describes, but those are separate links doing a different job.
+- **The reference 8-GPU x86 server is dual-socket.** An 8-GPU server built on NVIDIA's HGX board, such as NVIDIA's own DGX, has **two CPU sockets**, and the GPUs are split between them. In the diagram, GPU0–3 sit under CPU0 and GPU4–7 under CPU1, often behind PCIe switches. The second socket is **not there for failover**. If a CPU dies, its GPUs do not move to the other one. It is there for **PCIe lanes**, because 8 GPUs, about 8 NICs and the NVMe drives need more lanes than one socket has. Each CPU, with its memory and the GPUs and NICs under it, forms one **NUMA domain**, and traffic is fastest when it stays inside one domain. That is why each GPU sends through a NIC behind its own PCIe switch. The GPUs talk to each other over NVLink, which the diagram leaves out and [§3 Scale-up: the NVLink fabric](#3-scale-up-the-nvlink-fabric) covers. The two CPUs are joined by an inter-socket link. Intel calls this link **UPI** (Ultra Path Interconnect), and AMD calls it **Infinity Fabric**. Infinity Fabric is AMD's name for a whole family of chip-to-chip links. AMD also uses it to connect GPUs to each other, as [§8.2 AMD: the open bet](#82-amd-the-open-bet) describes, but those are separate links doing a different job.
 - **A server of PCIe cards has no NVLink.** With PCIe cards such as the L40S or RTX PRO 6000, described in [§1.2.2 The GPU generations](#122-the-gpu-generations), the GPUs reach each other only over PCIe. Traffic between a GPU under CPU0 and a GPU under CPU1 then also crosses the inter-socket link. PCIe is much slower than NVLink, as [§3.1 The problem NVLink solves](#31-the-problem-nvlink-solves) shows.
 - **Superchip servers are not strictly dual-socket.** A GB200 or GB300 compute tray carries two superchips, each with one Grace CPU and two Blackwell GPUs. Vera Rubin keeps the same layout, with one Vera CPU and two Rubin GPUs per superchip [[63]](#ref-63). The tray still runs one OS across both CPUs, with one NUMA domain per CPU, so it behaves much like the dual-socket box above. The earlier **GH200** pairs one Grace CPU with one Hopper GPU, and a server holds one or two of them [[89]](#ref-89). In all of these designs, the CPUs are soldered onto the boards rather than plugged into sockets, and each CPU reaches its GPUs over **NVLink-C2C** instead of PCIe.
 - *Aside:* NVLink-C2C is cache-coherent and fast. On Grace it carries about **450 GB/s per direction** (900 GB/s in NVIDIA's both-directions count), roughly 7× a PCIe 5 x16 link. On Vera it doubles to **900 GB/s per direction** (1.8 TB/s) [[63]](#ref-63). The superchip also changes the CPU-to-GPU ratio. GB200, GB300 and Vera Rubin have one CPU for every two GPUs, and GH200 has one for one. The x86 box has one for every four. [§1.5.2 How much CPU per GPU](#152-the-other-axis-how-much-cpu-per-gpu) covers why that ratio changes.
@@ -504,7 +534,7 @@ Scale-up, in eight steps:
 
 ### 3.1 The problem NVLink solves
 
-[§1.1 Why GPUs run the show](#11-why-gpus-run-the-show-and-what-the-cpu-still-does) showed that tensors are **sharded** across GPUs. This means the GPUs must **collaborate mid-computation**. At every layer, while the math is running, they exchange slices and sum partial results. [§1.2 What a GPU looks like](#12-what-a-gpu-looks-like-and-the-words-for-its-parts) showed that the data lives in **HBM**, which moves at **3–8 TB/s**. The traffic between GPUs needs to run close to that speed. If it is much slower, the Tensor cores sit idle waiting for data, and an idle Tensor core on a $40k GPU is wasted money.
+[§1.1 Why GPUs run the show](#11-why-gpus-run-the-show-and-what-the-cpu-still-does) showed that tensors are **sharded** across GPUs. This means the GPUs must **collaborate mid-computation**. At every layer, while the math is running, they exchange slices and sum partial results. [§1.2 What a GPU looks like](#12-what-a-gpu-looks-like) showed that the data lives in **HBM**, which moves at **3–8 TB/s**. The traffic between GPUs needs to run close to that speed. If it is much slower, the Tensor cores sit idle waiting for data, and an idle Tensor core on a $40k GPU is wasted money.
 
 So the requirement is simple: **let one GPU read and write another GPU's HBM at a useful fraction of HBM speed, with very low latency.** The question is which link to use.
 
