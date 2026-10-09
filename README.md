@@ -40,7 +40,10 @@ One rule runs through the whole document: **whenever something looks like magic,
     - [3.4.1 NVL72: one rack, one switch tier](#341-nvl72-one-rack-one-switch-tier)
     - [3.4.2 NVL576: eight racks, two switch tiers (a folded Clos)](#342-nvl576-eight-racks-two-switch-tiers-a-folded-clos)
   - [3.5 Memory semantics: load/store vs send/receive](#35-memory-semantics-loadstore-vs-sendreceive)
-  - [3.6 Decoding the names: DGX/HGX/MGX, Oberon/Kyber, NVL##, and C-G-N-B](#36-decoding-the-names-dgxhgxmgx-oberonkyber-nvl-and-c-g-n-b)
+  - [3.6 Decoding the names](#36-decoding-the-names)
+    - [3.6.1 DGX, HGX and MGX](#361-dgx-hgx-and-mgx)
+    - [3.6.2 Oberon, Kyber and NVL##](#362-oberon-kyber-and-nvl)
+    - [3.6.3 C-G-N-B: a server in four numbers](#363-c-g-n-b-a-server-in-four-numbers)
   - [3.7 A second scale-up fabric: Groq LPX](#37-a-second-scale-up-fabric-groq-lpx)
   - [3.8 Where scale-up ends and scale-out must begin](#38-where-scale-up-ends-and-scale-out-must-begin)
 - [4. Scale-out: the GPU cluster network](#4-scale-out-the-gpu-cluster-network)
@@ -528,7 +531,7 @@ Scale-up, in eight steps:
 - **§3.3** — from links to a fabric: a single NVSwitch.
 - **§3.4** — scaling past the box: NVL72, then NVL576.
 - **§3.5** — memory semantics: load/store vs send/receive.
-- **§3.6** — decoding the names: DGX/HGX/MGX, Oberon/Kyber, the NVL## trap, and C-G-N-B.
+- **§3.6** — decoding the names: DGX/HGX/MGX, Oberon/Kyber, NVL##, and C-G-N-B.
 - **§3.7** — a second scale-up fabric: Groq LPX, scheduled instead of switched.
 - **§3.8** — where scale-up ends and scale-out begins.
 
@@ -890,26 +893,49 @@ RDMA is the interesting middle: it's **one-sided** like NVLink (the remote CPU d
 
 > **Keep this:** scale-up = **load/store into a shared address space** (memory semantics, NUMA). Scale-out = **send/receive or RDMA of messages** (packets). Same goal — move bytes between GPUs — opposite programming models.
 
-### 3.6 Decoding the names: DGX/HGX/MGX, Oberon/Kyber, NVL##, and C-G-N-B
+### 3.6 Decoding the names
 
-We've met the technology (§3.2) and the systems (§3.4). What's left is the part that makes NVIDIA's slides unreadable to a newcomer: **the names.** None of them are hard once decoded — here's the cheat sheet.
+We have now seen the technology in [§3.2 NVLink as a link](#32-nvlink-as-a-link-lanes-sublinks-and-how-to-read-a-spec-sheet) and the systems in [§3.4 Scaling past the box](#34-scaling-past-the-box-nvl72-then-nvl576). What is left is the part that makes NVIDIA's slides hard to read for a newcomer: **the names.** None of them is hard once decoded. Here is the cheat sheet.
 
-**DGX vs HGX vs MGX — three layers, not three products.** They name *different layers of the same stack*, which is why people use all three about "the same" machine:
+#### 3.6.1 DGX, HGX and MGX
 
-- **HGX** = the **GPU baseboard** — the 8-GPU + NVSwitch board (§3.3) that NVIDIA sells to server makers. The building block, not a whole system.
-- **DGX** = NVIDIA's **complete, branded system** built around an HGX board — the finished server/rack you buy from NVIDIA (DGX H100, DGX GB200).
-- **MGX** = a **modular rack reference design** OEMs build to, so a Supermicro/Dell rack and an NVIDIA rack are mechanically compatible. Think "the spec for the rack," not a box.
+**DGX, HGX and MGX: three layers, not three products.** They name *different layers of the same stack*, which is why people use all three for "the same" machine:
 
-> One line: **HGX = the board, DGX = NVIDIA's whole system, MGX = the rack blueprint.**
+- **HGX** is the **GPU baseboard**: the board with 8 GPUs and the NVSwitch chips from [§3.3 A single NVSwitch](#33-from-links-to-a-fabric-a-single-nvswitch-one-node), which NVIDIA sells to server makers. It is a building block, not a whole system.
+- **DGX** is NVIDIA's **complete, branded system**, sold through NVIDIA's partners [[95]](#ref-95). It can be an 8-GPU server built on an HGX board (DGX H100, DGX B200) or a full NVL72 rack (DGX GB200). Many NVL72 racks are not DGX, though: server makers build their own from the same NVIDIA design, as the next bullet explains.
+- **MGX** is NVIDIA's **modular reference design**, which server makers build to. It covers everything "from single-node servers to rack-scale AI factories" [[93]](#ref-93), and NVIDIA's own racks are MGX designs too. NVIDIA has even published the GB200 NVL72 rack and tray designs through the Open Compute Project, "derived from the NVIDIA MGX architecture" [[96]](#ref-96). That is how other makers can build an NVL72.
 
-**Oberon vs Kyber — the rack architectures.** These name the *physical rack generation* the trays and spine plug into. **Oberon** is today's NVL72 rack (Blackwell, Rubin). **Kyber** is the next one (Rubin Ultra onward), denser — it roughly doubles the per-rack NVLink domain and is what NVL576 / NVL1152 are built on. When someone says "Kyber rack," hear "the post-Blackwell rack that holds more GPUs per NVLink domain."
+> In one line: **HGX is the board, DGX is NVIDIA's complete system, and MGX is the design that NVIDIA and other makers build to.**
 
-**The `NVL##` trap — dies vs packages.** `NVL` + a number = the size of the **NVLink (scale-up) domain**. The trap is *what the number counts.* NVIDIA briefly counted **GPU dies**, then reverted to **packages**:
+**Two lines: x86 servers and superchip racks.** The table in [§1.2.2 The GPU generations](#122-the-gpu-generations) lists the data-center GPUs and the superchips in separate columns. They are two product lines, and only one of them uses HGX:
 
-- A modern "GPU" **package is 2 dies** (Blackwell, Rubin). So "NVL72" (72 packages) and the short-lived "NVL144" (144 dies) were **the same rack**, counted two ways.
-- So when the number jumps, ask *dies or packages?* before assuming the domain doubled. **NVL72 = NVL144 = one 72-package rack.**
+- **The x86 line** is built on the HGX board: an 8-GPU server with x86 CPUs, built by server makers or sold as a DGX. It exists in every generation: HGX H100 and H200, HGX B200 and B300, and now HGX Rubin NVL8, "a server board that links eight Rubin GPUs through NVLink to support x86-based generative AI platforms" [[97]](#ref-97).
+- **The superchip line** has no HGX board. From Blackwell on, its building block is the compute tray of a rack such as the NVL72, where Grace or Vera CPUs sit on the same boards as the GPUs, as [§1.3 Host vs device](#13-host-vs-device) explains. Here the product is the whole rack, with its trays, switch trays and NVLink spine designed together.
 
-**C-G-N-B: a server in four numbers.** NVIDIA's reference architectures name each server design with four numbers: **CPUs, GPUs, NICs, and east-west bandwidth per GPU in Gb/s** [[92]](#ref-92). The last two matter most to a networker. They tell you how many backend ports each server needs, and at what speed.
+So integration grows on the superchip side, and the unit you buy moves from the server to the rack. The x86 line stays for buyers who want standard servers. NVIDIA sells both as DGX: DGX Rubin NVL8 and DGX Vera Rubin NVL72 [[97]](#ref-97).
+
+#### 3.6.2 Oberon, Kyber and NVL##
+
+**Oberon and Kyber: two generations of MGX rack.** These name the *physical rack* that the trays and the NVLink spine plug into. **Oberon** is today's NVL72 rack, used for Blackwell and Rubin. **Kyber** is the next one, which "will double the NVLink domain per rack to fit 144 GPUs" [[94]](#ref-94).
+
+**Reading `NVL##` names.** `NVL` plus a number is the size of the **NVLink (scale-up) domain**: how many GPUs share one NVLink fabric. The number says nothing about racks, though. The smallest, NVL8, is a single HGX server. NVL72 is one rack. NVL576 and NVL1152 each span eight racks, as the table below shows. So a bigger NVL number does not always mean a bigger rack. [§3.4.2 NVL576](#342-nvl576-eight-racks-two-switch-tiers-a-folded-clos) shows how eight racks become one domain.
+
+**The whole lineup, on one line each.** NVLink generations and bandwidth are in [§3.2 NVLink as a link](#32-nvlink-as-a-link-lanes-sublinks-and-how-to-read-a-spec-sheet). This table is just the name map:
+
+| GPU generation          | Rack             | NVLink domain           | ~Year   |
+|-------------------------|------------------|-------------------------|---------|
+| Blackwell (GB200/GB300) | Oberon           | NVL72, one rack         | 2024–25 |
+| Rubin                   | Oberon           | NVL72                   | 2026    |
+| Rubin Ultra\*           | 72-GPU MGX rack  | NVL576, 8 racks of 72   | 2027    |
+| Feynman\*               | Kyber (144 GPUs) | NVL1152, 8 racks of 144 | 2028    |
+
+\**Roadmap, not shipping. Treat as preliminary.*
+
+With the names decoded, a phrase like *"Vera Rubin Ultra NVL576, built from eight MGX NVL racks"* parses cleanly: **Rubin Ultra GPUs**, in **eight 72-GPU racks** of the **MGX** design, joined into **one 576-GPU NVLink domain**.
+
+#### 3.6.3 C-G-N-B: a server in four numbers
+
+NVIDIA's reference architectures name each server design with four numbers: **CPUs, GPUs, NICs, and east-west bandwidth per GPU in Gb/s** [[92]](#ref-92). The last two matter most to a networker. They tell you how many backend ports each server needs, and at what speed.
 
 | Name      | Server                | East-west NICs | Per GPU  |
 |-----------|-----------------------|----------------|----------|
@@ -919,18 +945,7 @@ We've met the technology (§3.2) and the systems (§3.4). What's left is the par
 
 <p align="center"><em>Three NVIDIA server designs, named CPUs-GPUs-NICs-Gb/s per GPU.</em></p>
 
-In each design, one more NIC, a BlueField-3, serves the north-south frontend, so the east-west NICs are the total minus one. Read the GPU and NIC numbers together. In 2-8-9-800, each of the 8 GPUs has its own NIC. In 2-8-5-200, two GPUs share each NIC. In 2-4-5-800, the 2 counts the two Grace CPUs of a GB300 tray, even though they are not in sockets, as [§1.3 Host vs device](#13-host-vs-device) explains. In this notation, the ConnectX-8 PCIe server of [§3.1 The problem NVLink solves](#31-the-problem-nvlink-solves) would be a 2-8-5-400.
-
-**The whole lineup, on one line each** (NVLink-gen numbers and bandwidth are back in §3.2; this is just the name map):
-
-| GPU generation          | Rack arch | Flagship NVLink domain | ~Year   |
-|-------------------------|-----------|------------------------|---------|
-| Blackwell (GB200/GB300) | Oberon    | NVL72                  | 2024–25 |
-| Rubin                   | Oberon    | NVL72 (was "NVL144")   | 2026    |
-| Rubin Ultra             | Kyber     | NVL576                 | 2027    |
-| Feynman                 | Kyber     | NVL1152                | 2028    |
-
-With the names decoded, a sentence like *"the Kyber-based Rubin Ultra NVL576 MGX rack"* stops being noise and parses cleanly: **Rubin Ultra GPUs**, in the **Kyber** rack design, wired into a **576-GPU NVLink domain**, to the **MGX** modular spec.
+In each design, one more NIC, a BlueField-3, serves the north-south frontend, so the east-west NICs are the total minus one. Read the GPU and NIC numbers together. In 2-8-9-800, each of the 8 GPUs has its own NIC. In 2-8-5-200, two GPUs share each NIC. In 2-4-5-800, the 2 counts the two Grace CPUs of a GB300 tray, even though they are not in sockets, as [§1.3 Host vs device](#13-host-vs-device) explains. In this notation, the ConnectX-8 PCIe server of [§3.1 The problem NVLink solves](#31-the-problem-nvlink-solves) would be a 2-8-5-400, with two CPUs and one frontend NIC.
 
 ### 3.7 A second scale-up fabric: Groq LPX
 
@@ -3045,7 +3060,7 @@ Every term this document introduces, with the section that explains it. Ordinary
 - **GSP** — *GPU System Processor.* The RISC-V core on the GPU that runs GSP-RM, half of NVIDIA's driver. §6.1
 - **HBM** — *high-bandwidth memory.* Stacked DRAM on the GPU package. §1.2
 - **HCA** — *host channel adapter.* InfiniBand's name for the NIC. §4.3
-- **HGX / DGX / MGX** — NVIDIA's GPU baseboard / complete system / modular rack design. §3.6
+- **HGX / DGX / MGX** — NVIDIA's GPU baseboard / complete system / modular reference design. §3.6
 - **HIP** — *Heterogeneous-compute Interface for Portability.* AMD's CUDA-portable language. §8.2
 - **IB** — InfiniBand. §4.3
 - **ICI** — *inter-chip interconnect.* Google TPU's scale-up fabric, a 3-D torus with no switch. §8.4
@@ -3198,6 +3213,11 @@ Every term this document introduces, with the section that explains it. Ordinary
 90. <a id="ref-90"></a>NVIDIA — *Inside NVIDIA Blackwell Ultra: The Chip Powering the AI Factory Era* ("160 Streaming Multiprocessors (SMs)" in the full GPU; 288 GB of HBM3e per GPU at 8 TB/s, "50% more than Blackwell"; dense NVFP4 from 10 to 15 petaFLOPS, "a 1.5x increase"; SFU throughput doubled for attention instructions, "up to 2x faster attention-layer compute"). <https://developer.nvidia.com/blog/inside-nvidia-blackwell-ultra-the-chip-powering-the-ai-factory-era/>
 91. <a id="ref-91"></a>CloudRift — *RTX PRO 6000 vs H100, H200, and L40S: LLM Inference* (third-party benchmark on "8 x RTX PRO 6000 Workstation Edition" with "a 64-core EPYC Genoa (4th Gen) processor", no topology details given; single GPU, GLM-4.5-Air-AWQ-4bit: "PRO 6000 actually outperforms the H100 in raw throughput (3,140 vs 2,987 tok/s)"; a 480B model on about 4 GPUs: "the H100 achieves 31% higher throughput than PRO 6000"; GLM-4.6-FP8 with 8-way tensor parallelism: "The H100 achieves nearly 3x the throughput of RTX PRO 6000", H200 "almost 4x"; "Once inter-GPU communication enters the picture, the PRO 6000's PCIe limitation becomes obvious"). <https://www.cloudrift.ai/blog/benchmarking-rtx6000-vs-datacenter-gpus>
 92. <a id="ref-92"></a>NVIDIA — *NVIDIA Reference Architectures: Deep Dive* (Enterprise Reference Architectures; server designs named CPU-GPU-NIC-Bandwidth, e.g. "2-8-5-200 (CPU-GPU-NIC-Bandwidth)", the last field being east-west bandwidth per GPU; RTX PRO AI Factory 2-8-5-200 with 4 BlueField-3 east-west NICs plus 1 BlueField-3 north-south; HGX B300 2-8-9-800 with 8 ConnectX-8 plus 1 BlueField-3; GB300 NVL72 tray 2-4-5-800 with 4 ConnectX-8 plus 1 BlueField-3). <https://docs.nvidia.com/enterprise-reference-architectures/white-paper/latest/reference-architectures-deep-dive.html>
+93. <a id="ref-93"></a>NVIDIA — *MGX Platform for Modular Server Design* ("NVIDIA MGX provides an open modular reference architecture that enables OEMs, ODMs, and ecosystem partners to build accelerated systems faster. From single-node servers to rack-scale AI factories…"). <https://www.nvidia.com/en-us/data-center/products/mgx/>
+94. <a id="ref-94"></a>NVIDIA — *NVIDIA Vera Rubin POD: Seven Chips, Five Rack-Scale Systems, One AI Supercomputer* (March 16, 2026; Vera Rubin NVL72 integrates "72 NVIDIA Rubin GPUs and 36 NVIDIA Vera CPUs"; "Vera Rubin Ultra introduces a new two-layer all-to-all NVLink topology that will enable developers to scale-up to 576 GPUs"; "To scale beyond NVL576, a new MGX rack, NVIDIA Kyber, will be introduced… to fit 144 GPUs"; "NVIDIA Kyber will scale up into a massive all-to-all NVL1152 supercomputer"). <https://developer.nvidia.com/blog/nvidia-vera-rubin-pod-seven-chips-five-rack-scale-systems-one-ai-supercomputer/>
+95. <a id="ref-95"></a>NVIDIA — *Buy DGX Systems Through NVIDIA Partner Network* ("NVIDIA DGX™ Systems are available through select NVIDIA Partner Network (NPN) partners"). <https://www.nvidia.com/en-eu/data-center/where-to-buy-dgx-systems/>
+96. <a id="ref-96"></a>NVIDIA — *NVIDIA Contributes NVIDIA GB200 NVL72 Designs to Open Compute Project* (October 15, 2024; "NVIDIA contributed the NVIDIA GB200 NVL72 rack and compute and switch tray liquid cooled designs to the Open Compute Project (OCP)"; "The rack, tray, and internal component designs were derived from the NVIDIA MGX architecture"). <https://developer.nvidia.com/blog/nvidia-contributes-nvidia-gb200-nvl72-designs-to-open-compute-project/>
+97. <a id="ref-97"></a>NVIDIA — *NVIDIA Kicks Off the Next Generation of AI With Rubin — Six New Chips, One Incredible AI Supercomputer* (press release, January 5, 2026; "NVIDIA will also offer the NVIDIA HGX Rubin NVL8 platform, a server board that links eight Rubin GPUs through NVLink to support x86-based generative AI platforms"; DGX SuperPOD integrates "either NVIDIA DGX Vera Rubin NVL72 or DGX Rubin NVL8 systems"). <https://nvidianews.nvidia.com/news/rubin-platform-ai-supercomputer>
 
 # TODO list tracking
 
