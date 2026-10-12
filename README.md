@@ -85,7 +85,14 @@ One rule runs through the whole document: **whenever something looks like magic,
     - [9.1.3 What AMD actually ships](#913-what-amd-actually-ships)
   - [9.2 The ESUN frame: Ethernet without IP](#92-the-esun-frame-ethernet-without-ip)
   - [9.3 The scale-out front: rebuilding RDMA on Ethernet](#93-the-scale-out-front-rebuilding-rdma-on-ethernet)
-  - [9.4 Where it leaves the networker](#94-where-it-leaves-the-networker)
+  - [9.4 What the open standards mean for a networker](#94-what-the-open-standards-mean-for-a-networker)
+- [10. The AI grid: serving from GSLB to the GPU](#10-the-ai-grid-serving-from-gslb-to-the-gpu)
+  - [10.1 Inference distributes by necessity, not by choice](#101-inference-distributes-by-necessity-not-by-choice)
+    - [10.1.1 The four drivers](#1011-the-four-drivers)
+    - [10.1.2 How far out? Latency and the placement of the AI edge](#1012-how-far-out-latency-and-the-placement-of-the-ai-edge)
+  - [10.2 The shape of the grid: one platform, unequal sites](#102-the-shape-of-the-grid-one-platform-unequal-sites)
+  - [10.3 The request path: GSLB to the GPU](#103-the-request-path-gslb-to-the-gpu)
+  - [10.4 The ecosystem: who builds which layer](#104-the-ecosystem-who-builds-which-layer)
 - [Glossary](#glossary)
 - [References](#references)
 
@@ -2534,6 +2541,8 @@ The software mirrors the §8.1 pattern, layer for layer:
 
 Portability is the point — a collective written once runs on either fabric.
 
+AMD is the biggest backer of open interconnects, but it is not the whole open story. The standards themselves (UALink, Ultra Ethernet, SUE) come from industry groups, and they get their own chapter, [§9 Open standards](#9-open-standards-the-fabric-without-the-vendor). Next, [§8.3 Intel Gaudi](#83-intel-gaudi-one-fabric-for-both-scales) goes one step further: a chip that drops the special fabric and runs *both* scales on plain Ethernet.
+
 ### 8.3 Intel Gaudi: one fabric for both scales
 
 Intel's **Gaudi** breaks the pattern of the last two sections — and it is the one section here about a line Intel has since closed. It earns the space anyway: Gaudi is the only shipped design that collapses this document's two fabrics into one, which makes it the cleanest test of whether §2's split is a law or a choice. Gaudi is not a GPU — it is a dedicated AI accelerator (matrix and vector engines, no graphics heritage), and it sits at the far end of this chapter's openness axis. NVIDIA builds two proprietary fabrics; AMD builds its silicon around open *standards*; Gaudi builds **no special fabric at all**. It runs both scales on the plainest thing in the building — **RoCEv2 over ordinary Ethernet** — with the NIC *on the die*.
@@ -2816,14 +2825,11 @@ The pitch is InfiniBand's benefits — RDMA, low latency, scale — on open, mul
 
 One detail ties the two fronts together. ESUN does not define its own link-layer reliability: it takes **LLR** (link level retry) and **CBFC** (credit-based flow control) straight from the UEC specification, and requires both in a scale-up switch [[80]](#ref-80). The scale-out standard is quietly supplying the scale-up standard's link layer — which is why the frame in §9.2 ends up lossless by credits rather than by PFC alone.
 
-<a id="94-where-it-leaves-the-networker"></a>
-### 9.4 Where it leaves the networker (??? probably need rework since this is not the last section)
+### 9.4 What the open standards mean for a networker
 
-Line the backers up and the pattern is plain: **UALink, ESUN, and Ultra Ethernet are supported by essentially everyone except NVIDIA** — AMD, Intel, Broadcom, Cisco, Arista, and every hyperscaler. NVIDIA holds the one complete proprietary stack (NVLink, NVSwitch, Quantum InfiniBand, Spectrum-X); the rest of the industry is converging on open standards to break the dependence — and NVIDIA has itself joined some of them (it is a UEC and ESUN member) while keeping its own fabrics intact.
+Look at who supports each standard, and a clear pattern appears. **UALink, ESUN and Ultra Ethernet are supported by almost everyone except NVIDIA**: AMD, Intel, Broadcom, Cisco, Arista and the large hyperscalers. NVIDIA has the only complete proprietary stack: NVLink, NVSwitch, Quantum InfiniBand and Spectrum-X. The rest of the industry is moving to open standards to depend less on NVIDIA. NVIDIA has also joined some of these groups (it is a member of UEC and ESUN), but it keeps its own fabrics.
 
-Whether the open stack wins is the genuine open question of the field, and this document will not pretend to settle it. But the direction is a comfortable one to a networker: toward RDMA over standard Ethernet, multi-vendor switches, packet spray and adaptive routing as published mechanisms rather than trade secrets — the AI fabric slowly becoming the kind of open, interoperable network the rest of the datacenter already is.
-
-AMD is the biggest backer of open interconnects, but it is not the whole open story: the standards themselves — UALink, Ultra Ethernet, SUE — are consortia, and they get their own chapter (§9). Next, §8.3 takes the openness argument to its limit: a chip that drops the special-purpose fabric altogether and runs *both* scales on nothing but Ethernet.
+Nobody knows yet whether the open stack will win, and this document does not try to answer that. But the direction is good news for a networker: RDMA over standard Ethernet, switches from many vendors, and packet spraying and adaptive routing described in public standards instead of kept secret. Step by step, the AI fabric is becoming an open, multi-vendor network, like the rest of the data center.
 
 ---
 
