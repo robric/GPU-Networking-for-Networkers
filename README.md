@@ -4,7 +4,7 @@
 
 > A deep dive into how GPUs talk to each other, written by a networking person, for networking people.
 
-If you have spent your career working with routers, MPLS, routing tables, BGP and `tcpdump`, the world of "GPU networking" can feel like it was designed by aliens. People throw around words like *NVLink*, *NVSwitch*, *collective*, *all-reduce*, *RDMA*, *RoCE* and *rail-optimized fabric* as if they were obvious. They are not.
+My original background is networking (i.e. routers, MPLS, BGP, `tcpdump`), even though I have since moved up the cloud stack. When I started looking at GPU networking, I kept running into words like *NVLink*, *NVSwitch*, *collective*, *all-reduce*, *RDMA*, *RoCE* and *rail-optimized fabric*, often used as if they were obvious. They were not obvious to me, so I dug into the topic, as I usually do when something interests me.
 
 This document has two goals, like my [k8s service & LB testing notes](https://github.com/robric/k8s-svc-and-lb-testing) did:
 - a **personal cheat sheet**, so that I (and maybe you) can stop asking Claude or Google "how does this NVLink thing connect GPUs to each other?" every six months.
